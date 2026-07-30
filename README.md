@@ -33,6 +33,8 @@ The capability URL is short-lived. It must not be committed, stored in persisten
 
 Brave MVP implementation is buildable and has passed the focused relay contracts plus an end-to-end disposable-profile smoke test: load extension, pair, share one tab, read it through authenticated CDP, disconnect the client without revoking the share, unshare, and confirm immediate disappearance. Chrome remains unverified.
 
+See [`ROADMAP.md`](ROADMAP.md) for the major releases from the current MVP through trusted local/LAN sessions, bookmarks and history capabilities, managed actions, and Guardian Auto.
+
 ## Build and try it
 
 Requires Node.js 22 or newer.
