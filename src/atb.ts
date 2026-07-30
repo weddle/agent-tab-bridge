@@ -192,7 +192,7 @@ export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {})
   }
   const extensionOrigin = await extensionOriginFromManifest(command.extensionManifest);
   const executablePath = path.resolve(command.executable ?? process.argv[1] ?? process.execPath);
-  const params = { executablePath, extensionOrigin, hostName: DEFAULT_NATIVE_HOST_NAME, home: command.home };
+  const params = { executablePath, runtimePath: process.execPath, extensionOrigin, hostName: DEFAULT_NATIVE_HOST_NAME, home: command.home };
   const stdout = deps.stdout ?? process.stdout;
   if (command.kind === "install") {
     await access(executablePath, fsConstants.X_OK);

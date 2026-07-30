@@ -26,6 +26,15 @@ export type NativeHostManifest = {
 export type ManifestFs = Pick<typeof fs, "mkdir" | "readFile" | "rename" | "rm" | "writeFile"> & {
   chmod?: typeof fs.chmod;
 };
+type NativeHostInstallation = {
+  executablePath: string;
+  extensionOrigin: string;
+  hostName?: string;
+  description?: string;
+  home?: string;
+  runtimePath?: string;
+  io?: ManifestFs;
+};
 export type ManifestPaths = Record<Browser, string>;
 
 export function nativeMessagingDirectory(browser: Browser, home = os.homedir()): string {
@@ -40,6 +49,18 @@ export function nativeManifestPaths(hostName = DEFAULT_NATIVE_HOST_NAME, home = 
     brave: path.join(nativeMessagingDirectory("brave", home), `${hostName}.json`),
     chrome: path.join(nativeMessagingDirectory("chrome", home), `${hostName}.json`),
   };
+}
+
+export function nativeHostLauncherPath(hostName = DEFAULT_NATIVE_HOST_NAME, home = os.homedir()): string {
+  return path.join(home, "Library", "Application Support", "Agent Tab Bridge", hostName);
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+export function makeNativeHostLauncher(runtimePath: string, executablePath: string): string {
+  return `#!/bin/sh\nexec ${shellQuote(path.resolve(runtimePath))} ${shellQuote(path.resolve(executablePath))} "$@"\n`;
 }
 
 function extensionIdFromKey(key: string): string {
@@ -87,12 +108,18 @@ export function makeNativeHostManifest(params: {
   };
 }
 
-async function atomicWrite(filePath: string, body: string, io: ManifestFs): Promise<void> {
+function installedExecutablePath(params: NativeHostInstallation): string {
+  return params.runtimePath
+    ? nativeHostLauncherPath(params.hostName, params.home)
+    : params.executablePath;
+}
+
+async function atomicWrite(filePath: string, body: string, io: ManifestFs, mode = 0o600): Promise<void> {
   await io.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const temporary = `${filePath}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
   try {
-    await io.writeFile(temporary, body, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    if (io.chmod) await io.chmod(temporary, 0o600);
+    await io.writeFile(temporary, body, { encoding: "utf8", mode, flag: "wx" });
+    if (io.chmod) await io.chmod(temporary, mode);
     await io.rename(temporary, filePath);
   } catch (error) {
     await io.rm(temporary, { force: true }).catch(() => undefined);
@@ -100,32 +127,28 @@ async function atomicWrite(filePath: string, body: string, io: ManifestFs): Prom
   }
 }
 
-export async function installNativeManifests(params: {
-  executablePath: string;
-  extensionOrigin: string;
-  hostName?: string;
-  description?: string;
-  home?: string;
-  io?: ManifestFs;
-}): Promise<ManifestPaths> {
+export async function installNativeManifests(params: NativeHostInstallation): Promise<ManifestPaths> {
   const io = params.io ?? fs;
-  const manifest = makeNativeHostManifest(params);
+  const launcherPath = installedExecutablePath(params);
+  if (params.runtimePath) {
+    await atomicWrite(
+      launcherPath,
+      makeNativeHostLauncher(params.runtimePath, params.executablePath),
+      io,
+      0o700,
+    );
+  }
+  const manifest = makeNativeHostManifest({ ...params, executablePath: launcherPath });
   const paths = nativeManifestPaths(manifest.name, params.home);
   const body = `${JSON.stringify(manifest, null, 2)}\n`;
   await Promise.all(Object.values(paths).map((target) => atomicWrite(target, body, io)));
   return paths;
 }
 
-export async function uninstallNativeManifests(params: {
-  executablePath: string;
-  extensionOrigin: string;
-  hostName?: string;
-  description?: string;
-  home?: string;
-  io?: ManifestFs;
-}): Promise<{ removed: string[]; skipped: string[] }> {
+export async function uninstallNativeManifests(params: NativeHostInstallation): Promise<{ removed: string[]; skipped: string[] }> {
   const io = params.io ?? fs;
-  const expected = makeNativeHostManifest(params);
+  const launcherPath = installedExecutablePath(params);
+  const expected = makeNativeHostManifest({ ...params, executablePath: launcherPath });
   const paths = nativeManifestPaths(expected.name, params.home);
   const removed: string[] = [];
   const skipped: string[] = [];
@@ -138,25 +161,39 @@ export async function uninstallNativeManifests(params: {
     await io.rm(target, { force: false });
     removed.push(target);
   }
+  if (params.runtimePath && removed.length > 0 && skipped.length === 0) {
+    const expectedLauncher = makeNativeHostLauncher(params.runtimePath, params.executablePath);
+    try {
+      if (await io.readFile(launcherPath, "utf8") === expectedLauncher) {
+        await io.rm(launcherPath, { force: false });
+      }
+    } catch {}
+  }
   return { removed, skipped };
 }
 
-export async function nativeManifestStatus(params: {
-  executablePath: string;
-  extensionOrigin: string;
-  hostName?: string;
-  description?: string;
-  home?: string;
-  io?: ManifestFs;
-}): Promise<Record<Browser, { path: string; installed: boolean; matches: boolean }>> {
+export async function nativeManifestStatus(params: NativeHostInstallation): Promise<Record<Browser, { path: string; installed: boolean; matches: boolean }>> {
   const io = params.io ?? fs;
-  const expected = makeNativeHostManifest(params);
+  const launcherPath = installedExecutablePath(params);
+  const expected = makeNativeHostManifest({ ...params, executablePath: launcherPath });
   const paths = nativeManifestPaths(expected.name, params.home);
+  let launcherMatches = true;
+  if (params.runtimePath) {
+    try {
+      launcherMatches = await io.readFile(launcherPath, "utf8") === makeNativeHostLauncher(params.runtimePath, params.executablePath);
+    } catch {
+      launcherMatches = false;
+    }
+  }
   const result = {} as Record<Browser, { path: string; installed: boolean; matches: boolean }>;
   for (const browser of ["brave", "chrome"] as const) {
     try {
       const parsed = JSON.parse(await io.readFile(paths[browser], "utf8")) as unknown;
-      result[browser] = { path: paths[browser], installed: true, matches: JSON.stringify(parsed) === JSON.stringify(expected) };
+      result[browser] = {
+        path: paths[browser],
+        installed: true,
+        matches: launcherMatches && JSON.stringify(parsed) === JSON.stringify(expected),
+      };
     } catch {
       result[browser] = { path: paths[browser], installed: false, matches: false };
     }
