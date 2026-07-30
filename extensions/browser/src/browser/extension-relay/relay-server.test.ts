@@ -2,7 +2,11 @@ import http from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket, { type RawData } from "ws";
 import { buildRelayWsProtocols } from "../../../chrome-extension/modules/relay-core.js";
-import { startAgentTabRelay, type AgentTabRelayHandle } from "./relay-server.js";
+import {
+  EXTENSION_RELAY_EXTENSION_ORIGIN,
+  startAgentTabRelay,
+  type AgentTabRelayHandle,
+} from "./relay-server.js";
 
 type JsonFrame = Record<string, unknown>;
 function isJsonFrame(value: unknown): value is JsonFrame {
@@ -12,8 +16,8 @@ function isJsonFrame(value: unknown): value is JsonFrame {
 
 const handles: AgentTabRelayHandle[] = [];
 
-async function start(token = "test-token"): Promise<AgentTabRelayHandle> {
-  const handle = await startAgentTabRelay({ token });
+async function start(extensionToken = "test-extension-token"): Promise<AgentTabRelayHandle> {
+  const handle = await startAgentTabRelay({ extensionToken });
   handles.push(handle);
   return handle;
 }
@@ -111,11 +115,12 @@ function hello(tabs: Array<Record<string, unknown>>) {
 async function connectExtension(
   handle: AgentTabRelayHandle,
   tabs: Array<Record<string, unknown>>,
+  respondToDetach = true,
 ): Promise<WebSocket> {
   const pairing = new URL(handle.pairingUrl);
   pairing.hash = "";
-  const extension = await openSocket(pairing.toString(), buildRelayWsProtocols(handle.token), {
-    Origin: "chrome-extension://agent-tab-bridge",
+  const extension = await openSocket(pairing.toString(), buildRelayWsProtocols(handle.extensionToken), {
+    Origin: EXTENSION_RELAY_EXTENSION_ORIGIN,
   });
   extension.on("message", (raw) => {
     let parsed: unknown;
@@ -135,6 +140,12 @@ async function connectExtension(
           result: { targetId: `target-${parsed.tabId}` },
         }),
       );
+      return;
+    }
+    if (
+      (parsed.type === "detach" && !respondToDetach) ||
+      !["detach", "activateTab", "closeTab"].includes(parsed.type)
+    ) {
       return;
     }
     if (parsed.type === "detach" || parsed.type === "activateTab" || parsed.type === "closeTab") {
@@ -171,13 +182,13 @@ describe("standalone Agent Tab Bridge relay", () => {
     const handle = await start();
 
     await expect(
-      httpGet(handle.port, `/json/version?token=${handle.token}`, { Host: "attacker.example" }),
+      httpGet(handle.port, `/json/version?token=${handle.cdpToken}`, { Host: "attacker.example" }),
     ).resolves.toMatchObject({ status: 403 });
     await expect(
-      upgradeStatus(handle.port, `/extension?token=${handle.token}`, {
+      upgradeStatus(handle.port, `/extension?token=${handle.extensionToken}`, {
         Host: "127.0.0.1",
         Origin: "https://attacker.example",
-        "Sec-WebSocket-Protocol": buildRelayWsProtocols(handle.token).join(", "),
+        "Sec-WebSocket-Protocol": buildRelayWsProtocols(handle.extensionToken).join(", "),
         Connection: "Upgrade",
         Upgrade: "websocket",
       }),
@@ -190,18 +201,21 @@ describe("standalone Agent Tab Bridge relay", () => {
       { tabId: 7, url: "https://shared.example", title: "Shared", active: true },
     ]);
 
-    const versionResponse = await httpGet(handle.port, `/json/version?token=${handle.token}`);
+    const versionResponse = await httpGet(handle.port, `/json/version?token=${handle.cdpToken}`);
     expect(versionResponse.status).toBe(200);
     expect(JSON.parse(versionResponse.body)).toMatchObject({
       webSocketDebuggerUrl: handle.cdpUrl,
     });
 
-    const tabsResponse = await httpGet(handle.port, `/json?token=${handle.token}`);
+    const tabsResponse = await httpGet(handle.port, `/json?token=${handle.cdpToken}`);
     expect(JSON.parse(tabsResponse.body)).toEqual([
       { tabId: 7, url: "https://shared.example", title: "Shared", active: true },
     ]);
-    expect(handle.pairingUrl).toBe(`ws://127.0.0.1:${handle.port}/extension#${handle.token}`);
-    expect(handle.cdpUrl).toBe(`ws://127.0.0.1:${handle.port}/cdp?token=${handle.token}`);
+    expect(handle.extensionToken).not.toBe(handle.cdpToken);
+    expect(handle.pairingUrl).toBe(
+      `ws://127.0.0.1:${handle.port}/extension#${handle.extensionToken}`,
+    );
+    expect(handle.cdpUrl).toBe(`ws://127.0.0.1:${handle.port}/cdp?token=${handle.cdpToken}`);
 
     extension.close();
   });
@@ -233,13 +247,61 @@ describe("standalone Agent Tab Bridge relay", () => {
     const detachedPromise = nextFrame(cdp, (frame) => frame.method === "Target.detachedFromTarget");
     extension.send(JSON.stringify({ type: "tabs", tabs: [] }));
     expect(await detachedPromise).toMatchObject({ method: "Target.detachedFromTarget" });
-    await expect(httpGet(handle.port, `/json?token=${handle.token}`)).resolves.toMatchObject({
+    await expect(httpGet(handle.port, `/json?token=${handle.cdpToken}`)).resolves.toMatchObject({
       status: 200,
       body: "[]",
     });
 
     cdp.close();
     extension.close();
+  });
+
+  it("cleans all relay resources when HTTP listen fails", async () => {
+    const first = await start();
+    await expect(
+      startAgentTabRelay({ port: first.port, extensionToken: "collision-extension-token" }),
+    ).rejects.toBeTruthy();
+
+    await first.close();
+    handles.splice(handles.indexOf(first), 1);
+    const replacement = await start();
+    await replacement.close();
+    handles.splice(handles.indexOf(replacement), 1);
+  });
+
+  it("withdraws CDP clients before waiting for an unresponsive extension", async () => {
+    const handle = await start();
+    const extension = await connectExtension(
+      handle,
+      [{ tabId: 7, url: "https://shared.example", title: "Shared", active: true }],
+      false,
+    );
+    const forwarded: JsonFrame[] = [];
+    extension.on("message", (raw) => {
+      try {
+        const frame = JSON.parse(raw.toString()) as unknown;
+        if (isJsonFrame(frame) && frame.type === "cdp") {
+          forwarded.push(frame);
+        }
+      } catch {
+        // Ignore non-JSON frames in this diagnostic listener.
+      }
+    });
+    const cdp = await openSocket(handle.cdpUrl);
+    const attached = nextFrame(cdp, (frame) => frame.method === "Target.attachedToTarget");
+    cdp.send(JSON.stringify({ id: 1, method: "Target.setAutoAttach", params: { autoAttach: true } }));
+    await attached;
+    const detachCommand = nextFrame(extension, (frame) => frame.type === "detach");
+    const closing = handle.close();
+    await detachCommand;
+    try {
+      cdp.send(JSON.stringify({ id: 2, method: "Page.reload" }));
+    } catch {
+      // The bridge may have already closed the client socket synchronously.
+    }
+    await closing;
+    expect(forwarded).toEqual([]);
+    expect(cdp.readyState).toBe(WebSocket.CLOSED);
   });
 
   it("detaches shared tabs and closes sockets and listener", async () => {
@@ -260,11 +322,11 @@ describe("standalone Agent Tab Bridge relay", () => {
     const cdpClosedGate = Promise.withResolvers<void>();
     cdp.once("close", cdpClosedGate.resolve);
 
-    await handle.close();
+    await Promise.all([handle.close(), handle.close()]);
     handles.splice(handles.indexOf(handle), 1);
     await expect(detachCommand).resolves.toMatchObject({ type: "detach", tabId: 7 });
     await Promise.all([extensionClosedGate.promise, cdpClosedGate.promise]);
     expect(handle.bridge.sharedTabs()).toEqual([]);
-    await expect(httpGet(handle.port, `/json/version?token=${handle.token}`)).rejects.toBeTruthy();
+    await expect(httpGet(handle.port, `/json/version?token=${handle.cdpToken}`)).rejects.toBeTruthy();
   });
 });

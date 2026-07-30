@@ -31,44 +31,50 @@ The capability URL is short-lived. It must not be committed, stored in persisten
 
 ## Status
 
-Brave MVP implementation is buildable and has passed the focused relay contracts plus an end-to-end disposable-profile smoke test: load extension, pair, share one tab, read it through authenticated CDP, disconnect the client without revoking the share, unshare, and confirm immediate disappearance. Chrome remains unverified.
+Release 1's trusted-local workflow is implemented. The companion is installed once, the extension and companion authenticate and pin each other, each `atb run` request requires an explicit browser-local approval, and only tabs shared into that task's visible group appear over CDP. No user copies a token or port.
 
-See [`ROADMAP.md`](ROADMAP.md) for the major releases from the current MVP through trusted local/LAN sessions, bookmarks and history capabilities, managed actions, and Guardian Auto.
+The focused contract suite and disposable Brave and Chrome-for-Testing profiles cover companion authentication, task approval, one explicitly shared page read through authenticated CDP, launcher-scoped revocation, browser disconnect, and one-click device trust removal.
 
-## Build and try it
+See [`ROADMAP.md`](ROADMAP.md) for the later trusted-LAN, bookmarks/history, managed-action, and Guardian Auto releases.
+
+## Build and install
 
 Requires Node.js 22 or newer.
 
 ```bash
 npm install
 npm run build
-npm run test:relay
+npm test
+node dist/src/atb.js install
+node dist/src/atb.js status
 ```
 
-In Brave:
+Then load `extensions/browser/chrome-extension/` as an unpacked extension:
 
-1. Open `brave://extensions`, enable **Developer mode**, and choose **Load unpacked**.
-2. Select `extensions/browser/chrome-extension/`.
-3. Start one foreground relay:
+1. Open `brave://extensions` or `chrome://extensions`.
+2. Enable **Developer mode** and choose **Load unpacked**.
+3. Select `extensions/browser/chrome-extension/`.
+4. Open the extension popup and confirm that the companion is connected and its abbreviated verified identity is visible.
 
-   ```bash
-   npm start
-   ```
+The manifest's committed public key gives the unpacked extension a stable ID. The installer derives the allowed Native Messaging origin from that manifest rather than accepting an extension ID from the command line.
 
-4. Copy the first, fragment-bearing line from the relay terminal into the extension popup and choose **Pair**.
-5. On a tab you intend to expose, choose **Share this tab**. It moves into the visible **Agent Tabs** group.
-6. In a second terminal, read the relay's CDP URL without putting the capability itself in shell history, then start Hermes:
+## Run a task
 
-   ```bash
-   read -r BROWSER_CDP_URL
-   export BROWSER_CDP_URL
-   hermes
-   unset BROWSER_CDP_URL
-   ```
+Launch the agent as a child of `atb run`:
 
-   Paste only the URL after `BROWSER_CDP_URL=` at the `read` prompt.
+```bash
+node dist/src/atb.js run --label "Research task" -- hermes
+```
 
-Do not put either printed capability in shell history, profile configuration, logs, or notifications. Stop the foreground relay when the task ends.
+The popup shows the authenticated controller principal, unverified display label, requested capability, and TTL. Approve the task, then share only the intended tabs with that session. `atb` injects the ephemeral `BROWSER_CDP_URL` only into the child process; it is never printed, persisted, or copied by the user. Child exit, browser loss, session revocation, tab-group removal, or debugger detachment removes the corresponding authority.
+
+To remove the Native Messaging registration:
+
+```bash
+node dist/src/atb.js uninstall
+```
+
+The popup's **Forget companion & revoke all access** control separately removes device trust and stops every local task session.
 
 ## Upstream and attribution
 

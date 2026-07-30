@@ -62,11 +62,14 @@ The releases below are intentionally broad. Work within one release may be proto
 
 **Outcome:** prove narrow CDP access to explicitly shared Brave tabs.
 
-This is the current repository state. It remains the regression baseline for every later release: nothing may weaken loopback binding, per-run tokens, target filtering, visible debugger attachment, or immediate revocation.
+This was the repository's original regression baseline. Later releases must not weaken loopback binding, per-session tokens, target filtering, visible debugger attachment, or immediate revocation.
 
 ### Release 1 — Trusted local product
 
 **Outcome:** installation once; thereafter one command and one browser-local approval, with no copied capability strings.
+
+**Status:** implemented and smoke-tested with disposable Brave and Chrome-for-Testing profiles.
+
 
 Major contents:
 

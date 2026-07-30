@@ -9,18 +9,21 @@
     "node": ">=22"
   },
   "bin": {
-    "agent-tab-bridge-relay": "./dist/src/agent-tab-bridge-relay.js"
+    "atb": "./dist/src/atb.js"
   },
   "files": [
     "dist/",
+    "extensions/",
+    "!extensions/**/*.test.ts",
     "LICENSE",
     "README.md",
     "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
-    "build": "tsc --project tsconfig.json",
-    "test:relay": "vitest run extensions/browser/chrome-extension/modules/relay-core.test.ts extensions/browser/src/browser/extension-relay/relay-protocol.test.ts extensions/browser/src/browser/extension-relay/relay-bridge.test.ts extensions/browser/src/browser/extension-relay/relay-server.test.ts",
-    "start": "node dist/src/agent-tab-bridge-relay.js"
+    "build": "tsc --project tsconfig.json && chmod 755 dist/src/atb.js",
+    "prepack": "npm run build",
+    "test": "vitest run src/**/*.test.ts extensions/browser/chrome-extension/modules/native-identity.test.ts extensions/browser/chrome-extension/modules/session-core.test.ts extensions/browser/chrome-extension/modules/relay-core.test.ts extensions/browser/src/browser/extension-relay/relay-protocol.test.ts extensions/browser/src/browser/extension-relay/relay-bridge.test.ts extensions/browser/src/browser/extension-relay/relay-server.test.ts",
+    "start": "node dist/src/atb.js"
   },
   "dependencies": {
     "ws": "^8.18.3"

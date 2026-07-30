@@ -1,6 +1,12 @@
 // Extension relay bridge: CDP target synthesis and extension command routing.
-import { describe, expect, it } from "vitest";
-import { ExtensionRelayBridge } from "./relay-bridge.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  CDP_METHOD_POLICY_ERROR,
+  CDP_METHOD_POLICY_ERROR_CODE,
+  CdpMethodPolicy,
+  classifyCdpMethod,
+  ExtensionRelayBridge,
+} from "./relay-bridge.js";
 import type { ExtensionToRelayMessage, RelayToExtensionMessage } from "./relay-protocol.js";
 
 /** In-memory socket capturing every frame the bridge sends. */
@@ -100,6 +106,24 @@ const flush = async () => {
     setImmediate(resolve);
   });
 };
+
+async function attachSharedPageSession() {
+  const bridge = new ExtensionRelayBridge();
+  const { socket: extensionSocket, handlers } = wireExtension(bridge);
+  sendHello(handlers);
+  const client = new FakeSocket();
+  const cdp = bridge.attachCdpClientSocket(client);
+  cdp.onMessage(
+    JSON.stringify({ id: 1, method: "Target.setAutoAttach", params: { autoAttach: true } }),
+  );
+  await flush();
+  const attached = client.frames().find((frame) => frame.method === "Target.attachedToTarget");
+  const sessionId = (attached?.params as { sessionId?: unknown } | undefined)?.sessionId;
+  if (typeof sessionId !== "string") {
+    throw new Error("expected a shared tab session");
+  }
+  return { client, cdp, extensionSocket, handlers, sessionId };
+}
 
 describe("ExtensionRelayBridge", () => {
   it("reports the paired browser identity through Browser.getVersion", async () => {
@@ -400,6 +424,23 @@ describe("ExtensionRelayBridge", () => {
     expect(bridge.extensionConnected).toBe(false);
   });
 
+  it("treats a queued keepalive callback after disconnect as extension teardown", () => {
+    const bridge = new ExtensionRelayBridge();
+    const intervalSpy = vi.spyOn(globalThis, "setInterval");
+    try {
+      const { handlers } = wireExtension(bridge);
+      sendHello(handlers);
+      const callback = intervalSpy.mock.calls.at(-1)?.[0] as (() => void) | undefined;
+      expect(callback).toBeTypeOf("function");
+
+      handlers.onClose();
+      expect(() => callback?.()).not.toThrow();
+      expect(bridge.extensionConnected).toBe(false);
+    } finally {
+      intervalSpy.mockRestore();
+    }
+  });
+
   it("reports malformed CDP client JSON instead of leaving the client waiting", () => {
     const bridge = new ExtensionRelayBridge();
     const client = new FakeSocket();
@@ -462,6 +503,154 @@ describe("ExtensionRelayBridge", () => {
     await flush();
     const response = client.frames().find((frame) => frame.id === 2);
     expect(response?.error).toBeTruthy();
+  });
+
+  it.each([
+    ["page navigation", "Page.navigate", { url: "https://next.example" }],
+    ["script evaluation", "Runtime.evaluate", { expression: "document.title" }],
+    ["DOM inspection", "DOM.getDocument", {}],
+    ["input dispatch", "Input.dispatchKeyEvent", { type: "keyDown", key: "A" }],
+    ["network observation", "Network.enable", {}],
+    ["request interception", "Fetch.enable", {}],
+    ["page emulation", "Emulation.setUserAgentOverride", { userAgent: "ATB test" }],
+    ["page logging", "Log.enable", {}],
+    ["page performance", "Performance.enable", {}],
+    ["page debugging", "Debugger.enable", {}],
+    ["CSS inspection", "CSS.enable", {}],
+    ["accessibility inspection", "Accessibility.enable", {}],
+  ])("forwards allowed %s commands only to the shared page", async (_label, method, params) => {
+    expect(classifyCdpMethod(method, "page")).toBe(CdpMethodPolicy.Allow);
+    const { client, cdp, extensionSocket, sessionId } = await attachSharedPageSession();
+
+    cdp.onMessage(JSON.stringify({ id: 2, sessionId, method, params }));
+    await flush();
+
+    expect(
+      extensionSocket
+        .frames()
+        .find((frame) => frame.type === "cdp" && frame.method === method),
+    ).toMatchObject({ tabId: 1, method, params });
+    expect(client.frames().find((frame) => frame.id === 2)).toMatchObject({
+      sessionId,
+      result: { ok: true, echoed: method },
+    });
+  });
+
+  it("handles Browser.close locally without forwarding it to Chrome", async () => {
+    expect(classifyCdpMethod("Browser.close", "browser")).toBe(CdpMethodPolicy.Allow);
+    const bridge = new ExtensionRelayBridge();
+    const { socket: extensionSocket, handlers } = wireExtension(bridge);
+    sendHello(handlers);
+    const client = new FakeSocket();
+    const cdp = bridge.attachCdpClientSocket(client);
+
+    cdp.onMessage(JSON.stringify({ id: 1, method: "Browser.close" }));
+    await flush();
+
+    expect(client.frames()).toEqual([{ id: 1, result: {} }]);
+    expect(client.closed).toBe(true);
+    expect(extensionSocket.frames().filter((frame) => frame.type === "cdp")).toHaveLength(0);
+  });
+
+  it.each([
+    ["download behavior", "Browser.setDownloadBehavior"],
+    ["permission grant", "Browser.grantPermissions"],
+    ["permission reset", "Browser.resetPermissions"],
+    ["unknown Browser method", "Browser.futureSensitiveCommand"],
+    ["browser-context creation", "Target.createBrowserContext"],
+    ["browser-context disposal", "Target.disposeBrowserContext"],
+    ["target protocol exposure", "Target.exposeDevToolsProtocol"],
+    ["unknown Target method", "Target.futureSensitiveCommand"],
+    ["profile cookies", "Storage.getCookies"],
+    ["profile cache", "CacheStorage.requestEntries"],
+    ["service-worker registry", "ServiceWorker.enable"],
+    ["unknown System method", "System.futureSensitiveCommand"],
+    ["browser cookies through Network", "Network.getAllCookies"],
+    ["browser cache through Network", "Network.clearBrowserCache"],
+  ])("rejects %s with a stable policy error", async (_label, method) => {
+    expect(classifyCdpMethod(method, "browser")).toBe(CdpMethodPolicy.Deny);
+    const bridge = new ExtensionRelayBridge();
+    const { socket: extensionSocket, handlers } = wireExtension(bridge);
+    sendHello(handlers);
+    const client = new FakeSocket();
+    const cdp = bridge.attachCdpClientSocket(client);
+
+    cdp.onMessage(JSON.stringify({ id: 1, method }));
+    await flush();
+
+    expect(client.frames()).toEqual([
+      {
+        id: 1,
+        error: {
+          code: CDP_METHOD_POLICY_ERROR_CODE,
+          message: CDP_METHOD_POLICY_ERROR,
+        },
+      },
+    ]);
+    expect(client.closed).toBe(false);
+    expect(extensionSocket.frames().filter((frame) => frame.type === "cdp")).toHaveLength(0);
+  });
+
+  it.each([
+    ["page download behavior", "Page.setDownloadBehavior"],
+    ["local file path inspection", "DOM.getFileInfo"],
+    ["profile cookies through Network", "Network.getCookies"],
+    ["profile cookies set through Network", "Network.setCookies"],
+    ["global certificate override", "Security.setIgnoreCertificateErrors"],
+    ["unreviewed Tethering domain", "Tethering.bind"],
+    ["unreviewed Autofill domain", "Autofill.trigger"],
+    ["unreviewed FedCm domain", "FedCm.enable"],
+    ["unreviewed WebAuthn domain", "WebAuthn.enable"],
+    ["unknown new domain", "FutureCdpDomain.doThing"],
+  ])("denies %s from a shared page session before forwarding", async (_label, method) => {
+    expect(classifyCdpMethod(method, "page")).toBe(CdpMethodPolicy.Deny);
+    const { client, cdp, extensionSocket, sessionId } = await attachSharedPageSession();
+
+    cdp.onMessage(JSON.stringify({ id: 2, sessionId, method }));
+    await flush();
+
+    expect(client.frames().find((frame) => frame.id === 2)).toEqual({
+      id: 2,
+      sessionId,
+      error: {
+        code: CDP_METHOD_POLICY_ERROR_CODE,
+        message: CDP_METHOD_POLICY_ERROR,
+      },
+    });
+    expect(extensionSocket.frames().filter((frame) => frame.type === "cdp")).toHaveLength(0);
+  });
+
+  it("applies the policy to a flattened child session before forwarding", async () => {
+    const { client, cdp, extensionSocket, handlers } = await attachSharedPageSession();
+    handlers.onMessage(
+      JSON.stringify({
+        type: "cdpEvent",
+        tabId: 1,
+        sessionId: "child-iframe",
+        method: "Runtime.executionContextCreated",
+        params: {},
+      }),
+    );
+    await flush();
+
+    cdp.onMessage(
+      JSON.stringify({
+        id: 2,
+        sessionId: "child-iframe",
+        method: "Browser.grantPermissions",
+      }),
+    );
+    await flush();
+
+    expect(client.frames().find((frame) => frame.id === 2)).toEqual({
+      id: 2,
+      sessionId: "child-iframe",
+      error: {
+        code: CDP_METHOD_POLICY_ERROR_CODE,
+        message: CDP_METHOD_POLICY_ERROR,
+      },
+    });
+    expect(extensionSocket.frames().filter((frame) => frame.type === "cdp")).toHaveLength(0);
   });
 
 

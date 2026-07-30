@@ -11,6 +11,8 @@ import type { Duplex } from "node:stream";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import { ExtensionRelayBridge } from "./relay-bridge.js";
 
+export const EXTENSION_RELAY_EXTENSION_ID = "ahidcojpekedppablmjchogimfhbgbho";
+export const EXTENSION_RELAY_EXTENSION_ORIGIN = `chrome-extension://${EXTENSION_RELAY_EXTENSION_ID}`;
 export const EXTENSION_RELAY_PROTOCOL = "agent-tab-bridge-relay";
 export const EXTENSION_RELAY_TOKEN_PROTOCOL_PREFIX = "agent-tab-bridge-token.";
 
@@ -19,7 +21,10 @@ export const EXTENSION_RELAY_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
 
 export type AgentTabRelayHandle = {
   port: number;
-  token: string;
+  /** Capability used only by the extension pairing endpoint. */
+  extensionToken: string;
+  /** Capability used only by discovery and the CDP endpoint. */
+  cdpToken: string;
   pairingUrl: string;
   cdpUrl: string;
   bridge: ExtensionRelayBridge;
@@ -89,8 +94,9 @@ export function isAllowedExtensionOrigin(req: IncomingMessage): boolean {
   try {
     const parsed = new URL(origin);
     return (
+      origin === EXTENSION_RELAY_EXTENSION_ORIGIN &&
       parsed.protocol === "chrome-extension:" &&
-      parsed.hostname.length > 0 &&
+      parsed.hostname === EXTENSION_RELAY_EXTENSION_ID &&
       parsed.username === "" &&
       parsed.password === "" &&
       parsed.port === "" &&
@@ -152,16 +158,46 @@ function bindSocket(
   ws.on("error", () => {});
 }
 
-/** Start one ephemeral Agent Tab Bridge relay. */
+async function closeWebSocketServer(wss: WebSocketServer): Promise<void> {
+  for (const client of wss.clients) {
+    client.terminate();
+  }
+  await new Promise<void>((resolve) => {
+    try {
+      wss.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+  wss.removeAllListeners();
+}
+
+async function closeHttpServer(server: Server): Promise<void> {
+  // Closing a server that failed during listen can itself emit an error. Keep
+  // that expected cleanup error from becoming an uncaught EventEmitter error,
+  // then remove every listener owned by this relay.
+  const cleanupErrorHandler = () => {};
+  server.on("error", cleanupErrorHandler);
+  await new Promise<void>((resolve) => {
+    try {
+      server.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+  server.removeAllListeners("error");
+  server.removeAllListeners("upgrade");
+}
 export async function startAgentTabRelay(
-  params: { port?: number; token?: string } = {},
+  params: { port?: number; extensionToken?: string } = {},
 ): Promise<AgentTabRelayHandle> {
   const requestedPort = params.port ?? 0;
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65_535) {
     throw new RangeError("relay port must be an integer between 0 and 65535");
   }
-  const token = params.token ?? crypto.randomBytes(32).toString("hex");
-  if (token.length === 0) {
+  const extensionToken = params.extensionToken ?? crypto.randomBytes(32).toString("hex");
+  const cdpToken = crypto.randomBytes(32).toString("hex");
+  if (extensionToken.length === 0) {
     throw new Error("relay token must not be empty");
   }
 
@@ -173,6 +209,7 @@ export async function startAgentTabRelay(
 
   let serverPort = requestedPort;
   let server: Server;
+  let closing = false;
   const resolvedPort = () => {
     const address = server.address();
     return typeof address === "object" && address ? address.port : serverPort;
@@ -183,13 +220,24 @@ export async function startAgentTabRelay(
       res.writeHead(403).end("Forbidden");
       return;
     }
-    if (!isAuthorized(req, token)) {
+    const path = (req.url ?? "/").split("?", 1)[0];
+    if (closing) {
+      res.writeHead(503).end("Relay is closed");
+      return;
+    }
+    if (path === "/extension") {
+      if (!isAuthorized(req, extensionToken) || !isAllowedExtensionOrigin(req)) {
+        res.writeHead(403).end("Forbidden");
+        return;
+      }
+      res.writeHead(426, { Upgrade: "websocket" }).end("Upgrade Required");
+      return;
+    }
+    if (!isAuthorized(req, cdpToken)) {
       res.writeHead(401, { "WWW-Authenticate": 'Bearer realm="agent-tab-bridge-relay"' });
       res.end("Unauthorized");
       return;
     }
-
-    const path = (req.url ?? "/").split("?", 1)[0];
     if (req.method === "GET" && (path === "/json/version" || path === "/json/version/")) {
       if (!bridge.extensionConnected) {
         res.writeHead(503, { "Content-Type": "application/json" });
@@ -197,7 +245,7 @@ export async function startAgentTabRelay(
         return;
       }
       const identity = bridge.identity;
-      const cdpUrl = `ws://127.0.0.1:${resolvedPort()}/cdp?token=${encodeURIComponent(token)}`;
+      const cdpUrl = `ws://127.0.0.1:${resolvedPort()}/cdp?token=${encodeURIComponent(cdpToken)}`;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
@@ -214,14 +262,6 @@ export async function startAgentTabRelay(
       res.end(JSON.stringify(bridge.sharedTabs()));
       return;
     }
-    if (path === "/extension") {
-      if (!isAllowedExtensionOrigin(req)) {
-        res.writeHead(403).end("Forbidden");
-        return;
-      }
-      res.writeHead(426, { Upgrade: "websocket" }).end("Upgrade Required");
-      return;
-    }
     if (path === "/cdp") {
       res.writeHead(426, { Upgrade: "websocket" }).end("Upgrade Required");
       return;
@@ -229,78 +269,102 @@ export async function startAgentTabRelay(
     res.writeHead(404).end("Not found");
   });
 
-  server.on("upgrade", (req, socket, head) => {
+  const upgradeHandler = (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
     const path = (req.url ?? "/").split("?", 1)[0];
-    if (!hasLoopbackHostHeader(req)) {
-      destroySocket(socket, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
-      return;
-    }
-    if (!isAuthorized(req, token)) {
-      destroySocket(socket, "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+    if (!hasLoopbackHostHeader(req) || closing) {
+      destroySocket(socket, closing ? "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n" : "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
       return;
     }
     if (path === "/extension") {
-      if (!isAllowedExtensionOrigin(req) || !requestExtensionProtocolToken(req)) {
+      if (
+        !isAuthorized(req, extensionToken) ||
+        !isAllowedExtensionOrigin(req) ||
+        requestExtensionProtocolToken(req) !== extensionToken
+      ) {
         destroySocket(socket, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
         return;
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
+        if (closing) {
+          ws.close(1001, "relay stopped");
+          return;
+        }
         attachExtensionWebSocket(bridge, ws);
       });
       return;
     }
     if (path === "/cdp") {
+      if (!isAuthorized(req, cdpToken)) {
+        destroySocket(socket, "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+        return;
+      }
       wss.handleUpgrade(req, socket, head, (ws) => {
+        if (closing) {
+          ws.close(1001, "relay stopped");
+          return;
+        }
         bindSocket(ws, bridge.attachCdpClientSocket(ws));
       });
       return;
     }
     destroySocket(socket, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
-  });
+  };
+  server.on("upgrade", upgradeHandler);
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(requestedPort, "127.0.0.1", () => {
-      serverPort = resolvedPort();
-      resolve();
+  let listenErrorHandler: ((error: Error) => void) | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      listenErrorHandler = (error) => reject(error);
+      server.once("error", listenErrorHandler);
+      server.listen(requestedPort, "127.0.0.1", () => {
+        serverPort = resolvedPort();
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    closing = true;
+    if (listenErrorHandler) {
+      server.removeListener("error", listenErrorHandler);
+    }
+    server.removeListener("upgrade", upgradeHandler);
+    try {
+      await bridge.dispose();
+    } finally {
+      await closeWebSocketServer(wss);
+      await closeHttpServer(server);
+    }
+    throw error;
+  }
+  if (listenErrorHandler) {
+    server.removeListener("error", listenErrorHandler);
+  }
 
   const port = resolvedPort();
-  const encodedToken = encodeURIComponent(token);
+  const encodedExtensionToken = encodeURIComponent(extensionToken);
+  const encodedCdpToken = encodeURIComponent(cdpToken);
   let closePromise: Promise<void> | null = null;
   const close = async (): Promise<void> => {
     if (closePromise) {
       return closePromise;
     }
+    closing = true;
     closePromise = (async () => {
-      await bridge.dispose();
-      for (const client of wss.clients) {
-        client.terminate();
+      try {
+        await bridge.dispose();
+      } finally {
+        await closeWebSocketServer(wss);
+        await closeHttpServer(server);
       }
-      await new Promise<void>((resolve) => {
-        try {
-          wss.close(() => resolve());
-        } catch {
-          resolve();
-        }
-      });
-      await new Promise<void>((resolve) => {
-        try {
-          server.close(() => resolve());
-        } catch {
-          resolve();
-        }
-      });
     })();
     return closePromise;
   };
 
   return {
     port,
-    token,
-    pairingUrl: `ws://127.0.0.1:${port}/extension#${encodedToken}`,
-    cdpUrl: `ws://127.0.0.1:${port}/cdp?token=${encodedToken}`,
+    extensionToken,
+    cdpToken,
+    pairingUrl: `ws://127.0.0.1:${port}/extension#${encodedExtensionToken}`,
+    cdpUrl: `ws://127.0.0.1:${port}/cdp?token=${encodedCdpToken}`,
     bridge,
     close,
   };

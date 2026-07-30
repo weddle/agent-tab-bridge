@@ -24,6 +24,101 @@ const BROWSER_TARGET_ID = "agent-tab-bridge-browser";
 /** Playwright requires every attached page target to identify its browser context. */
 const BROWSER_CONTEXT_ID = "agent-tab-bridge-context";
 
+/**
+ * CDP commands from a browser-scoped synthetic session and a debugger-attached
+ * page session have different authorities. The bridge synthesizes the safe
+ * browser/Target surface; only page automation commands may reach
+ * chrome.debugger.
+ */
+export type CdpMethodScope = "browser" | "page";
+
+export enum CdpMethodPolicy {
+  Allow = "allow",
+  Deny = "deny",
+}
+
+/** Stable error returned when a method could escape the shared-page boundary. */
+export const CDP_METHOD_POLICY_ERROR = "CDP method is not permitted by Agent Tab Bridge";
+export const CDP_METHOD_POLICY_ERROR_CODE = -32000;
+
+const SYNTHETIC_BROWSER_METHODS: Record<string, true> = {
+  "Browser.getVersion": true,
+  // Close only this CDP client; never forward a browser-close command.
+  "Browser.close": true,
+};
+const SYNTHETIC_TARGET_METHODS: Record<string, true> = {
+  "Target.getTargetInfo": true,
+  "Target.getTargets": true,
+  "Target.attachToBrowserTarget": true,
+  "Target.setAutoAttach": true,
+  "Target.attachToTarget": true,
+  "Target.detachFromTarget": true,
+  "Target.createTarget": true,
+  "Target.closeTarget": true,
+  "Target.activateTarget": true,
+  // This is a no-op: target enumeration remains bridge-synthesized.
+  "Target.setDiscoverTargets": true,
+};
+
+/**
+ * Domains whose commands are useful solely against the already attached page
+ * target. New domains must be explicitly reviewed before joining this list.
+ */
+const PAGE_CDP_DOMAINS: Record<string, true> = {
+  Accessibility: true,
+  CSS: true,
+  DOM: true,
+  Debugger: true,
+  Emulation: true,
+  Fetch: true,
+  Input: true,
+  Log: true,
+  Network: true,
+  Page: true,
+  Performance: true,
+  Runtime: true,
+};
+
+/**
+ * Commands from otherwise page-scoped domains that alter or expose profile
+ * state, or disclose a local file path.
+ */
+const DENIED_PAGE_METHODS: Record<string, true> = {
+  "DOM.getFileInfo": true,
+  "Network.clearBrowserCache": true,
+  "Network.clearBrowserCookies": true,
+  "Network.deleteCookies": true,
+  "Network.getAllCookies": true,
+  "Network.getCookies": true,
+  "Network.setCookie": true,
+  "Network.setCookies": true,
+  "Page.setDownloadBehavior": true,
+};
+
+/**
+ * Deterministically classifies CDP methods before the bridge forwards them.
+ *
+ * Only reviewed page-control and inspection domains may be forwarded. Unknown
+ * methods in those domains remain compatible, but new domains fail closed.
+ */
+export function classifyCdpMethod(
+  method: string,
+  scope: CdpMethodScope,
+): CdpMethodPolicy {
+  if (scope === "browser" && SYNTHETIC_BROWSER_METHODS[method]) {
+    return CdpMethodPolicy.Allow;
+  }
+  if (scope === "browser" && SYNTHETIC_TARGET_METHODS[method]) {
+    return CdpMethodPolicy.Allow;
+  }
+  if (scope !== "page" || DENIED_PAGE_METHODS[method]) {
+    return CdpMethodPolicy.Deny;
+  }
+  const separator = method.indexOf(".");
+  const domain = separator === -1 ? method : method.slice(0, separator);
+  return PAGE_CDP_DOMAINS[domain] ? CdpMethodPolicy.Allow : CdpMethodPolicy.Deny;
+}
+
 /** Minimal socket seam so tests can drive the bridge without real WebSockets. */
 type BridgeSocket = {
   send: (data: string) => void;
@@ -120,6 +215,8 @@ export class ExtensionRelayBridge {
   private nextSessionOrdinal = 1;
   private pingTimer: NodeJS.Timeout | null = null;
   private disposePromise: Promise<void> | null = null;
+  private closing = false;
+  private disposed = false;
 
   /** True once an extension socket completed its hello handshake. */
   get extensionConnected(): boolean {
@@ -150,6 +247,10 @@ export class ExtensionRelayBridge {
     onMessage: (raw: string) => void;
     onClose: () => void;
   } {
+    if (this.closing || this.disposed) {
+      socket.close(1001, "relay stopped");
+      return { onMessage: () => {}, onClose: () => {} };
+    }
     if (this.extension) {
       // Replace the previous connection: MV3 service workers restart and the
       // stale socket may linger half-open. Newest connection wins.
@@ -158,6 +259,9 @@ export class ExtensionRelayBridge {
     }
     let helloSeen = false;
     const onMessage = (raw: string) => {
+      if (this.closing || this.disposed) {
+        return;
+      }
       const msg = parseExtensionMessage(raw);
       if (!msg) {
         return;
@@ -261,7 +365,17 @@ export class ExtensionRelayBridge {
   private startPing(): void {
     this.stopPing();
     this.pingTimer = setInterval(() => {
-      this.sendToExtension({ type: "ping" });
+      if (!this.extension) {
+        this.handleExtensionGone();
+        return;
+      }
+      try {
+        this.sendToExtension({ type: "ping" });
+      } catch {
+        // A queued interval callback can run after the extension's close
+        // callback. Treat a failed keepalive exactly like that close.
+        this.handleExtensionGone();
+      }
     }, EXTENSION_PING_INTERVAL_MS);
     this.pingTimer.unref?.();
   }
@@ -544,8 +658,15 @@ export class ExtensionRelayBridge {
     onClose: () => void;
   } {
     const client: CdpClientState = { socket, autoAttach: false, announcedSessions: new Set() };
+    if (this.closing || this.disposed) {
+      socket.close(1001, "relay stopped");
+      return { onMessage: () => {}, onClose: () => {} };
+    }
     this.clients.add(client);
     const onMessage = (raw: string) => {
+      if (this.closing || this.disposed) {
+        return;
+      }
       let parsed: unknown;
       try {
         parsed = JSON.parse(raw);
@@ -668,6 +789,15 @@ export class ExtensionRelayBridge {
     client: CdpClientState,
     request: CdpRequest,
   ): Promise<void> {
+    if (classifyCdpMethod(request.method, "page") === CdpMethodPolicy.Deny) {
+      this.respondError(
+        client,
+        request,
+        CDP_METHOD_POLICY_ERROR,
+        CDP_METHOD_POLICY_ERROR_CODE,
+      );
+      return;
+    }
     const sessionId = request.sessionId as string;
     const auxiliary = this.auxiliaryTabSessions.get(sessionId);
     if (auxiliary && auxiliary.client !== client) {
@@ -693,6 +823,15 @@ export class ExtensionRelayBridge {
     client: CdpClientState,
     request: CdpRequest,
   ): Promise<void> {
+    if (classifyCdpMethod(request.method, "browser") === CdpMethodPolicy.Deny) {
+      this.respondError(
+        client,
+        request,
+        CDP_METHOD_POLICY_ERROR,
+        CDP_METHOD_POLICY_ERROR_CODE,
+      );
+      return;
+    }
     switch (request.method) {
       case "Browser.getVersion": {
         const identity = this.extension?.identity;
@@ -706,15 +845,13 @@ export class ExtensionRelayBridge {
         return;
       }
       case "Browser.close": {
-        // Never close the user's real browser; end this automation client only.
+        // Safe relay-local cleanup for clients such as Playwright.
         this.respond(client, request, {});
         client.socket.close(1000, "Browser.close");
         return;
       }
-      // Browser-level knobs chrome.debugger cannot reach; acknowledging keeps
-      // Playwright's default-context bootstrap happy with browser defaults.
-      case "Browser.setDownloadBehavior":
       case "Target.setDiscoverTargets": {
+        // Intentionally a no-op: shared targets are always bridge-synthesized.
         this.respond(client, request, {});
         return;
       }
@@ -910,14 +1047,6 @@ export class ExtensionRelayBridge {
         this.respond(client, request, {});
         return;
       }
-      case "Target.createBrowserContext": {
-        this.respondError(
-          client,
-          request,
-          "The Agent Tab Bridge drives the user's real browser profile; isolated browser contexts are not supported.",
-        );
-        return;
-      }
       default: {
         this.respondError(client, request, `'${request.method}' wasn't found`, -32601);
       }
@@ -926,7 +1055,10 @@ export class ExtensionRelayBridge {
 
   /** Close attached debugger sessions, sockets, and reject pending work. */
   dispose(): Promise<void> {
-    this.disposePromise ??= this.disposeNow();
+    if (!this.disposePromise) {
+      this.closing = true;
+      this.disposePromise = this.disposeNow();
+    }
     return this.disposePromise;
   }
 
@@ -935,6 +1067,31 @@ export class ExtensionRelayBridge {
     const attachedTabIds = [...this.tabs].flatMap(([tabId, tab]) =>
       tab.attached ? [tabId] : [],
     );
+
+    for (const pending of this.pendingExtension.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Agent Tab Bridge relay stopped"));
+    }
+    this.pendingExtension.clear();
+    for (const [tabId, waiters] of this.tabWaiters) {
+      for (const waiter of waiters) {
+        clearTimeout(waiter.timer);
+        waiter.reject(new Error(`tab ${tabId} is no longer shared`));
+      }
+    }
+    this.tabWaiters.clear();
+
+    // Withdraw the CDP capability before waiting for best-effort debugger
+    // detach commands. Requests arriving during that wait must not forward.
+    for (const client of this.clients) {
+      client.socket.close(1001, "relay stopped");
+    }
+    this.clients.clear();
+    this.browserSessions.clear();
+    this.auxiliaryTabSessions.clear();
+    this.tabs.clear();
+    this.childSessions.clear();
+
     const detachPromise =
       this.extension && attachedTabIds.length > 0
         ? Promise.allSettled(
@@ -955,22 +1112,8 @@ export class ExtensionRelayBridge {
       pending.reject(new Error("Agent Tab Bridge relay stopped"));
     }
     this.pendingExtension.clear();
-    for (const [tabId, waiters] of this.tabWaiters) {
-      for (const waiter of waiters) {
-        clearTimeout(waiter.timer);
-        waiter.reject(new Error(`tab ${tabId} is no longer shared`));
-      }
-    }
-    this.tabWaiters.clear();
     this.extension?.socket.close(1001, "relay stopped");
     this.extension = null;
-    for (const client of this.clients) {
-      client.socket.close(1001, "relay stopped");
-    }
-    this.clients.clear();
-    this.browserSessions.clear();
-    this.auxiliaryTabSessions.clear();
-    this.tabs.clear();
-    this.childSessions.clear();
+    this.disposed = true;
   }
 }

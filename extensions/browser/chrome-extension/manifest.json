@@ -2,13 +2,13 @@
   "manifest_version": 3,
   "name": "Agent Tab Bridge",
   "version": "1.0.0",
-  "description": "Explicitly share Brave tabs with a paired local agent through the Agent Tabs group.",
+  "description": "Approve isolated local task sessions for Agent Tab Bridge.",
+  "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEK7xq73dCByVjSyuH/uoToX3IeSvK0a3V/9DepSsG9BAmkLUFfIZrmW8pgSIm3Oz2Au+F+eM8rK+bjOuCiRuCEw==",
   "permissions": [
     "debugger",
+    "nativeMessaging",
     "tabs",
-    "tabGroups",
-    "storage",
-    "alarms"
+    "tabGroups"
   ],
   "background": { "service_worker": "background.js", "type": "module" },
   "action": {
