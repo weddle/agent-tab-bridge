@@ -1,0 +1,5 @@
+# Paths retained in the generated openclaw-browser-upstream mirror.
+LICENSE
+THIRD_PARTY_NOTICES.md
+extensions/browser/chrome-extension/
+extensions/browser/src/browser/extension-relay/
