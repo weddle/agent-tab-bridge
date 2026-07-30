@@ -1,41 +1,19 @@
 {
   "manifest_version": 3,
-  "name": "OpenClaw",
-  "version": "2.1.0",
-  "description": "Let OpenClaw agents browse with you. Tabs shared with OpenClaw live in a colored tab group; drag a tab out to revoke access.",
-  "icons": {
-    "16": "icons/icon16.png",
-    "32": "icons/icon32.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
-  },
+  "name": "Agent Tab Bridge",
+  "version": "1.0.0",
+  "description": "Explicitly share Brave tabs with a paired local agent through the Agent Tabs group.",
   "permissions": [
     "debugger",
     "tabs",
     "tabGroups",
     "storage",
-    "alarms",
-    "sidePanel",
-    "contextMenus",
-    "scripting",
-    "activeTab"
+    "alarms"
   ],
-  "commands": {
-    "send-page": {
-      "suggested_key": { "default": "Alt+Shift+S" },
-      "description": "Send this page to OpenClaw"
-    }
-  },
   "background": { "service_worker": "background.js", "type": "module" },
   "action": {
-    "default_title": "OpenClaw",
-    "default_popup": "popup.html",
-    "default_icon": {
-      "16": "icons/icon16.png",
-      "32": "icons/icon32.png",
-      "48": "icons/icon48.png",
-      "128": "icons/icon128.png"
-    }
+    "default_title": "Agent Tab Bridge",
+    "default_popup": "popup.html"
   },
   "minimum_chrome_version": "125"
 }

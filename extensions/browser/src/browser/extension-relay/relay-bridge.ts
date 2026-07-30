@@ -2,39 +2,27 @@
  * Extension relay CDP bridge.
  *
  * Presents a CDP browser endpoint (compatible with Playwright connectOverCDP)
- * on one side and the OpenClaw Chrome extension's chrome.debugger transport on
- * the other. The bridge owns all Target.* synthesis so the extension stays a
- * thin forwarder — the old assets/chrome-extension put this logic in an
- * untestable MV3 service worker, which is why it rotted and was removed.
+ * on one side and the browser extension's chrome.debugger transport on the
+ * other. The bridge owns all Target.* synthesis so the extension stays a thin
+ * forwarder.
  */
-import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { resolveCreateTargetParams } from "./create-target-params.js";
-import { PAGE_SHARE_GATEWAY_REQUIRED_ERROR } from "./page-share.js";
 import {
   type ExtensionToRelayMessage,
-  PAGE_SHARE_MAX_NOTE_CHARS,
-  PAGE_SHARE_MAX_TITLE_CHARS,
-  PAGE_SHARE_MAX_URL_CHARS,
-  type PageSharePayload,
   parseExtensionMessage,
   type RelayCommandBody,
-  type RelayPageShareResultMessage,
   type RelayTabInfo,
   type RelayToExtensionMessage,
 } from "./relay-protocol.js";
 
-const log = createSubsystemLogger("browser").child("extension-relay");
-
-/** Default timeout for commands forwarded to the extension. */
 const EXTENSION_COMMAND_TIMEOUT_MS = 15_000;
-/** App-level keepalive interval; message traffic keeps the MV3 worker alive. */
 const EXTENSION_PING_INTERVAL_MS = 20_000;
-const PAGE_SHARE_MAX_BODY_CHARS = 300_000;
+const EXTENSION_DISPOSE_TIMEOUT_MS = 2_000;
 
 /** Synthetic targetId for the emulated browser target. */
-const BROWSER_TARGET_ID = "openclaw-extension-relay";
+const BROWSER_TARGET_ID = "agent-tab-bridge-browser";
 /** Playwright requires every attached page target to identify its browser context. */
-const BROWSER_CONTEXT_ID = "openclaw-extension-context";
+const BROWSER_CONTEXT_ID = "agent-tab-bridge-context";
 
 /** Minimal socket seam so tests can drive the bridge without real WebSockets. */
 type BridgeSocket = {
@@ -74,6 +62,12 @@ type AuxiliaryTabSession = {
   parentSessionId: string;
   client: CdpClientState;
 };
+type TabWaiter = {
+  resolve: (tab: TabState) => void;
+  reject: (err: Error) => void;
+  timer: NodeJS.Timeout;
+};
+
 
 /** Browser identity reported by the paired extension. */
 type ExtensionIdentity = {
@@ -82,6 +76,7 @@ type ExtensionIdentity = {
   extensionVersion: string;
 };
 
+
 function toErrorPayload(
   id: number | null,
   sessionId: string | undefined,
@@ -89,6 +84,19 @@ function toErrorPayload(
   code = -32000,
 ): string {
   return JSON.stringify({ id, ...(sessionId ? { sessionId } : {}), error: { code, message } });
+}
+function isRelayTabInfo(value: unknown): value is RelayTabInfo {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const tab = value as Partial<RelayTabInfo>;
+  return (
+    Number.isSafeInteger(tab.tabId) &&
+    (tab.tabId as number) >= 0 &&
+    typeof tab.url === "string" &&
+    typeof tab.title === "string" &&
+    typeof tab.active === "boolean"
+  );
 }
 
 /**
@@ -107,21 +115,11 @@ export class ExtensionRelayBridge {
   /** Child debugger sessions (iframes/workers) mapped to their owning tab. */
   private readonly childSessions = new Map<string, number>();
   private readonly pendingExtension = new Map<number, PendingExtensionCommand>();
+  private readonly tabWaiters = new Map<number, Set<TabWaiter>>();
   private nextSeq = 1;
   private nextSessionOrdinal = 1;
   private pingTimer: NodeJS.Timeout | null = null;
-  private readonly onStateChange?: () => void;
-  private readonly onPageShare?: (payload: PageSharePayload) => Promise<void>;
-
-  constructor(
-    opts: {
-      onStateChange?: () => void;
-      onPageShare?: (payload: PageSharePayload) => Promise<void>;
-    } = {},
-  ) {
-    this.onStateChange = opts.onStateChange;
-    this.onPageShare = opts.onPageShare;
-  }
+  private disposePromise: Promise<void> | null = null;
 
   /** True once an extension socket completed its hello handshake. */
   get extensionConnected(): boolean {
@@ -133,7 +131,7 @@ export class ExtensionRelayBridge {
     return this.extension?.identity ?? null;
   }
 
-  /** Tabs currently shared with OpenClaw (the extension's tab group). */
+  /** Tabs currently reported as shared by the extension. */
   sharedTabs(): RelayTabInfo[] {
     return [...this.tabs.values()].map((tab) => tab.info);
   }
@@ -155,7 +153,6 @@ export class ExtensionRelayBridge {
     if (this.extension) {
       // Replace the previous connection: MV3 service workers restart and the
       // stale socket may linger half-open. Newest connection wins.
-      log.info("extension reconnected; replacing previous relay connection");
       this.extension.socket.close(4000, "replaced by newer extension connection");
       this.handleExtensionGone();
     }
@@ -163,7 +160,6 @@ export class ExtensionRelayBridge {
     const onMessage = (raw: string) => {
       const msg = parseExtensionMessage(raw);
       if (!msg) {
-        log.warn("dropping malformed extension relay frame");
         return;
       }
       if (!helloSeen) {
@@ -182,7 +178,6 @@ export class ExtensionRelayBridge {
         };
         this.syncTabs(msg.tabs);
         this.startPing();
-        this.onStateChange?.();
         return;
       }
       this.handleExtensionMessage(msg);
@@ -190,7 +185,6 @@ export class ExtensionRelayBridge {
     const onClose = () => {
       if (this.extension?.socket === socket) {
         this.handleExtensionGone();
-        this.onStateChange?.();
       }
     };
     return { onMessage, onClose };
@@ -224,10 +218,6 @@ export class ExtensionRelayBridge {
         this.syncTabs(msg.tabs);
         return;
       }
-      case "pageShare": {
-        void this.handlePageShare(msg.requestId, msg.payload);
-        return;
-      }
       case "detached": {
         const tab = this.tabs.get(msg.tabId);
         if (tab?.attached) {
@@ -242,53 +232,6 @@ export class ExtensionRelayBridge {
     }
   }
 
-  private async handlePageShare(requestId: number, payload: PageSharePayload): Promise<void> {
-    const validRequestId = Number.isSafeInteger(requestId) && requestId >= 0;
-    const validPayload =
-      payload !== null &&
-      typeof payload === "object" &&
-      typeof payload.url === "string" &&
-      payload.url.length <= PAGE_SHARE_MAX_URL_CHARS &&
-      typeof payload.title === "string" &&
-      payload.title.length <= PAGE_SHARE_MAX_TITLE_CHARS &&
-      typeof payload.content === "string" &&
-      (payload.selection === undefined || typeof payload.selection === "string") &&
-      (payload.note === undefined ||
-        (typeof payload.note === "string" && payload.note.length <= PAGE_SHARE_MAX_NOTE_CHARS)) &&
-      payload.content.length + (payload.selection?.length ?? 0) <= PAGE_SHARE_MAX_BODY_CHARS;
-
-    if (!validRequestId || !validPayload) {
-      this.sendPageShareResult({
-        requestId: validRequestId ? requestId : 0,
-        ok: false,
-        error: "Invalid page-share payload.",
-      });
-      return;
-    }
-    if (!this.onPageShare) {
-      this.sendPageShareResult({ requestId, ok: false, error: PAGE_SHARE_GATEWAY_REQUIRED_ERROR });
-      return;
-    }
-
-    try {
-      await this.onPageShare(payload);
-      this.sendPageShareResult({ requestId, ok: true });
-    } catch (err) {
-      this.sendPageShareResult({
-        requestId,
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  private sendPageShareResult(result: Omit<RelayPageShareResultMessage, "type">): void {
-    try {
-      this.sendToExtension({ type: "pageShareResult", ...result });
-    } catch (err) {
-      log.warn(`failed to send page-share result: ${String(err)}`);
-    }
-  }
 
   private handleExtensionGone(): void {
     this.extension = null;
@@ -298,14 +241,20 @@ export class ExtensionRelayBridge {
       pending.reject(new Error("extension disconnected"));
     }
     this.pendingExtension.clear();
-    // Tell CDP clients their pages are gone; the tab list itself survives so a
-    // reconnecting extension can re-expose the same tabs.
+    for (const [tabId, waiters] of this.tabWaiters) {
+      for (const waiter of waiters) {
+        clearTimeout(waiter.timer);
+        waiter.reject(new Error(`tab ${tabId} is no longer shared`));
+      }
+    }
+    this.tabWaiters.clear();
     for (const [tabId, tab] of this.tabs) {
       if (tab.attached) {
         this.emitDetachedFromTarget(tabId, tab.attached.sessionId, tab.attached.targetId);
         tab.attached = undefined;
       }
     }
+    this.tabs.clear();
     this.childSessions.clear();
   }
 
@@ -326,10 +275,11 @@ export class ExtensionRelayBridge {
 
   private sendToExtension(msg: RelayToExtensionMessage): void {
     if (!this.extension) {
-      throw new Error("OpenClaw Chrome extension is not connected to the relay");
+      throw new Error("Agent Tab Bridge extension is not connected to the relay");
     }
     this.extension.socket.send(JSON.stringify(msg));
   }
+
 
   private callExtension(
     command: RelayCommandBody,
@@ -352,9 +302,9 @@ export class ExtensionRelayBridge {
       }
     });
   }
-
-  private syncTabs(tabs: RelayTabInfo[]): void {
-    const nextIds = new Set(tabs.map((tab) => tab.tabId));
+  private syncTabs(tabs: unknown): void {
+    const validTabs = (Array.isArray(tabs) ? tabs : []).filter(isRelayTabInfo);
+    const nextIds = new Set(validTabs.map((tab) => tab.tabId));
     for (const [tabId, tab] of this.tabs) {
       if (!nextIds.has(tabId)) {
         if (tab.attached) {
@@ -363,31 +313,61 @@ export class ExtensionRelayBridge {
         this.tabs.delete(tabId);
       }
     }
-    for (const info of tabs) {
+    for (const info of validTabs) {
       const existing = this.tabs.get(info.tabId);
       if (existing) {
         existing.info = info;
       } else {
-        this.tabs.set(info.tabId, { info });
-        // Newly shared tab: expose it to auto-attach clients right away so an
-        // agent mid-session sees tabs the user shares via the toolbar action.
+        const tab = { info };
+        this.tabs.set(info.tabId, tab);
+        const waiters = this.tabWaiters.get(info.tabId);
+        if (waiters) {
+          for (const waiter of waiters) {
+            clearTimeout(waiter.timer);
+            waiter.resolve(tab);
+          }
+          this.tabWaiters.delete(info.tabId);
+        }
+        // Newly shared tab: expose it to auto-attach clients right away.
         if ([...this.clients].some((client) => client.autoAttach)) {
           void this.ensureTabAttached(info.tabId)
             .then(({ targetId, sessionId }) => {
               this.announceAttachedTab(info.tabId, targetId, sessionId, { onlyAutoAttach: true });
+
             })
-            .catch((err: unknown) => {
-              log.warn(`auto-attach of shared tab ${info.tabId} failed: ${String(err)}`);
-            });
+            .catch(() => {});
         }
       }
     }
   }
+  private waitForSharedTab(tabId: number): Promise<TabState> {
+    const existing = this.tabs.get(tabId);
+    if (existing) {
+      return Promise.resolve(existing);
+    }
+    return new Promise<TabState>((resolve, reject) => {
+      let waiter: TabWaiter;
+      const timer = setTimeout(() => {
+        const waiters = this.tabWaiters.get(tabId);
+        waiters?.delete(waiter);
+        if (waiters?.size === 0) {
+          this.tabWaiters.delete(tabId);
+        }
+        reject(new Error(`extension did not report tab ${tabId} as shared`));
+      }, EXTENSION_COMMAND_TIMEOUT_MS);
+      timer.unref?.();
+      waiter = { resolve, reject, timer };
+      const waiters = this.tabWaiters.get(tabId) ?? new Set<TabWaiter>();
+      waiters.add(waiter);
+      this.tabWaiters.set(tabId, waiters);
+    });
+  }
+
 
   private async ensureTabAttached(tabId: number): Promise<{ targetId: string; sessionId: string }> {
     const tab = this.tabs.get(tabId);
     if (!tab) {
-      throw new Error(`tab ${tabId} is not shared with OpenClaw`);
+      throw new Error(`tab ${tabId} is not shared with Agent Tabs`);
     }
     if (tab.attached) {
       return tab.attached;
@@ -400,7 +380,7 @@ export class ExtensionRelayBridge {
         targetId?: unknown;
       } | null;
       const targetId = typeof result?.targetId === "string" ? result.targetId : `tab-${tabId}`;
-      const sessionId = `openclaw-tab-${tabId}-${this.nextSessionOrdinal++}`;
+      const sessionId = `agent-tab-bridge-tab-${tabId}-${this.nextSessionOrdinal++}`;
       const attached = { targetId, sessionId };
       // Identity check, not just presence: the tab could have left the group and
       // rejoined under the same tabId while this attach was in flight, replacing
@@ -606,7 +586,8 @@ export class ExtensionRelayBridge {
 
   /**
    * Drop chrome.debugger sessions once no CDP client is connected so the
-   * "OpenClaw is debugging this browser" infobar only spans active automation.
+   * "Agent Tab Bridge is debugging this browser" infobar only spans active
+   * automation.
    */
   private detachAllWhenIdle(): void {
     if (this.clients.size > 0 || !this.extension) {
@@ -717,8 +698,8 @@ export class ExtensionRelayBridge {
         const identity = this.extension?.identity;
         this.respond(client, request, {
           protocolVersion: "1.3",
-          product: identity?.browserVersion ?? "Chrome/unknown",
-          revision: "openclaw-extension-relay",
+          product: identity?.browserVersion ?? "Brave/unknown",
+          revision: "agent-tab-bridge-relay",
           userAgent: identity?.userAgent ?? "unknown",
           jsVersion: "",
         });
@@ -744,7 +725,7 @@ export class ExtensionRelayBridge {
             targetInfo: {
               targetId: BROWSER_TARGET_ID,
               type: "browser",
-              title: "OpenClaw Extension Relay",
+              title: "Agent Tab Bridge",
               url: "",
               attached: true,
               canAccessOpener: false,
@@ -770,7 +751,7 @@ export class ExtensionRelayBridge {
         return;
       }
       case "Target.attachToBrowserTarget": {
-        const sessionId = `openclaw-browser-${this.nextSessionOrdinal++}`;
+        const sessionId = `agent-tab-bridge-browser-${this.nextSessionOrdinal++}`;
         this.browserSessions.set(sessionId, client);
         this.respond(client, request, { sessionId });
         return;
@@ -796,9 +777,7 @@ export class ExtensionRelayBridge {
                   onlyClient: client,
                 },
               );
-            } else {
-              log.warn(`setAutoAttach attach failed: ${String(settled.reason)}`);
-            }
+          }
           }
         }
         this.respond(client, request, {});
@@ -821,7 +800,7 @@ export class ExtensionRelayBridge {
           // Playwright creates a fresh page-scoped session for helpers such as
           // Target.getTargetInfo and DOM refs. Multiplex it onto the one real
           // chrome.debugger attachment instead of reusing the auto-attach id.
-          const sessionId = `openclaw-tab-${found.tabId}-${this.nextSessionOrdinal++}`;
+          const sessionId = `agent-tab-bridge-tab-${found.tabId}-${this.nextSessionOrdinal++}`;
           this.auxiliaryTabSessions.set(sessionId, {
             tabId: found.tabId,
             parentSessionId: request.sessionId,
@@ -877,14 +856,16 @@ export class ExtensionRelayBridge {
         const createParams = resolveCreateTargetParams(request.params);
         const command = { type: "createTab", url, ...createParams } as const;
         const created = (await this.callExtension(command)) as { tabId?: unknown } | null;
-        if (typeof created?.tabId !== "number") {
-          this.respondError(client, request, "extension did not return a tabId for createTab");
+        const createdTabId =
+          created && typeof created.tabId === "number" && Number.isSafeInteger(created.tabId)
+            ? created.tabId
+            : null;
+        if (createdTabId === null) {
+          this.respondError(client, request, "extension did not return a valid tabId for createTab");
           return;
         }
-        const tabId = created.tabId;
-        if (!this.tabs.has(tabId)) {
-          this.tabs.set(tabId, { info: { tabId, url, title: "", active: false } });
-        }
+        const tabId = createdTabId;
+        await this.waitForSharedTab(tabId);
         const attached = await this.ensureTabAttached(tabId);
         // Announce before responding, mirroring Chrome's event-then-result order.
         this.announceAttachedTab(tabId, attached.targetId, attached.sessionId, {
@@ -933,7 +914,7 @@ export class ExtensionRelayBridge {
         this.respondError(
           client,
           request,
-          "The OpenClaw extension relay drives the user's real browser profile; isolated browser contexts are not supported.",
+          "The Agent Tab Bridge drives the user's real browser profile; isolated browser contexts are not supported.",
         );
         return;
       }
@@ -943,14 +924,44 @@ export class ExtensionRelayBridge {
     }
   }
 
-  /** Close all sockets and reject pending work (relay shutdown). */
-  dispose(): void {
+  /** Close attached debugger sessions, sockets, and reject pending work. */
+  dispose(): Promise<void> {
+    this.disposePromise ??= this.disposeNow();
+    return this.disposePromise;
+  }
+
+  private async disposeNow(): Promise<void> {
     this.stopPing();
+    const attachedTabIds = [...this.tabs].flatMap(([tabId, tab]) =>
+      tab.attached ? [tabId] : [],
+    );
+    const detachPromise =
+      this.extension && attachedTabIds.length > 0
+        ? Promise.allSettled(
+            attachedTabIds.map((tabId) => this.callExtension({ type: "detach", tabId })),
+          )
+        : Promise.resolve([]);
+    let timeout!: NodeJS.Timeout;
+    await Promise.race([
+      detachPromise,
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, EXTENSION_DISPOSE_TIMEOUT_MS);
+        timeout.unref?.();
+      }),
+    ]);
+    clearTimeout(timeout);
     for (const pending of this.pendingExtension.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error("extension relay stopped"));
+      pending.reject(new Error("Agent Tab Bridge relay stopped"));
     }
     this.pendingExtension.clear();
+    for (const [tabId, waiters] of this.tabWaiters) {
+      for (const waiter of waiters) {
+        clearTimeout(waiter.timer);
+        waiter.reject(new Error(`tab ${tabId} is no longer shared`));
+      }
+    }
+    this.tabWaiters.clear();
     this.extension?.socket.close(1001, "relay stopped");
     this.extension = null;
     for (const client of this.clients) {
@@ -963,4 +974,3 @@ export class ExtensionRelayBridge {
     this.childSessions.clear();
   }
 }
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

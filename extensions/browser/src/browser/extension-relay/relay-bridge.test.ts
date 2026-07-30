@@ -1,5 +1,5 @@
 // Extension relay bridge: CDP target synthesis and extension command routing.
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { ExtensionRelayBridge } from "./relay-bridge.js";
 import type { ExtensionToRelayMessage, RelayToExtensionMessage } from "./relay-protocol.js";
 
@@ -41,6 +41,22 @@ function wireExtension(bridge: ExtensionRelayBridge) {
       if (reply) {
         handlers.onMessage(JSON.stringify(reply));
       }
+      if (msg.type === "createTab") {
+        handlers.onMessage(
+          JSON.stringify({
+            type: "tabs",
+            tabs: [
+              ...defaultTabs(),
+              {
+                tabId: 999,
+                url: msg.url,
+                title: "New tab",
+                active: msg.focus === true,
+              },
+            ],
+          }),
+        );
+      }
     });
   };
   return { socket, handlers };
@@ -67,8 +83,8 @@ function sendHello(handlers: { onMessage: (raw: string) => void }, tabs = defaul
   handlers.onMessage(
     JSON.stringify({
       type: "hello",
-      userAgent: "Mozilla/5.0 Chrome/144.0.0.0",
-      browserVersion: "Chrome/144.0.0.0",
+      userAgent: "Mozilla/5.0 Brave/1.80.0",
+      browserVersion: "Brave/1.80.0",
       extensionVersion: "2.0.0",
       tabs,
     }),
@@ -79,10 +95,11 @@ function defaultTabs() {
   return [{ tabId: 1, url: "https://example.com", title: "Example", active: true }];
 }
 
-const flush = () =>
-  new Promise((resolve) => {
-    setTimeout(resolve, 0);
+const flush = async () => {
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
   });
+};
 
 describe("ExtensionRelayBridge", () => {
   it("reports the paired browser identity through Browser.getVersion", async () => {
@@ -99,7 +116,7 @@ describe("ExtensionRelayBridge", () => {
     const response = client.frames().find((frame) => frame.id === 1);
     expect(response?.result).toMatchObject({
       protocolVersion: "1.3",
-      product: "Chrome/144.0.0.0",
+      product: "Brave/1.80.0",
     });
   });
 
@@ -122,7 +139,6 @@ describe("ExtensionRelayBridge", () => {
       sessionId?: string;
     };
     expect(params.targetInfo?.targetId).toBe("target-1");
-    expect(params.targetInfo?.browserContextId).toBe("openclaw-extension-context");
     expect(typeof params.sessionId).toBe("string");
   });
 
@@ -377,7 +393,7 @@ describe("ExtensionRelayBridge", () => {
 
     handlers.onClose();
     // A subsequent session command should surface a clean error, not hang.
-    cdp.onMessage(JSON.stringify({ id: 2, sessionId: "openclaw-tab-1-1", method: "Page.reload" }));
+    cdp.onMessage(JSON.stringify({ id: 2, sessionId: "session-no-longer-shared", method: "Page.reload" }));
     await flush();
     const response = client.frames().find((frame) => frame.id === 2);
     expect(response?.error).toBeTruthy();
@@ -436,7 +452,7 @@ describe("ExtensionRelayBridge", () => {
     );
     await flush();
 
-    // Tab 1 leaves the OpenClaw group.
+    // Tab 1 loses the user's sharing consent.
     handlers.onMessage(JSON.stringify({ type: "tabs", tabs: [] }));
     await flush();
 
@@ -448,122 +464,6 @@ describe("ExtensionRelayBridge", () => {
     expect(response?.error).toBeTruthy();
   });
 
-  it("delivers a valid page share and acknowledges success", async () => {
-    const onPageShare = vi.fn(async () => undefined);
-    const bridge = new ExtensionRelayBridge({ onPageShare });
-    const { socket, handlers } = wireExtension(bridge);
-    sendHello(handlers);
-    const payload = {
-      url: "https://example.com/article",
-      title: "Example",
-      content: "Article body",
-    };
-
-    handlers.onMessage(JSON.stringify({ type: "pageShare", requestId: 41, payload }));
-    await flush();
-
-    expect(onPageShare).toHaveBeenCalledWith(payload);
-    expect(socket.frames()).toContainEqual({
-      type: "pageShareResult",
-      requestId: 41,
-      ok: true,
-    });
-  });
-
-  it("returns the delivery error when the page-share handler rejects", async () => {
-    const bridge = new ExtensionRelayBridge({
-      onPageShare: async () => {
-        throw new Error("queue unavailable");
-      },
-    });
-    const { socket, handlers } = wireExtension(bridge);
-    sendHello(handlers);
-
-    handlers.onMessage(
-      JSON.stringify({
-        type: "pageShare",
-        requestId: 42,
-        payload: { url: "https://example.com", title: "Example", content: "Body" },
-      }),
-    );
-    await flush();
-
-    expect(socket.frames()).toContainEqual({
-      type: "pageShareResult",
-      requestId: 42,
-      ok: false,
-      error: "queue unavailable",
-    });
-  });
-
-  it("explains that page shares require a gateway-hosted relay", async () => {
-    const bridge = new ExtensionRelayBridge();
-    const { socket, handlers } = wireExtension(bridge);
-    sendHello(handlers);
-
-    handlers.onMessage(
-      JSON.stringify({
-        type: "pageShare",
-        requestId: 43,
-        payload: { url: "https://example.com", title: "Example", content: "Body" },
-      }),
-    );
-    await flush();
-
-    expect(socket.frames()).toContainEqual({
-      type: "pageShareResult",
-      requestId: 43,
-      ok: false,
-      error:
-        "Send to OpenClaw needs the extension relay hosted by the Gateway (pair on the Gateway host or use direct Gateway pairing). Node-hosted relays are not supported yet.",
-    });
-  });
-
-  it("rejects invalid and oversized page-share payloads before delivery", async () => {
-    const onPageShare = vi.fn(async () => undefined);
-    const bridge = new ExtensionRelayBridge({ onPageShare });
-    const { socket, handlers } = wireExtension(bridge);
-    sendHello(handlers);
-
-    handlers.onMessage(
-      JSON.stringify({
-        type: "pageShare",
-        requestId: 44,
-        payload: { url: "https://example.com", title: 7, content: "Body" },
-      }),
-    );
-    handlers.onMessage(
-      JSON.stringify({
-        type: "pageShare",
-        requestId: 45,
-        payload: {
-          url: "https://example.com",
-          title: "Example",
-          content: "c".repeat(200_000),
-          selection: "s".repeat(100_001),
-        },
-      }),
-    );
-    await flush();
-
-    expect(onPageShare).not.toHaveBeenCalled();
-    expect(socket.frames()).toEqual(
-      expect.arrayContaining([
-        {
-          type: "pageShareResult",
-          requestId: 44,
-          ok: false,
-          error: "Invalid page-share payload.",
-        },
-        {
-          type: "pageShareResult",
-          requestId: 45,
-          ok: false,
-          error: "Invalid page-share payload.",
-        },
-      ]),
-    );
-  });
 
   it("requires a hello frame before other extension messages", () => {
     const bridge = new ExtensionRelayBridge();

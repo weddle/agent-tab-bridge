@@ -31,7 +31,42 @@ The capability URL is short-lived. It must not be committed, stored in persisten
 
 ## Status
 
-Initial upstream import. OpenClaw-specific branding, copilot/sidebar features, gateway integration, and page-sharing features are being removed before the first usable build. Brave is the MVP validation target.
+Brave MVP implementation is buildable and has passed the focused relay contracts plus an end-to-end disposable-profile smoke test: load extension, pair, share one tab, read it through authenticated CDP, disconnect the client without revoking the share, unshare, and confirm immediate disappearance. Chrome remains unverified.
+
+## Build and try it
+
+Requires Node.js 22 or newer.
+
+```bash
+npm install
+npm run build
+npm run test:relay
+```
+
+In Brave:
+
+1. Open `brave://extensions`, enable **Developer mode**, and choose **Load unpacked**.
+2. Select `extensions/browser/chrome-extension/`.
+3. Start one foreground relay:
+
+   ```bash
+   npm start
+   ```
+
+4. Copy the first, fragment-bearing line from the relay terminal into the extension popup and choose **Pair**.
+5. On a tab you intend to expose, choose **Share this tab**. It moves into the visible **Agent Tabs** group.
+6. In a second terminal, read the relay's CDP URL without putting the capability itself in shell history, then start Hermes:
+
+   ```bash
+   read -r BROWSER_CDP_URL
+   export BROWSER_CDP_URL
+   hermes
+   unset BROWSER_CDP_URL
+   ```
+
+   Paste only the URL after `BROWSER_CDP_URL=` at the `read` prompt.
+
+Do not put either printed capability in shell history, profile configuration, logs, or notifications. Stop the foreground relay when the task ends.
 
 ## Upstream and attribution
 

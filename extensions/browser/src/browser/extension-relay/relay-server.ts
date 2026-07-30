@@ -1,45 +1,27 @@
 /**
- * Extension relay HTTP/WebSocket server.
+ * Standalone loopback relay between the Agent Tab Bridge extension and CDP.
  *
- * Loopback-only endpoint that pairs the OpenClaw Chrome extension with the
- * browser control service:
- *   GET /json/version  -> CDP discovery for pw-session (503 until paired)
- *   WS  /cdp           -> CDP browser endpoint (Playwright connectOverCDP)
- *   WS  /extension     -> the Chrome extension's relay transport
- * Both sides authenticate with the derived relay token: CDP clients send it as
- * Basic auth (flows from the profile cdpUrl userinfo via getHeadersWithAuth),
- * the extension sends the token in its WebSocket subprotocol list.
+ * The relay has no application-runtime dependencies. It binds only to
+ * 127.0.0.1, creates an ephemeral capability by default, and authenticates
+ * every HTTP request and WebSocket upgrade before exposing discovery or CDP.
  */
+import crypto from "node:crypto";
 import http, { type IncomingMessage, type Server } from "node:http";
 import type { Duplex } from "node:stream";
-import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
-import { WebSocketServer, type WebSocket } from "ws";
-import { isLoopbackHost } from "../../gateway/net.js";
-import { rawDataToString } from "../../infra/ws.js";
-import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import { ExtensionRelayBridge } from "./relay-bridge.js";
-import type { PageSharePayload } from "./relay-protocol.js";
 
-const log = createSubsystemLogger("browser").child("extension-relay");
-const EXTENSION_RELAY_PROTOCOL = "openclaw-extension-relay";
-const EXTENSION_RELAY_TOKEN_PROTOCOL_PREFIX = "openclaw-extension-token.";
+export const EXTENSION_RELAY_PROTOCOL = "agent-tab-bridge-relay";
+export const EXTENSION_RELAY_TOKEN_PROTOCOL_PREFIX = "agent-tab-bridge-token.";
 
-/**
- * Cap relay frame size to bound memory from a hostile/buggy peer while leaving
- * headroom for CDP payloads (base64 screenshots, DOM snapshots, network bodies).
- */
+/** Maximum size accepted for a single extension or CDP WebSocket frame. */
 export const EXTENSION_RELAY_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
 
-/** Wire an accepted extension WebSocket to a bridge (shared by loopback + gateway paths). */
-export function attachExtensionWebSocket(bridge: ExtensionRelayBridge, ws: WebSocket): void {
-  bindSocket(ws, bridge.attachExtensionSocket(ws));
-}
-
-/** Running relay server handle owned by the profile runtime state. */
-export type ExtensionRelayHandle = {
+export type AgentTabRelayHandle = {
   port: number;
-  /** Auth token this relay validates against; used to detect auth rotation. */
   token: string;
+  pairingUrl: string;
+  cdpUrl: string;
   bridge: ExtensionRelayBridge;
   close: () => Promise<void>;
 };
@@ -62,7 +44,6 @@ export function requestExtensionProtocolToken(req: IncomingMessage): string {
   return tokenProtocol?.slice(EXTENSION_RELAY_TOKEN_PROTOCOL_PREFIX.length) ?? "";
 }
 
-/** Extract relay auth from a CDP header, extension subprotocol, or legacy query. */
 function requestToken(req: IncomingMessage): string {
   const auth = firstHeader(req.headers.authorization);
   if (auth.startsWith("Bearer ")) {
@@ -85,83 +66,145 @@ function requestToken(req: IncomingMessage): string {
   }
 }
 
+/** Compare the fixed-length capability without an ordinary string equality. */
+function hasValidToken(expected: string, candidate: string): boolean {
+  const expectedBytes = Buffer.from(expected, "utf8");
+  const candidateBytes = Buffer.from(candidate, "utf8");
+  const padded = Buffer.alloc(expectedBytes.length);
+  candidateBytes.copy(padded, 0, 0, Math.min(candidateBytes.length, padded.length));
+  const equal = crypto.timingSafeEqual(expectedBytes, padded);
+  return candidateBytes.length === expectedBytes.length && equal;
+}
+
 function isAuthorized(req: IncomingMessage, token: string): boolean {
-  const candidate = requestToken(req);
-  return candidate.length > 0 && safeEqualSecret(token, candidate);
+  return hasValidToken(token, requestToken(req));
 }
 
-/** Reject cross-origin websocket upgrades; the extension side must come from Chrome. */
+/** Require a real chrome-extension:// origin for the extension endpoint. */
 export function isAllowedExtensionOrigin(req: IncomingMessage): boolean {
-  const origin = firstHeader(req.headers.origin);
-  // Chrome MV3 service workers send their chrome-extension:// origin. Absent
-  // origin is allowed for non-browser clients such as tests and diagnostics.
-  return origin === "" || origin.startsWith("chrome-extension://");
-}
-
-/** Reject DNS-rebinding style requests that reach loopback with a foreign Host. */
-function hasLoopbackHostHeader(req: IncomingMessage): boolean {
-  const host = firstHeader(req.headers.host);
-  if (!host) {
-    return true;
+  const origin = firstHeader(req.headers.origin).trim();
+  if (!origin) {
+    return false;
   }
   try {
-    return isLoopbackHost(new URL(`http://${host}`).hostname);
+    const parsed = new URL(origin);
+    return (
+      parsed.protocol === "chrome-extension:" &&
+      parsed.hostname.length > 0 &&
+      parsed.username === "" &&
+      parsed.password === "" &&
+      parsed.port === "" &&
+      (parsed.pathname === "" || parsed.pathname === "/") &&
+      parsed.search === "" &&
+      parsed.hash === ""
+    );
   } catch {
     return false;
   }
 }
 
-function destroySocket(socket: Duplex, response: string): void {
-  socket.write(response);
-  socket.destroy();
+/** The relay accepts only the exact IPv4 loopback Host spelling. */
+function hasLoopbackHostHeader(req: IncomingMessage): boolean {
+  const host = firstHeader(req.headers.host).trim();
+  const match = /^127\.0\.0\.1(?::(\d{1,5}))?$/.exec(host);
+  return match !== null && (match[1] === undefined || Number(match[1]) <= 65_535);
 }
 
-/** Start the relay server for one extension-driver profile. */
-export async function startExtensionRelayServer(params: {
-  port: number;
-  token: string;
-  onStateChange?: () => void;
-  onPageShare?: (payload: PageSharePayload) => Promise<void>;
-}): Promise<ExtensionRelayHandle> {
-  const bridge = new ExtensionRelayBridge({
-    onStateChange: params.onStateChange,
-    onPageShare: params.onPageShare,
+function destroySocket(socket: Duplex, response: string): void {
+  try {
+    socket.write(response);
+  } finally {
+    socket.destroy();
+  }
+}
+
+function rawDataToString(data: RawData): string {
+  if (typeof data === "string") {
+    return data;
+  }
+  if (data instanceof ArrayBuffer) {
+    return Buffer.from(data).toString("utf8");
+  }
+  if (Array.isArray(data)) {
+    return Buffer.concat(data).toString("utf8");
+  }
+  return data.toString("utf8");
+}
+
+/** Wire an accepted extension WebSocket to a bridge. */
+export function attachExtensionWebSocket(bridge: ExtensionRelayBridge, ws: WebSocket): void {
+  bindSocket(ws, bridge.attachExtensionSocket(ws));
+}
+
+function bindSocket(
+  ws: WebSocket,
+  handlers: { onMessage: (raw: string) => void; onClose: () => void },
+): void {
+  ws.on("message", (data) => {
+    const raw = rawDataToString(data);
+    if (Buffer.byteLength(raw, "utf8") > EXTENSION_RELAY_MAX_PAYLOAD_BYTES) {
+      ws.close(1009, "relay frame exceeds maximum size");
+      return;
+    }
+    handlers.onMessage(raw);
   });
+  ws.on("close", handlers.onClose);
+  ws.on("error", () => {});
+}
+
+/** Start one ephemeral Agent Tab Bridge relay. */
+export async function startAgentTabRelay(
+  params: { port?: number; token?: string } = {},
+): Promise<AgentTabRelayHandle> {
+  const requestedPort = params.port ?? 0;
+  if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65_535) {
+    throw new RangeError("relay port must be an integer between 0 and 65535");
+  }
+  const token = params.token ?? crypto.randomBytes(32).toString("hex");
+  if (token.length === 0) {
+    throw new Error("relay token must not be empty");
+  }
+
+  const bridge = new ExtensionRelayBridge();
   const wss = new WebSocketServer({
     noServer: true,
     maxPayload: EXTENSION_RELAY_MAX_PAYLOAD_BYTES,
   });
 
-  const server: Server = http.createServer((req, res) => {
+  let serverPort = requestedPort;
+  let server: Server;
+  const resolvedPort = () => {
+    const address = server.address();
+    return typeof address === "object" && address ? address.port : serverPort;
+  };
+
+  server = http.createServer((req, res) => {
     if (!hasLoopbackHostHeader(req)) {
       res.writeHead(403).end("Forbidden");
       return;
     }
-    if (!isAuthorized(req, params.token)) {
-      res.writeHead(401, { "WWW-Authenticate": 'Basic realm="openclaw-extension-relay"' });
+    if (!isAuthorized(req, token)) {
+      res.writeHead(401, { "WWW-Authenticate": 'Bearer realm="agent-tab-bridge-relay"' });
       res.end("Unauthorized");
       return;
     }
-    const path = (req.url ?? "/").split("?")[0];
+
+    const path = (req.url ?? "/").split("?", 1)[0];
     if (req.method === "GET" && (path === "/json/version" || path === "/json/version/")) {
       if (!bridge.extensionConnected) {
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error:
-              "OpenClaw Chrome extension is not connected. Install the extension and pair it with `openclaw browser extension pair`.",
-          }),
-        );
+        res.end(JSON.stringify({ error: "Agent Tab Bridge extension is not connected" }));
         return;
       }
       const identity = bridge.identity;
+      const cdpUrl = `ws://127.0.0.1:${resolvedPort()}/cdp?token=${encodeURIComponent(token)}`;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
-          Browser: identity?.browserVersion ?? "Chrome/unknown",
+          Browser: identity?.browserVersion ?? "Brave/unknown",
           "Protocol-Version": "1.3",
           "User-Agent": identity?.userAgent ?? "unknown",
-          webSocketDebuggerUrl: `ws://127.0.0.1:${resolvedPort()}/cdp`,
+          webSocketDebuggerUrl: cdpUrl,
         }),
       );
       return;
@@ -171,27 +214,38 @@ export async function startExtensionRelayServer(params: {
       res.end(JSON.stringify(bridge.sharedTabs()));
       return;
     }
+    if (path === "/extension") {
+      if (!isAllowedExtensionOrigin(req)) {
+        res.writeHead(403).end("Forbidden");
+        return;
+      }
+      res.writeHead(426, { Upgrade: "websocket" }).end("Upgrade Required");
+      return;
+    }
+    if (path === "/cdp") {
+      res.writeHead(426, { Upgrade: "websocket" }).end("Upgrade Required");
+      return;
+    }
     res.writeHead(404).end("Not found");
   });
 
   server.on("upgrade", (req, socket, head) => {
-    const path = (req.url ?? "/").split("?")[0];
+    const path = (req.url ?? "/").split("?", 1)[0];
     if (!hasLoopbackHostHeader(req)) {
-      destroySocket(socket, "HTTP/1.1 403 Forbidden\r\n\r\n");
+      destroySocket(socket, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
       return;
     }
-    if (!isAuthorized(req, params.token)) {
-      destroySocket(socket, "HTTP/1.1 401 Unauthorized\r\n\r\n");
+    if (!isAuthorized(req, token)) {
+      destroySocket(socket, "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       return;
     }
     if (path === "/extension") {
-      if (!isAllowedExtensionOrigin(req)) {
-        destroySocket(socket, "HTTP/1.1 403 Forbidden\r\n\r\n");
+      if (!isAllowedExtensionOrigin(req) || !requestExtensionProtocolToken(req)) {
+        destroySocket(socket, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
         return;
       }
       wss.handleUpgrade(req, socket, head, (ws) => {
         attachExtensionWebSocket(bridge, ws);
-        log.info("extension connected to relay");
       });
       return;
     }
@@ -201,42 +255,53 @@ export async function startExtensionRelayServer(params: {
       });
       return;
     }
-    destroySocket(socket, "HTTP/1.1 404 Not Found\r\n\r\n");
+    destroySocket(socket, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
   });
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(params.port, "127.0.0.1", () => resolve());
+    server.listen(requestedPort, "127.0.0.1", () => {
+      serverPort = resolvedPort();
+      resolve();
+    });
   });
 
-  const resolvedPort = () => {
-    const address = server.address();
-    return typeof address === "object" && address ? address.port : params.port;
+  const port = resolvedPort();
+  const encodedToken = encodeURIComponent(token);
+  let closePromise: Promise<void> | null = null;
+  const close = async (): Promise<void> => {
+    if (closePromise) {
+      return closePromise;
+    }
+    closePromise = (async () => {
+      await bridge.dispose();
+      for (const client of wss.clients) {
+        client.terminate();
+      }
+      await new Promise<void>((resolve) => {
+        try {
+          wss.close(() => resolve());
+        } catch {
+          resolve();
+        }
+      });
+      await new Promise<void>((resolve) => {
+        try {
+          server.close(() => resolve());
+        } catch {
+          resolve();
+        }
+      });
+    })();
+    return closePromise;
   };
 
   return {
-    port: resolvedPort(),
-    token: params.token,
+    port,
+    token,
+    pairingUrl: `ws://127.0.0.1:${port}/extension#${encodedToken}`,
+    cdpUrl: `ws://127.0.0.1:${port}/cdp?token=${encodedToken}`,
     bridge,
-    close: async () => {
-      bridge.dispose();
-      wss.close();
-      await new Promise<void>((resolve) => {
-        server.close(() => resolve());
-      });
-    },
+    close,
   };
-}
-
-function bindSocket(
-  ws: WebSocket,
-  handlers: { onMessage: (raw: string) => void; onClose: () => void },
-): void {
-  ws.on("message", (data) => {
-    handlers.onMessage(rawDataToString(data));
-  });
-  ws.on("close", handlers.onClose);
-  ws.on("error", (err) => {
-    log.warn(`relay socket error: ${String(err)}`);
-  });
 }

@@ -1,11 +1,11 @@
 /**
- * Wire protocol between the extension relay server and the OpenClaw Chrome
- * extension. The extension stays a dumb transport: it attaches chrome.debugger,
- * forwards CDP traffic, and manages the OpenClaw tab group. All CDP target
- * semantics (Target.* synthesis for Playwright) live server-side in the bridge.
+ * Wire protocol between the Agent Tab Bridge relay and its browser extension.
+ * The extension stays a dumb transport: it attaches chrome.debugger, forwards
+ * CDP traffic, and manages the shared tab group. CDP target semantics live in
+ * the bridge.
  */
 
-/** Tab snapshot reported by the extension for tabs shared with OpenClaw. */
+/** Tab snapshot reported by the extension for tabs shared with the agent. */
 export type RelayTabInfo = {
   tabId: number;
   url: string;
@@ -13,27 +13,11 @@ export type RelayTabInfo = {
   active: boolean;
 };
 
-export const PAGE_SHARE_MAX_NOTE_CHARS = 2_000;
-export const PAGE_SHARE_MAX_TITLE_CHARS = 500;
-export const PAGE_SHARE_MAX_URL_CHARS = 2_000;
-
-/** Page-share payload captured by the extension on explicit user action. */
-export type PageSharePayload = {
-  url: string;
-  title: string;
-  /** Extracted readable page text (already truncated extension-side). */
-  content: string;
-  /** User-highlighted selection; preferred over content when present. */
-  selection?: string;
-  /** Short user-typed note; trusted (typed by the user in the popup). */
-  note?: string;
-};
-
 /** First message the extension sends after the WebSocket opens. */
 type ExtensionHelloMessage = {
   type: "hello";
   userAgent: string;
-  /** Full browser product string, e.g. "Chrome/144.0.7204.49". */
+  /** Full browser product string, e.g. "Brave/144.0.7204.49". */
   browserVersion: string;
   extensionVersion: string;
   tabs: RelayTabInfo[];
@@ -80,12 +64,6 @@ type ExtensionPongMessage = {
   type: "pong";
 };
 
-type ExtensionPageShareMessage = {
-  type: "pageShare";
-  requestId: number;
-  payload: PageSharePayload;
-};
-
 export type ExtensionToRelayMessage =
   | ExtensionHelloMessage
   | ExtensionTabsMessage
@@ -93,8 +71,7 @@ export type ExtensionToRelayMessage =
   | ExtensionResultMessage
   | ExtensionErrorMessage
   | ExtensionDetachedMessage
-  | ExtensionPongMessage
-  | ExtensionPageShareMessage;
+  | ExtensionPongMessage;
 
 /**
  * Command bodies sent to the extension. The bridge assigns the `seq` used to
@@ -107,7 +84,7 @@ export type RelayCommandBody =
   | { type: "attach"; tabId: number }
   /** Detach chrome.debugger from a tab (tab left the group or client detached). */
   | { type: "detach"; tabId: number }
-  /** Open a new tab inside the OpenClaw tab group. Result: { tabId: number }. */
+  /** Open a new tab inside the shared tab group. Result: { tabId: number }. */
   | { type: "createTab"; url: string; background?: boolean; focus?: boolean }
   /** Close a shared tab. Result: {}. */
   | { type: "closeTab"; tabId: number }
@@ -119,19 +96,9 @@ type RelayPingMessage = {
   type: "ping";
 };
 
-export type RelayPageShareResultMessage = {
-  type: "pageShareResult";
-  requestId: number;
-  ok: boolean;
-  error?: string;
-};
+export type RelayToExtensionMessage = (RelayCommandBody & { seq: number }) | RelayPingMessage;
 
-export type RelayToExtensionMessage =
-  | (RelayCommandBody & { seq: number })
-  | RelayPingMessage
-  | RelayPageShareResultMessage;
-
-/** Parse one extension frame; returns null for malformed input. */
+/** Parse one extension frame; returns null for malformed or unknown input. */
 export function parseExtensionMessage(raw: string): ExtensionToRelayMessage | null {
   let parsed: unknown;
   try {
@@ -139,7 +106,7 @@ export function parseExtensionMessage(raw: string): ExtensionToRelayMessage | nu
   } catch {
     return null;
   }
-  if (!parsed || typeof parsed !== "object") {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     return null;
   }
   const type = (parsed as { type?: unknown }).type;
@@ -154,7 +121,6 @@ export function parseExtensionMessage(raw: string): ExtensionToRelayMessage | nu
     case "error":
     case "detached":
     case "pong":
-    case "pageShare":
       return parsed as ExtensionToRelayMessage;
     default:
       return null;

@@ -1,11 +1,13 @@
 // Types for the extension's pure-logic module (the runtime is plain ESM JS so
-// it can load unbundled in Chrome). Kept in sync with relay-core.js.
+// it can load unbundled in Brave). Kept in sync with relay-core.js.
 
-export const OPENCLAW_TAB_GROUP_TITLE: string;
+export const AGENT_TAB_GROUP_TITLE: string;
+export const AGENT_TAB_BRIDGE_RELAY_PROTOCOL: string;
+export const AGENT_TAB_BRIDGE_TOKEN_PROTOCOL_PREFIX: string;
+
 export function parsePairingString(raw: unknown): {
   relayUrl: string;
   token: string;
-  gatewayUrl?: string;
 } | null;
 
 export function buildRelayWsProtocols(token: string): string[];
