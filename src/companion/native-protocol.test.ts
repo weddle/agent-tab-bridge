@@ -6,6 +6,7 @@ const session = (overrides: Partial<SessionRecord> = {}): SessionRecord => ({ id
 describe("native protocol validation", () => {
   it("accepts v1 records and rejects oversized or malformed records", () => {
     expect(validateSessionRecord(session())).toBe(true);
+    expect(validateSessionRecord(session({ expiresAt: null }))).toBe(true);
     expect(validateSessionRecord(session({ taskLabel: "x".repeat(129) }))).toBe(false);
     expect(validateSessionRecord(session({ expiresAt: 10 + MAX_TTL_MS + 1 }))).toBe(false);
     expect(validateSessionRecord(session({ requestedCapabilities: ["cdp", "cdp"] as ["cdp", "cdp"] }))).toBe(false);
@@ -22,7 +23,7 @@ describe("native protocol validation", () => {
     expect(validateNativeMessage({ ...challenge, signature: undefined })).toBe(false);
     expect(validateNativeMessage({ version: 1, type: "revokeDevice", requestId: "forget-1" })).toBe(true);
     expect(validateNativeMessage({ version: 1, type: "revokeDevice", requestId: "" })).toBe(false);
-    const approval = { version: NATIVE_PROTOCOL_VERSION, type: "approveSession", requestId: "approve-1", sessionId: "task-1", controllerPrincipalId: "sha256/controller", displayControllerName: "CLI", taskLabel: "research", requestedCapabilities: ["cdp"], ttlMs: 60_000 } as const;
+    const approval = { version: NATIVE_PROTOCOL_VERSION, type: "approveSession", requestId: "approve-1", sessionId: "task-1", controllerPrincipalId: "sha256/controller", displayControllerName: "CLI", taskLabel: "research", requestedCapabilities: ["cdp"], expiresAt: null } as const;
     expect(validateNativeMessage(approval)).toBe(true);
     expect(validateNativeMessage({ ...approval, unexpected: true })).toBe(false);
   });

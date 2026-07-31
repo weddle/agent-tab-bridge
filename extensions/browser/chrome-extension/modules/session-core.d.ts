@@ -23,7 +23,7 @@ export type SessionAuthorityRecord = {
   taskLabel: string;
   capabilities: string[];
   createdAt: number;
-  expiresAt: number;
+  expiresAt: number | null;
   state: "pending" | "active";
 };
 export function matchesSessionAuthority(

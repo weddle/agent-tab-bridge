@@ -76,6 +76,7 @@ function remainingMs(session) {
 }
 
 function formatRemaining(session) {
+  if (session?.expiresAt === null) return "Indefinite · no expiry";
   const remaining = remainingMs(session);
   if (!Number.isFinite(remaining)) return "Expiry unavailable";
   if (remaining <= 0) return "Expired; waiting for cleanup";

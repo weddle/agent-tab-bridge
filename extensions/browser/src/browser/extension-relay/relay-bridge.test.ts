@@ -29,7 +29,7 @@ class FakeSocket {
 
 /**
  * Scripted extension: auto-answers relay commands so the bridge can complete
- * attach/CDP round-trips. Attach returns a deterministic targetId per tab.
+ * attach/CDP round-trips.
  */
 function wireExtension(bridge: ExtensionRelayBridge) {
   const socket = new FakeSocket();
@@ -162,8 +162,49 @@ describe("ExtensionRelayBridge", () => {
       targetInfo?: { targetId?: string; browserContextId?: string };
       sessionId?: string;
     };
-    expect(params.targetInfo?.targetId).toBe("target-1");
+    expect(params.targetInfo?.targetId).toBe("agent-tab-bridge-target-1");
     expect(typeof params.sessionId).toBe("string");
+  });
+
+  it("discovers an unattached shared tab and attaches it only on demand", async () => {
+    const bridge = new ExtensionRelayBridge();
+    const { socket, handlers } = wireExtension(bridge);
+    sendHello(handlers);
+
+    const client = new FakeSocket();
+    const cdp = bridge.attachCdpClientSocket(client);
+    cdp.onMessage(JSON.stringify({ id: 1, method: "Target.getTargets" }));
+    await flush();
+
+    const targetId = "agent-tab-bridge-target-1";
+    expect(client.frames().find((frame) => frame.id === 1)?.result).toEqual({
+      targetInfos: [
+        expect.objectContaining({ targetId, attached: false }),
+      ],
+    });
+    expect(socket.frames().some((frame) => frame.type === "attach")).toBe(false);
+
+    cdp.onMessage(
+      JSON.stringify({ id: 2, method: "Target.getTargetInfo", params: { targetId } }),
+    );
+    await flush();
+    expect(client.frames().find((frame) => frame.id === 2)?.result).toEqual({
+      targetInfo: expect.objectContaining({ targetId, attached: false }),
+    });
+
+    cdp.onMessage(
+      JSON.stringify({ id: 3, method: "Target.attachToTarget", params: { targetId, flatten: true } }),
+    );
+    await flush();
+    expect(socket.frames().find((frame) => frame.type === "attach")).toMatchObject({ tabId: 1 });
+    expect(client.frames().find((frame) => frame.id === 3)?.result).toEqual({
+      sessionId: expect.any(String),
+    });
+    expect(client.frames().find((frame) => frame.id === 1)?.result).toEqual({
+      targetInfos: [
+        expect.objectContaining({ targetId, attached: false }),
+      ],
+    });
   });
 
   it("routes session-scoped CDP commands to the owning tab", async () => {
@@ -223,7 +264,7 @@ describe("ExtensionRelayBridge", () => {
         id: 3,
         sessionId: browserSessionId,
         method: "Target.attachToTarget",
-        params: { targetId: "target-1", flatten: true },
+        params: { targetId: "agent-tab-bridge-target-1", flatten: true },
       }),
     );
     await flush();
@@ -305,7 +346,7 @@ describe("ExtensionRelayBridge", () => {
     await flush();
 
     const response = client.frames().find((frame) => frame.id === 2);
-    expect(response?.result).toMatchObject({ targetId: "target-999" });
+    expect(response?.result).toMatchObject({ targetId: "agent-tab-bridge-target-999" });
     expect(socket.frames().find((frame) => frame.type === "createTab")).toMatchObject({
       url: "https://new.test",
       background: true,
@@ -330,7 +371,7 @@ describe("ExtensionRelayBridge", () => {
     await flush();
 
     expect(client.frames().find((frame) => frame.id === 1)?.result).toMatchObject({
-      targetId: "target-999",
+      targetId: "agent-tab-bridge-target-999",
     });
     expect(socket.frames().find((frame) => frame.type === "createTab")).toMatchObject({
       url: "https://foreground.test",
@@ -358,7 +399,7 @@ describe("ExtensionRelayBridge", () => {
       await flush();
 
       expect(client.frames().find((frame) => frame.id === 1)?.result).toMatchObject({
-        targetId: "target-999",
+        targetId: "agent-tab-bridge-target-999",
       });
       expect(socket.frames().find((frame) => frame.type === "createTab")).toMatchObject({
         url: "https://focused.test",

@@ -52,6 +52,8 @@ const tabOwners = new Map();
 const attachedTabs = new Map();
 /** Coalesces attach requests for one owned tab. */
 const attachingTabs = new Map();
+/** Suppresses duplicate group-change callbacks while a claimed tab is revoked. */
+const revokingTabs = new Set();
 /** Suppresses the expected onDetach callback while the extension itself detaches. */
 const intentionalDebuggerDetaches = new Set();
 /** Coalesces stop operations so native loss and browser events remain idempotent. */
@@ -132,9 +134,10 @@ function normalizeSession(raw, expectedState) {
     new Set(value.requestedCapabilities).size !== value.requestedCapabilities.length ||
     value.requestedCapabilities.some((capability) => capability !== "cdp") ||
     !Number.isInteger(value.createdAt) ||
-    !Number.isInteger(value.expiresAt) ||
-    value.expiresAt <= value.createdAt ||
-    value.expiresAt - value.createdAt > 24 * 60 * 60 * 1_000 ||
+    (value.expiresAt !== null &&
+      (!Number.isInteger(value.expiresAt) ||
+        value.expiresAt <= value.createdAt ||
+        value.expiresAt - value.createdAt > 24 * 60 * 60 * 1_000)) ||
     !["pending", "active", "revoked"].includes(value.state) ||
     (expectedState && value.state !== expectedState)
   ) {
@@ -1245,7 +1248,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             displayControllerName: session.controllerName,
             taskLabel: session.taskLabel,
             requestedCapabilities: session.capabilities,
-            ttlMs: session.expiresAt - session.createdAt,
+            expiresAt: session.expiresAt,
           });
         } catch (error) {
           approvedSessions.delete(session.id);
@@ -1320,14 +1323,44 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
       return;
     }
     if (sessionGroups.get(ownerSessionId) !== changeInfo.groupId) {
-      void revokeTabAccess(ownerSessionId, tabId, "tab left its task group").catch(() => {
-        releaseTab(tabOwners, ownerSessionId, tabId);
-      });
+      if (revokingTabs.has(tabId)) {
+        return;
+      }
+      revokingTabs.add(tabId);
+      if (groupOwnerSessionId && groupOwnerSessionId !== ownerSessionId) {
+        void chrome.tabs.ungroup([tabId]).catch(() => {});
+      }
+      void revokeTabAccess(ownerSessionId, tabId, "tab left its task group")
+        .catch(() => {
+          releaseTab(tabOwners, ownerSessionId, tabId);
+        })
+        .finally(() => revokingTabs.delete(tabId));
     }
   } else if (groupOwnerSessionId) {
-    // A user dragging an unrelated tab into a task group never grants control.
-    // The authoritative ownership map has no claim, so immediately undo it.
-    void chrome.tabs.ungroup([tabId]).catch(() => {});
+    if (revokingTabs.has(tabId)) {
+      return;
+    }
+    if (!sessionIsActive(groupOwnerSessionId)) {
+      void chrome.tabs.ungroup([tabId]).catch(() => {});
+      return;
+    }
+    const claim = claimTab(tabOwners, groupOwnerSessionId, tabId);
+    if (!claim.ok) {
+      // Ownership is exclusive. Do not let a tab owned by another session
+      // cross-claim merely because it was dragged over this group.
+      void chrome.tabs.ungroup([tabId]).catch(() => {});
+      return;
+    }
+    void syncSessionTabs(groupOwnerSessionId).catch(() => {
+      void revokeTabAccess(
+        groupOwnerSessionId,
+        tabId,
+        "tab sharing state could not be synchronized",
+        { notifyRelay: false },
+      ).catch(() => {
+        releaseTab(tabOwners, groupOwnerSessionId, tabId);
+      });
+    });
   }
 });
 

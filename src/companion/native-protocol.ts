@@ -19,7 +19,7 @@ export interface SessionRecord {
   taskLabel: string;
   requestedCapabilities: Capability[];
   createdAt: number;
-  expiresAt: number;
+  expiresAt: number | null;
   state: SessionState;
 }
 export interface SessionApproval {
@@ -28,7 +28,7 @@ export interface SessionApproval {
   displayControllerName: string;
   taskLabel: string;
   requestedCapabilities: Capability[];
-  ttlMs: number;
+  expiresAt: number | null;
 }
 export interface SharedTabRecord { tabId: number; title: string; url: string; }
 
@@ -92,12 +92,12 @@ const validCapabilities = (value: unknown): value is Capability[] => Array.isArr
 
 export function validateSessionRecord(value: unknown): value is SessionRecord {
   if (!isRecord(value) || !keysExactly(value, ["id", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "createdAt", "expiresAt", "state"])) return false;
-  return validId(value.id) && isString(value.controllerPrincipalId, 256) && validDisplay(value.displayControllerName) && validLabel(value.taskLabel) && validCapabilities(value.requestedCapabilities) && isInteger(value.createdAt) && isInteger(value.expiresAt) && value.expiresAt > value.createdAt && value.expiresAt - value.createdAt <= MAX_TTL_MS && (value.state === "pending" || value.state === "active" || value.state === "revoked");
+  return validId(value.id) && isString(value.controllerPrincipalId, 256) && validDisplay(value.displayControllerName) && validLabel(value.taskLabel) && validCapabilities(value.requestedCapabilities) && isInteger(value.createdAt) && (value.expiresAt === null || (isInteger(value.expiresAt) && value.expiresAt > value.createdAt && value.expiresAt - value.createdAt <= MAX_TTL_MS)) && (value.state === "pending" || value.state === "active" || value.state === "revoked");
 }
 export function assertSessionRecord(value: unknown): SessionRecord { if (!validateSessionRecord(value)) throw new NativeProtocolError("invalid session record"); return value; }
 export function validateSessionApproval(value: unknown): value is SessionApproval {
-  if (!isRecord(value) || !keysExactly(value, ["sessionId", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "ttlMs"])) return false;
-  return validId(value.sessionId) && isString(value.controllerPrincipalId, 256) && validDisplay(value.displayControllerName) && validLabel(value.taskLabel) && validCapabilities(value.requestedCapabilities) && isInteger(value.ttlMs) && value.ttlMs > 0 && value.ttlMs <= MAX_TTL_MS;
+  if (!isRecord(value) || !keysExactly(value, ["sessionId", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "expiresAt"])) return false;
+  return validId(value.sessionId) && isString(value.controllerPrincipalId, 256) && validDisplay(value.displayControllerName) && validLabel(value.taskLabel) && validCapabilities(value.requestedCapabilities) && (value.expiresAt === null || (isInteger(value.expiresAt) && value.expiresAt > 0 && value.expiresAt <= Number.MAX_SAFE_INTEGER));
 }
 function validateSharedTab(value: unknown): value is SharedTabRecord { return isRecord(value) && keysExactly(value, ["tabId", "title", "url"]) && isInteger(value.tabId) && value.tabId >= 0 && isString(value.title, 4096) && isString(value.url, 8192); }
 function validHandshakeFields(value: Record<string, unknown>, role: "extension" | "companion"): boolean {
@@ -110,7 +110,7 @@ export function validateNativeMessage(value: unknown): value is NativeMessage {
     case "hello": return hasVersionAndType(value, "hello", ["role", "extensionId", "extensionPublicKey", "extensionNonce"]) && value.role === "extension" && validId(value.extensionId, 256) && isBase64(value.extensionPublicKey) && isBase64(value.extensionNonce);
     case "helloChallenge": return hasVersionAndType(value, "helloChallenge", ["role", "companionId", "companionPublicKey", "extensionId", "extensionPublicKey", "extensionNonce", "companionNonce", "signature"]) && validHandshakeFields(value, "companion");
     case "helloProof": return hasVersionAndType(value, "helloProof", ["role", "extensionId", "extensionPublicKey", "companionId", "companionPublicKey", "extensionNonce", "companionNonce", "signature"]) && validHandshakeFields(value, "extension");
-    case "approveSession": return hasVersionAndType(value, "approveSession", ["sessionId", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "ttlMs"]) && validateSessionApproval({ sessionId: value.sessionId, controllerPrincipalId: value.controllerPrincipalId, displayControllerName: value.displayControllerName, taskLabel: value.taskLabel, requestedCapabilities: value.requestedCapabilities, ttlMs: value.ttlMs });
+    case "approveSession": return hasVersionAndType(value, "approveSession", ["sessionId", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "expiresAt"]) && validateSessionApproval({ sessionId: value.sessionId, controllerPrincipalId: value.controllerPrincipalId, displayControllerName: value.displayControllerName, taskLabel: value.taskLabel, requestedCapabilities: value.requestedCapabilities, expiresAt: value.expiresAt });
     case "revokeDevice": return hasVersionAndType(value, "revokeDevice", []) && typeof value.requestId === "string" && value.requestId.length > 0;
     case "revokeSession": return hasVersionAndType(value, "revokeSession", ["sessionId"], ["reason"]) && validId(value.sessionId) && (value.reason === undefined || isString(value.reason, 256));
     case "relayReady": return hasVersionAndType(value, "relayReady", ["sessionId", "relayUrl"]) && validId(value.sessionId) && isString(value.relayUrl, 8192) && /^ws:\/\/127\.0\.0\.1(?::\d+)?\//.test(value.relayUrl);

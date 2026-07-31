@@ -57,6 +57,25 @@ describe("TaskSessionManager integration contract", () => {
     expect(manager.cdpUrl("session-1")).toBe(relays[0]?.cdpUrl);
   });
 
+  it("creates an indefinite session without an expiry timer", async () => {
+    let now = 10_000;
+    const setTimer = vi.fn();
+    const { startRelay } = makeRelayFactory();
+    const manager = new TaskSessionManager({ startRelay, now: () => now, setTimer });
+    const session = manager.open({
+      controllerPrincipalId: "controller-1",
+      controllerName: "CLI",
+      taskLabel: "indefinite",
+      capabilities: ["cdp"],
+    });
+    expect(session.expiresAt).toBeNull();
+    expect(setTimer).not.toHaveBeenCalled();
+
+    now += 24 * 60 * 60 * 1_000;
+    await manager.sweepExpired();
+    expect(manager.get(session.id)).toMatchObject({ state: "pending", expiresAt: null });
+  });
+
   it("keeps concurrent session relays and URLs independent", async () => {
     const { relays, startRelay } = makeRelayFactory();
     const manager = new TaskSessionManager({ startRelay, idFactory: (() => { let n = 0; return () => `session-${++n}`; })() });

@@ -231,7 +231,7 @@ describe("standalone Agent Tab Bridge relay", () => {
     cdp.send(JSON.stringify({ id: 1, method: "Target.setAutoAttach", params: { autoAttach: true } }));
     const attached = await attachedPromise;
     expect(attached).toMatchObject({
-      params: { targetInfo: { targetId: "target-7" } },
+      params: { targetInfo: { targetId: "agent-tab-bridge-target-7" } },
     });
 
     const deniedPromise = nextFrame(cdp, (frame) => frame.id === 2);

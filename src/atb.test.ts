@@ -73,6 +73,10 @@ describe("atb CLI session boundary", () => {
       await expect(runAgentCommand(["agent", "--task"], { broker, spawn, processEnv: { KEEP_THIS: "yes" } })).resolves.toBe(0);
       expect(spawn).toHaveBeenCalledTimes(1);
       expect(requests.map(({ command }) => command)).toEqual(["openSession", "revokeSession"]);
+      expect(requests[0]).toEqual({
+        command: "openSession",
+        params: { taskLabel: "agent", requestedCapabilities: ["cdp"] },
+      });
       expect(stdoutWrite).not.toHaveBeenCalled();
     } finally {
       stdoutWrite.mockRestore();

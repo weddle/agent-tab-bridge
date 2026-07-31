@@ -86,7 +86,6 @@ export type ChildLike = Pick<ChildProcess, "once" | "on" | "kill">;
 export type RunDeps = { broker: BrokerClient; spawn?: typeof nodeSpawn; processEnv?: NodeJS.ProcessEnv; signalSource?: NodeJS.Process };
 
 const MAX_LABEL_LENGTH = 256;
-const DEFAULT_TTL_MS = 30 * 60 * 1000;
 function boundedLabel(argv: readonly string[], explicit?: string): string {
   return (explicit?.trim() || path.basename(argv[0] ?? "agent")).slice(0, MAX_LABEL_LENGTH);
 }
@@ -112,7 +111,9 @@ function signalNumber(signal: NodeJS.Signals): number {
 /** Run one approved session and revoke it on every child, broker, or signal path. */
 export async function runAgentCommand(argv: readonly string[], deps: RunDeps, options: { label?: string; ttlMs?: number } = {}): Promise<number> {
   if (!argv.length) throw new Error("run command must not be empty");
-  const ttlMs = Math.max(1_000, Math.min(options.ttlMs ?? DEFAULT_TTL_MS, 24 * 60 * 60 * 1000));
+  const ttlMs = options.ttlMs === undefined
+    ? undefined
+    : Math.max(1_000, Math.min(options.ttlMs, 24 * 60 * 60 * 1000));
   let sessionId: string | undefined;
   let removeEvent: (() => void) | undefined;
   const activeBeforeSessionId = new Map<string, string>();
@@ -134,7 +135,11 @@ export async function runAgentCommand(argv: readonly string[], deps: RunDeps, op
       };
       removeEvent = deps.broker.onEvent?.(onEvent) ?? undefined;
     });
-    const result = await deps.broker.request("openSession", { taskLabel: boundedLabel(argv, options.label), requestedCapabilities: ["cdp"], ttlMs });
+    const result = await deps.broker.request("openSession", {
+      taskLabel: boundedLabel(argv, options.label),
+      requestedCapabilities: ["cdp"],
+      ...(ttlMs === undefined ? {} : { ttlMs }),
+    });
     if (result && typeof result === "object") {
       const record = result as Record<string, unknown>;
       const session = record.session && typeof record.session === "object" ? record.session as Record<string, unknown> : record;

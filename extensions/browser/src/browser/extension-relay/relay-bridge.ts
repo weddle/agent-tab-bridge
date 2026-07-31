@@ -24,6 +24,11 @@ const BROWSER_TARGET_ID = "agent-tab-bridge-browser";
 /** Playwright requires every attached page target to identify its browser context. */
 const BROWSER_CONTEXT_ID = "agent-tab-bridge-context";
 
+/** Stable target identity for a shared Chrome tab, before or after attachment. */
+function targetIdForTab(tabId: number): string {
+  return `agent-tab-bridge-target-${tabId}`;
+}
+
 /**
  * CDP commands from a browser-scoped synthetic session and a debugger-attached
  * page session have different authorities. The bridge synthesizes the safe
@@ -140,7 +145,7 @@ type PendingExtensionCommand = {
 
 type TabState = {
   info: RelayTabInfo;
-  /** Set while chrome.debugger is attached: real CDP targetId + synthetic root sessionId. */
+  /** Set while chrome.debugger is attached: synthetic targetId + synthetic root sessionId. */
   attached?: { targetId: string; sessionId: string };
   attaching?: Promise<{ targetId: string; sessionId: string }>;
 };
@@ -490,10 +495,8 @@ export class ExtensionRelayBridge {
       return await tab.attaching;
     }
     const attaching = (async () => {
-      const result = (await this.callExtension({ type: "attach", tabId })) as {
-        targetId?: unknown;
-      } | null;
-      const targetId = typeof result?.targetId === "string" ? result.targetId : `tab-${tabId}`;
+      await this.callExtension({ type: "attach", tabId });
+      const targetId = targetIdForTab(tabId);
       const sessionId = `agent-tab-bridge-tab-${tabId}-${this.nextSessionOrdinal++}`;
       const attached = { targetId, sessionId };
       // Identity check, not just presence: the tab could have left the group and
@@ -525,7 +528,7 @@ export class ExtensionRelayBridge {
       // connectOverCDP owns this as a persistent default context, but still
       // asserts that attached page events carry a non-empty context id.
       browserContextId: BROWSER_CONTEXT_ID,
-      attached: true,
+      attached: tab.attached !== undefined,
       canAccessOpener: false,
     };
   }
@@ -762,7 +765,7 @@ export class ExtensionRelayBridge {
 
   private tabByTargetId(targetId: string): { tabId: number; tab: TabState } | null {
     for (const [tabId, tab] of this.tabs) {
-      if (tab.attached?.targetId === targetId) {
+      if (targetIdForTab(tabId) === targetId) {
         return { tabId, tab };
       }
     }
@@ -881,9 +884,8 @@ export class ExtensionRelayBridge {
         return;
       }
       case "Target.getTargets": {
-        const targetInfos = [...this.tabs.values()]
-          .filter((tab) => tab.attached)
-          .map((tab) => this.targetInfoForTab(tab, tab.attached?.targetId ?? ""));
+        const targetInfos = [...this.tabs.entries()]
+          .map(([tabId, tab]) => this.targetInfoForTab(tab, targetIdForTab(tabId)));
         this.respond(client, request, { targetInfos });
         return;
       }
@@ -923,7 +925,6 @@ export class ExtensionRelayBridge {
       case "Target.attachToTarget": {
         const targetId = request.params?.targetId as string | undefined;
         const found = targetId ? this.tabByTargetId(targetId) : null;
-        // Also allow attach by tab that is shared but not yet debugger-attached.
         if (!found && targetId) {
           this.respondError(client, request, `No target with given id found: ${targetId}`, -32602);
           return;
@@ -1001,18 +1002,8 @@ export class ExtensionRelayBridge {
           this.respondError(client, request, "extension did not return a valid tabId for createTab");
           return;
         }
-        const tabId = createdTabId;
-        await this.waitForSharedTab(tabId);
-        const attached = await this.ensureTabAttached(tabId);
-        // Announce before responding, mirroring Chrome's event-then-result order.
-        this.announceAttachedTab(tabId, attached.targetId, attached.sessionId, {
-          onlyAutoAttach: true,
-        });
-        this.announceAttachedTab(tabId, attached.targetId, attached.sessionId, {
-          onlyAutoAttach: false,
-          onlyClient: client,
-        });
-        this.respond(client, request, { targetId: attached.targetId });
+        await this.waitForSharedTab(createdTabId);
+        this.respond(client, request, { targetId: targetIdForTab(createdTabId) });
         return;
       }
       case "Target.closeTarget": {

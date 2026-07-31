@@ -53,7 +53,7 @@ describe("Native Messaging framing contract", () => {
       displayControllerName: "display",
       taskLabel: "task",
       requestedCapabilities: ["bookmarks"],
-      ttlMs: 1_000,
+      expiresAt: null,
     };
     expect(parseNativeMessage(JSON.stringify(approval))).toBeNull();
   });
