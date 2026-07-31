@@ -9,6 +9,17 @@ This project incorporates and adapts portions of OpenClaw's browser extension an
 - License: MIT
 - Copyright: Copyright (c) 2026 OpenClaw Foundation
 
+### Imported and adapted scope
+
+Agent Tab Bridge began from a history-filtered snapshot of these OpenClaw source paths:
+
+- `extensions/browser/chrome-extension/`
+- `extensions/browser/src/browser/extension-relay/`
+
+The retained extension background/popup implementation, relay transport, relay protocol, relay bridge, relay server, and associated tests remain OpenClaw-derived even where Agent Tab Bridge has substantially modified their behavior or removed upstream features. Agent Tab Bridge-specific identity, authorization, session, installation, and UI work is separately developed in this repository.
+
+The authoritative imported source is the OpenClaw commit above. [`upstream/openclaw-paths.txt`](upstream/openclaw-paths.txt) records the filtered path set, and [`upstream/README.md`](upstream/README.md) records the filtered mirror commit and refresh procedure. A copy of this notice and the OpenClaw MIT grant is also bundled inside the unpacked extension directory so that the attribution remains present if that directory is distributed separately.
+
 MIT License
 
 Copyright (c) 2026 OpenClaw Foundation

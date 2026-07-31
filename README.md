@@ -155,6 +155,7 @@ This project is derived from the browser-extension and extension-relay work in [
 - Filtered mirror tag: `openclaw-b907309b35754e25aa15a309ce6cf63875267c71`
 - Selected upstream paths: [`upstream/openclaw-paths.txt`](upstream/openclaw-paths.txt)
 - Detailed provenance and update procedure: [`upstream/README.md`](upstream/README.md)
+- Standalone extension notice: [`extensions/browser/chrome-extension/NOTICE`](extensions/browser/chrome-extension/NOTICE)
 - Required notices: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
 
 The project is independently named and is not affiliated with or endorsed by the OpenClaw Foundation.

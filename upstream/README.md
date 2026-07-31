@@ -1,6 +1,6 @@
 # OpenClaw filtered upstream
 
-`../openclaw-browser-upstream` is a local, generated, history-filtered mirror of selected paths from `https://github.com/openclaw/openclaw`. It is not a GitHub-native fork and must not contain hand-authored commits.
+Development uses a separate, generated, history-filtered mirror of selected paths from `https://github.com/openclaw/openclaw`. The mirror is not required to build or run Agent Tab Bridge, is not a GitHub-native fork, and must not contain hand-authored commits.
 
 ## Current import
 
