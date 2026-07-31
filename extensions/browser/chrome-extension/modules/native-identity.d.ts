@@ -1,3 +1,5 @@
+export const NATIVE_PROTOCOL_VERSION: 2;
+
 export type ExtensionIdentity = {
   key: "extension";
   version: 1;

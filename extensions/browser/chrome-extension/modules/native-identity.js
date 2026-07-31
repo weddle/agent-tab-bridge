@@ -2,6 +2,7 @@
 // The private P-256 key is imported non-extractable before it is placed in
 // IndexedDB; only its SPKI public key is ever exchanged with the companion.
 
+export const NATIVE_PROTOCOL_VERSION = 2;
 const DATABASE_NAME = "agent-tab-bridge";
 const DATABASE_VERSION = 1;
 const IDENTITY_STORE = "identity";
@@ -298,7 +299,7 @@ export async function forgetPinnedCompanion() {
   await deleteRecord(COMPANION_KEY);
 }
 
-/** Canonical transcript agreed with src/companion/native-protocol.ts protocol v1. */
+/** Canonical transcript agreed with src/companion/native-protocol.ts. */
 export function nativeProofTranscript({
   companionId,
   companionNonce,
@@ -315,7 +316,7 @@ export function nativeProofTranscript({
       extensionId,
       extensionNonce,
       extensionPublicKey,
-      protocolVersion: 1,
+      protocolVersion: NATIVE_PROTOCOL_VERSION,
       roles: ["extension", "companion"],
     }),
   );

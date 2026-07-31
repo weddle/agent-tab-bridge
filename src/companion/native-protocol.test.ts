@@ -4,7 +4,7 @@ import { assertNativeMessage, MAX_TTL_MS, NATIVE_PROTOCOL_VERSION, validateNativ
 const session = (overrides: Partial<SessionRecord> = {}): SessionRecord => ({ id: "task-1", controllerPrincipalId: "sha256/controller", displayControllerName: "CLI", taskLabel: "research", requestedCapabilities: ["cdp"], access: { level: "selectedTabs", tabIds: [], domains: [] }, createdAt: 10, expiresAt: 10 + 60_000, state: "pending", ...overrides });
 
 describe("native protocol validation", () => {
-  it("accepts v1 records and rejects oversized or malformed records", () => {
+  it("accepts versioned records and rejects oversized or malformed records", () => {
     expect(validateSessionRecord(session())).toBe(true);
     expect(validateSessionRecord(session({ expiresAt: null }))).toBe(true);
     expect(validateSessionRecord(session({ taskLabel: "x".repeat(129) }))).toBe(false);
@@ -40,5 +40,12 @@ describe("native protocol validation", () => {
     } as const;
     expect(validateNativeMessage(accessPending)).toBe(true);
     expect(validateNativeMessage({ ...accessPending, request: { ...accessPending.request, createdAt: 0 } })).toBe(false);
+    const tab = { tabId: 42, title: "Example", url: "https://example.com/", ownership: "unclaimed", claimability: "claimable" } as const;
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "listTabs", requestId: "tabs-1", scope: "all", sessionId: "task-1" })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "listTabs", requestId: "tabs-2", scope: "session" })).toBe(false);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "tabsListed", requestId: "tabs-1", tabs: [tab] })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "tabsListed", requestId: "tabs-1", tabs: [{ ...tab, ownership: "session-secret" }] })).toBe(false);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "claimTab", requestId: "claim-1", sessionId: "task-1", tabId: 42 })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "tabClaimed", requestId: "claim-1", sessionId: "task-1", tabId: 42, ok: true, tab: { ...tab, ownership: "currentSession", claimability: "alreadyShared" } })).toBe(true);
   });
 });

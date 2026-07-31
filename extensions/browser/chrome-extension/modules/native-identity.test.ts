@@ -8,7 +8,7 @@ import {
 } from "./native-identity.js";
 
 describe("Native Messaging identity transcript", () => {
-  it("binds both public keys, both nonces, identities, roles, and protocol v1 in canonical order", () => {
+  it("binds both public keys, both nonces, identities, roles, and protocol v2 in canonical order", () => {
     const transcript = new TextDecoder().decode(
       nativeProofTranscript({
         companionId: "companion-principal",
@@ -20,7 +20,7 @@ describe("Native Messaging identity transcript", () => {
       }),
     );
     expect(transcript).toBe(
-      '{"companionId":"companion-principal","companionNonce":"companion-nonce","companionPublicKey":"companion-spki","extensionId":"extension-id","extensionNonce":"extension-nonce","extensionPublicKey":"extension-spki","protocolVersion":1,"roles":["extension","companion"]}',
+      '{"companionId":"companion-principal","companionNonce":"companion-nonce","companionPublicKey":"companion-spki","extensionId":"extension-id","extensionNonce":"extension-nonce","extensionPublicKey":"extension-spki","protocolVersion":2,"roles":["extension","companion"]}',
     );
   });
 

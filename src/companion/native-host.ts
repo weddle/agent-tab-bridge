@@ -28,6 +28,7 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
   let outputFailure: NativeOutputFailure | null = null;
   let nextTabRequestId = 0;
   const pendingTabRequests = new Map<string, { resolve: (tabs: SharedTabRecord[]) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+  const pendingClaimRequests = new Map<string, { resolve: (tab: SharedTabRecord) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   const pendingAccess = new Map<string, AccessUpgradeRecord>();
   const pendingAccessBySession = new Map<string, string>();
   let outputTail = Promise.resolve();
@@ -37,23 +38,41 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
     outputTail = result.catch((error) => { if (!outputFailure) { outputFailure = error; finishHost(); } });
     return result;
   };
-  const listTabs = async (): Promise<SharedTabRecord[]> => {
+  const listTabs = async (sessionId: string | undefined, scope: "all" | "session"): Promise<SharedTabRecord[]> => {
     if (!trusted) throw new Error("browser extension is not trusted");
     nextTabRequestId += 1;
     const requestId = `host-tabs-${nextTabRequestId}`;
-    return await new Promise<SharedTabRecord[]>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        pendingTabRequests.delete(requestId);
-        reject(new Error("browser tab enumeration timed out"));
-      }, 5_000);
-      timer.unref?.();
-      pendingTabRequests.set(requestId, { resolve, reject, timer });
-      void send({ version: NATIVE_PROTOCOL_VERSION, type: "listTabs", requestId }).catch((error) => {
-        clearTimeout(timer);
-        pendingTabRequests.delete(requestId);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      });
+    const { promise, resolve, reject } = Promise.withResolvers<SharedTabRecord[]>();
+    const timer = setTimeout(() => {
+      pendingTabRequests.delete(requestId);
+      reject(new Error("browser tab enumeration timed out"));
+    }, 5_000);
+    timer.unref?.();
+    pendingTabRequests.set(requestId, { resolve, reject, timer });
+    void send({ version: NATIVE_PROTOCOL_VERSION, type: "listTabs", requestId, scope, ...(sessionId === undefined ? {} : { sessionId }) }).catch((error) => {
+      clearTimeout(timer);
+      pendingTabRequests.delete(requestId);
+      reject(error instanceof Error ? error : new Error(String(error)));
     });
+    return await promise;
+  };
+  const claimTab = async (sessionId: string, tabId: number): Promise<SharedTabRecord> => {
+    if (!trusted) throw new Error("browser extension is not trusted");
+    nextTabRequestId += 1;
+    const requestId = `host-claim-${nextTabRequestId}`;
+    const { promise, resolve, reject } = Promise.withResolvers<SharedTabRecord>();
+    const timer = setTimeout(() => {
+      pendingClaimRequests.delete(requestId);
+      reject(new Error("browser tab claim timed out"));
+    }, 5_000);
+    timer.unref?.();
+    pendingClaimRequests.set(requestId, { resolve, reject, timer });
+    void send({ version: NATIVE_PROTOCOL_VERSION, type: "claimTab", requestId, sessionId, tabId }).catch((error) => {
+      clearTimeout(timer);
+      pendingClaimRequests.delete(requestId);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    });
+    return await promise;
   };
   const requestAccess = async (principalId: string, stableSessionKey: string, delta: SessionAccessDelta): Promise<AccessUpgradeRecord> => {
     if (!trusted) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
@@ -88,7 +107,7 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
       void send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionStopped", session, reason: event.reason }).catch(() => {});
     }
   } });
-  broker = await startBrokerServer({ token: state.brokerSecret, sessions, isTrusted: () => trusted !== null, controller: () => trusted ? { principalId: controllerPrincipalId, displayName: "Local controller" } : null, status: () => ({ companionPrincipalId: companion.principalId, controllerPrincipalId }), listTabs, requestAccess });
+  broker = await startBrokerServer({ token: state.brokerSecret, sessions, isTrusted: () => trusted !== null, controller: () => trusted ? { principalId: controllerPrincipalId, displayName: "Local controller" } : null, status: () => ({ companionPrincipalId: companion.principalId, controllerPrincipalId }), listTabs, claimTab, requestAccess });
   const handshake = new HostIdentityHandshake(identityStore, stateStore);
   const decoder = new NativeMessageDecoder();
   const requestIds = new Set<string>();
@@ -99,6 +118,11 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
       pending.reject(new Error("native host is closing"));
     }
     pendingTabRequests.clear();
+    for (const pending of pendingClaimRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("native host is closing"));
+    }
+    pendingClaimRequests.clear();
     try { await sessions.revokeAll("hostClosing"); } finally { try { await broker?.close(); } catch {} }
   };
   const snapshot = async () => {
@@ -127,6 +151,18 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
           pendingTabRequests.delete(message.requestId);
           clearTimeout(pending.timer);
           pending.resolve(message.tabs);
+          return;
+        }
+        if (message.type === "tabClaimed") {
+          const pending = pendingClaimRequests.get(message.requestId);
+          if (!pending) return;
+          pendingClaimRequests.delete(message.requestId);
+          clearTimeout(pending.timer);
+          if (!message.ok || !message.tab) {
+            pending.reject(new Error(message.error ?? "browser rejected tab claim"));
+            return;
+          }
+          pending.resolve(message.tab);
           return;
         }
         if (message.type === "revokeDevice") { const current = trusted; await sessions.revokeAll("deviceRevoked"); await stateStore.unpinExtension(current.extensionId, current.fingerprint); trusted = null; await outputTail; finishHost(); return; }

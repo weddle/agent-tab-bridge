@@ -25,6 +25,8 @@ describe("BrokerServer socket ownership", () => {
       startRelay: async () => ({ pairingUrl: "ws://127.0.0.1/extension#token", cdpUrl: "ws://127.0.0.1/cdp?token=token", close: async () => undefined }),
     });
     const token = "a".repeat(32);
+    const tabRequests: Array<{ sessionId: string | undefined; scope: "all" | "session" }> = [];
+    const claims: Array<{ sessionId: string; tabId: number }> = [];
     const broker = await startBrokerServer({
       socketPath: join(directory, "broker.sock"),
       token,
@@ -38,6 +40,14 @@ describe("BrokerServer socket ownership", () => {
         requestedAccess: { level: "domains", tabIds: [], domains: ["example.com"] },
         createdAt: Date.now(),
       }),
+      listTabs: async (sessionId, scope) => {
+        tabRequests.push({ sessionId, scope });
+        return [];
+      },
+      claimTab: async (sessionId, tabId) => {
+        claims.push({ sessionId, tabId });
+        return { tabId, title: "Example", url: "https://example.com/", ownership: "currentSession", claimability: "alreadyShared" };
+      },
     });
     try {
       const first = createBrokerClient({ socketPath: broker.socketPath, token });
@@ -66,6 +76,19 @@ describe("BrokerServer socket ownership", () => {
         },
       });
       await accessClient.close();
+
+      const inventoryClient = createBrokerClient({ socketPath: broker.socketPath, token });
+      await expect(inventoryClient.request("listTabs", { stableSessionKey: "research", scope: "all" })).resolves.toEqual([]);
+      await expect(inventoryClient.request("listTabs", { stableSessionKey: "research", scope: "session" })).resolves.toEqual([]);
+      await expect(inventoryClient.request("claimTab", { stableSessionKey: "research", tabId: 42 })).resolves.toMatchObject({
+        tab: { tabId: 42, ownership: "currentSession", claimability: "alreadyShared" },
+      });
+      expect(tabRequests).toEqual([
+        { sessionId: opened.session.id, scope: "all" },
+        { sessionId: opened.session.id, scope: "session" },
+      ]);
+      expect(claims).toEqual([{ sessionId: opened.session.id, tabId: 42 }]);
+      await inventoryClient.close();
 
       const conflicting = createBrokerClient({ socketPath: broker.socketPath, token });
       await expect(conflicting.request("openSession", { taskLabel: "Different task", requestedCapabilities: ["cdp"], stableSessionKey: "research" })).rejects.toThrow(/different session authority/);

@@ -10,7 +10,7 @@ Launching a browser with `--remote-debugging-port` exposes a broad automation su
 
 - You explicitly share or unshare a tab from the extension.
 - Shared tabs live in a visibly labelled tab group.
-- Tabs outside that group are not reported to the relay or attachable by clients.
+- Tabs outside that group are not reported to the CDP relay or attachable by clients.
 - Dragging a tab out of the group immediately revokes access.
 - The browser's debugger banner remains visible; dismissing it revokes access.
 - The relay exists only for the current task, binds to `127.0.0.1`, and requires an ephemeral token.
@@ -86,6 +86,16 @@ node dist/src/atb.js request-access --session research --domain docs.example.org
 node dist/src/atb.js request-access --session research --full-access
 node dist/src/atb.js close --session research
 ```
+
+Inspect browser tabs in the context of a named session:
+
+```bash
+node dist/src/atb.js tabs --session research --scope all
+node dist/src/atb.js tabs --session research --scope session
+node dist/src/atb.js claim-tab --session research --tab 311
+```
+
+The all-tabs inventory labels each tab's `ownership` as `unclaimed`, `currentSession`, or `otherSession` and its `claimability` as `claimable`, `approvalRequired`, `alreadyShared`, or `blocked`. It does not reveal another session's identity. `--scope session` returns only tabs already in the named session. `claim-tab` succeeds without another prompt only when the session's existing selected-tab, domain, or full-access grant authorizes that tab; otherwise request and approve an access upgrade first.
 
 Every upgrade is separately displayed and approved or declined in the popup. Access can expand from selected tabs to requested sites to full access, but never silently narrows or broadens. `atb` injects the ephemeral `BROWSER_CDP_URL` only into a launched child process; it is never printed, persisted, or copied by the user. Browser loss, session revocation, tab-group removal, or debugger detachment removes the corresponding authority.
 

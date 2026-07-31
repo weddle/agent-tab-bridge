@@ -3,6 +3,7 @@ import { isPermittedPageCdpMethod } from "./modules/cdp-policy.js";
 import {
   buildRelayWsProtocols,
   claimTab,
+  classifyTabAccess,
   matchesSessionAuthority,
   parseRelayPairingUrl,
   reconnectDelayMs,
@@ -13,6 +14,7 @@ import {
   sessionTabIds,
 } from "./modules/session-core.js";
 import {
+  NATIVE_PROTOCOL_VERSION as PROTOCOL_VERSION,
   fingerprintSpki,
   forgetPinnedCompanion,
   loadExtensionIdentity,
@@ -23,7 +25,6 @@ import {
   toBase64Url,
 } from "./modules/native-identity.js";
 const NATIVE_HOST_NAME = "com.agenttabbridge.companion";
-const PROTOCOL_VERSION = 2;
 const TASK_GROUP_COLOR = "blue";
 const MAX_TASK_LABEL_LENGTH = 128;
 const CDP_POLICY_ERROR = "CDP method is not permitted by Agent Tab Bridge";
@@ -733,11 +734,13 @@ async function handleSessionStopped(message) {
   approvedSessions.delete(session.id);
   await stopSession(session.id, { removeSession: true });
 }
-async function enumerableBrowserTabs() {
+async function enumerableBrowserTabs(sessionId, scope) {
+  const session = validId(sessionId) && sessionIsActive(sessionId) ? sessions.get(sessionId) : null;
   const tabs = await chrome.tabs.query({});
   return tabs
     .filter((tab) => {
       if (!Number.isInteger(tab.id) || isSessionPageTab(tab) || typeof tab.url !== "string") return false;
+      if (scope === "session") return !!session && tabOwners.get(tab.id) === sessionId;
       if (tab.url === "about:blank") return true;
       try {
         const url = new URL(tab.url);
@@ -746,7 +749,15 @@ async function enumerableBrowserTabs() {
         return false;
       }
     })
-    .map((tab) => ({ tabId: tab.id, title: tab.title || "Untitled tab", url: tab.url }));
+    .map((tab) => {
+      const accessState = classifyTabAccess(
+        tabOwners,
+        session ? sessionId : undefined,
+        tab.id,
+        sessionCanAdoptTab(session, tab),
+      );
+      return { tabId: tab.id, title: tab.title || "Untitled tab", url: tab.url, ...accessState };
+    });
 }
 
 
@@ -772,8 +783,25 @@ async function handleNativeMessage(message, port, generation) {
           version: PROTOCOL_VERSION,
           type: "tabsListed",
           requestId: message.requestId,
-          tabs: await enumerableBrowserTabs(),
+          tabs: await enumerableBrowserTabs(message.sessionId, message.scope === "session" ? "session" : "all"),
         });
+      }
+      return;
+    case "claimTab":
+      if (typeof message.requestId === "string" && validId(message.sessionId) && Number.isInteger(message.tabId)) {
+        try {
+          const session = sessions.get(message.sessionId);
+          const tab = await chrome.tabs.get(message.tabId);
+          if (!sessionIsActive(message.sessionId) || !sessionCanAdoptTab(session, tab)) {
+            throw new Error("This tab requires an additional access approval.");
+          }
+          await shareTab(message.sessionId, message.tabId);
+          const record = (await enumerableBrowserTabs(message.sessionId, "session")).find(({ tabId }) => tabId === message.tabId);
+          if (!record) throw new Error("The claimed tab is no longer available.");
+          postNative({ version: PROTOCOL_VERSION, type: "tabClaimed", requestId: message.requestId, sessionId: message.sessionId, tabId: message.tabId, ok: true, tab: record });
+        } catch (error) {
+          postNative({ version: PROTOCOL_VERSION, type: "tabClaimed", requestId: message.requestId, sessionId: message.sessionId, tabId: message.tabId, ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
       }
       return;
     case "snapshot":
@@ -900,11 +928,11 @@ function sendRelay(sessionId, message) {
   }
 }
 
-async function sessionRelayTabs() {
+async function sessionRelayTabs(sessionId) {
   try {
     const tabs = await chrome.tabs.query({});
     return tabs
-      .filter((tab) => Number.isInteger(tab.id) && !isSessionPageTab(tab))
+      .filter((tab) => Number.isInteger(tab.id) && tabOwners.get(tab.id) === sessionId && !isSessionPageTab(tab))
       .map(toRelayTabInfo);
   } catch {
     return [];
@@ -915,7 +943,7 @@ async function syncSessionTabs(sessionId) {
   if (!sessionIsActive(sessionId)) {
     return;
   }
-  sendRelay(sessionId, { type: "tabs", tabs: await sessionRelayTabs() });
+  sendRelay(sessionId, { type: "tabs", tabs: await sessionRelayTabs(sessionId) });
 }
 
 async function syncActiveRelaySessions() {
@@ -930,7 +958,7 @@ async function sendRelayHello(sessionId) {
     userAgent: navigator.userAgent,
     browserVersion,
     extensionVersion: chrome.runtime.getManifest().version,
-    tabs: await sessionRelayTabs(),
+    tabs: await sessionRelayTabs(sessionId),
   })) {
     throw new Error("The local relay closed before it accepted its hello.");
   }

@@ -14,6 +14,8 @@ The current trusted-local release provides:
 - browser-local approval for selected-tab, requested-site, or full-website access;
 - separately approved monotonic access upgrades for reusable named sessions;
 - a visibly named and color-coded consent group per session;
+- session-aware all-tab and current-session inventories that distinguish unclaimed, claimable, approval-gated, and other-session-owned tabs without exposing other session identities;
+- immediate claiming under an existing grant, with conflicting ownership blocked and additional authority requiring a separate access upgrade;
 - immediate revocation when a tab leaves the group, the debugger banner is dismissed, or the relay stops; and
 - focused contract coverage plus disposable-profile browser rendering in Brave and Chrome-for-Testing.
 

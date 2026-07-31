@@ -2,9 +2,10 @@ import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, ran
 import { applicationSupportPath, atomicWritePrivateJson, readPrivateJson, type ApplicationSupportOptions, type CompanionStateStore, type PinnedExtensionIdentity } from "./state.js";
 import { canonicalHandshakeTranscript, type HandshakeTranscript, type HelloChallengeMessage, type HelloMessage, type HelloProofMessage, NATIVE_PROTOCOL_VERSION } from "./native-protocol.js";
 
+const IDENTITY_RECORD_VERSION = 1 as const;
 export type IdentityKind = "companion" | "controller";
-export interface StoredIdentity { version: typeof NATIVE_PROTOCOL_VERSION; kind: IdentityKind; principalId: string; publicKeySpki: string; privateKeyPkcs8: string; createdAt: number; }
-export interface IdentityStatus { version: typeof NATIVE_PROTOCOL_VERSION; kind: IdentityKind; principalId: string; publicKeySpki: string; fingerprint: string; createdAt: number; }
+export interface StoredIdentity { version: typeof IDENTITY_RECORD_VERSION; kind: IdentityKind; principalId: string; publicKeySpki: string; privateKeyPkcs8: string; createdAt: number; }
+export interface IdentityStatus { version: typeof IDENTITY_RECORD_VERSION; kind: IdentityKind; principalId: string; publicKeySpki: string; fingerprint: string; createdAt: number; }
 export interface IdentityKeypair { principalId: string; publicKeySpki: string; privateKeyPkcs8: string; fingerprint: string; }
 const b64 = (value: Uint8Array): string => Buffer.from(value).toString("base64url");
 const bytes = (value: string): Buffer => Buffer.from(value, "base64url");
@@ -32,13 +33,13 @@ export function signHandshakeTranscript(privateKeyPkcs8: string | KeyObject, fie
 export function verifyHandshakeTranscript(publicKeySpki: string | KeyObject, fields: HandshakeTranscript, signature: string): boolean { return verifyTranscript(publicKeySpki, canonicalHandshakeTranscript(fields), signature); }
 export function createHandshakeNonce(): string { return randomBytes(32).toString("base64url"); }
 
-function validStoredIdentity(value: unknown): value is StoredIdentity { if (!value || typeof value !== "object" || Array.isArray(value)) return false; const item = value as Record<string, unknown>; return item.version === NATIVE_PROTOCOL_VERSION && (item.kind === "companion" || item.kind === "controller") && typeof item.principalId === "string" && item.principalId.startsWith("sha256/") && typeof item.publicKeySpki === "string" && typeof item.privateKeyPkcs8 === "string" && typeof item.createdAt === "number" && Number.isInteger(item.createdAt); }
+function validStoredIdentity(value: unknown): value is StoredIdentity { if (!value || typeof value !== "object" || Array.isArray(value)) return false; const item = value as Record<string, unknown>; return item.version === IDENTITY_RECORD_VERSION && (item.kind === "companion" || item.kind === "controller") && typeof item.principalId === "string" && item.principalId.startsWith("sha256/") && typeof item.publicKeySpki === "string" && typeof item.privateKeyPkcs8 === "string" && typeof item.createdAt === "number"; }
 /** Load/create one persistent identity. Private key bytes are only present in StoredIdentity. */
 export class IdentityStore {
   readonly filePath: string; readonly kind: IdentityKind; private identity: StoredIdentity | undefined;
   constructor(kind: IdentityKind = "companion", options: ApplicationSupportOptions & { fileName?: string } = {}) { this.kind = kind; this.filePath = applicationSupportPath(options.fileName ?? `${kind}-identity.json`, options); }
   async load(): Promise<StoredIdentity | undefined> { if (this.identity) return structuredClone(this.identity); const value = await readPrivateJson<unknown>(this.filePath); if (value === undefined) return undefined; if (!validStoredIdentity(value) || value.kind !== this.kind || !keyPairMatches(value) || fingerprintSpki(value.publicKeySpki) !== value.principalId) throw new Error("invalid identity record"); this.identity = structuredClone(value); return structuredClone(value); }
-  async loadOrCreate(): Promise<StoredIdentity> { const existing = await this.load(); if (existing) return existing; const generated = generateIdentity(this.kind); const record: StoredIdentity = { version: NATIVE_PROTOCOL_VERSION, kind: this.kind, principalId: generated.principalId, publicKeySpki: generated.publicKeySpki, privateKeyPkcs8: generated.privateKeyPkcs8, createdAt: Date.now() }; await atomicWritePrivateJson(this.filePath, record); this.identity = record; return structuredClone(record); }
+  async loadOrCreate(): Promise<StoredIdentity> { const existing = await this.load(); if (existing) return existing; const generated = generateIdentity(this.kind); const record: StoredIdentity = { version: IDENTITY_RECORD_VERSION, kind: this.kind, principalId: generated.principalId, publicKeySpki: generated.publicKeySpki, privateKeyPkcs8: generated.privateKeyPkcs8, createdAt: Date.now() }; await atomicWritePrivateJson(this.filePath, record); this.identity = record; return structuredClone(record); }
   async save(identity: StoredIdentity): Promise<void> { if (!validStoredIdentity(identity) || identity.kind !== this.kind || !keyPairMatches(identity) || fingerprintSpki(identity.publicKeySpki) !== identity.principalId) throw new TypeError("invalid identity"); await atomicWritePrivateJson(this.filePath, identity); this.identity = structuredClone(identity); }
   async status(): Promise<IdentityStatus | undefined> { const identity = await this.load(); return identity ? { version: identity.version, kind: identity.kind, principalId: identity.principalId, publicKeySpki: identity.publicKeySpki, fingerprint: fingerprintSpki(identity.publicKeySpki), createdAt: identity.createdAt } : undefined; }
 }

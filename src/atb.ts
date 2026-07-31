@@ -19,7 +19,8 @@ export type CliCommand =
   | { kind: "uninstall"; extensionManifest?: string; executable?: string; home?: string }
   | { kind: "status"; extensionManifest?: string; executable?: string; home?: string }
   | { kind: "run"; argv: string[]; label?: string; ttlMs?: number; stableSessionKey?: string; access: SessionAccess }
-  | { kind: "tabs" }
+  | { kind: "tabs"; stableSessionKey?: string; scope: "all" | "session" }
+  | { kind: "claimTab"; stableSessionKey: string; tabId: number }
   | { kind: "requestAccess"; stableSessionKey: string; delta: SessionAccessDelta }
   | { kind: "close"; stableSessionKey: string }
   | { kind: "nativeHost" };
@@ -103,8 +104,27 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     return { kind: "requestAccess", stableSessionKey, delta };
   }
   if (first === "tabs") {
-    if (rest.length !== 0) throw new Error("usage: atb tabs");
-    return { kind: "tabs" };
+    let stableSessionKey;
+    let scope = "all" as "all" | "session";
+    for (let index = 0; index < rest.length; index += 1) {
+      const value = rest[index];
+      if (value === "--session") {
+        if (stableSessionKey !== undefined) throw new Error("--session may be specified only once");
+        stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--scope") {
+        const requested = requiredOptionValue(value, rest[++index]);
+        if (requested !== "all" && requested !== "session") throw new Error("--scope must be all or session");
+        scope = requested;
+      } else throw new Error(`unknown tabs option: ${value}`);
+    }
+    if (scope === "session" && stableSessionKey === undefined) throw new Error("--scope session requires --session <stable-key>");
+    return { kind: "tabs", scope, ...(stableSessionKey === undefined ? {} : { stableSessionKey }) };
+  }
+  if (first === "claim-tab") {
+    if (rest.length !== 4 || rest[0] !== "--session" || rest[2] !== "--tab") throw new Error("usage: atb claim-tab --session <stable-key> --tab <id>");
+    const raw = requiredOptionValue("--tab", rest[3]);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("--tab requires a non-negative integer tab ID");
+    return { kind: "claimTab", stableSessionKey: assertStableSessionKey(requiredOptionValue("--session", rest[1])), tabId: Number(raw) };
   }
   if (first === "close") {
     if (rest.length !== 2 || rest[0] !== "--session") throw new Error("usage: atb close --session <stable-key>");
@@ -324,8 +344,18 @@ export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {})
   if (command.kind === "tabs") {
     const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
     try {
-      const tabs = await broker.request("listTabs");
+      const tabs = await broker.request("listTabs", { scope: command.scope, ...(command.stableSessionKey === undefined ? {} : { stableSessionKey: command.stableSessionKey }) });
       (deps.stdout ?? process.stdout).write(`${JSON.stringify(tabs, null, 2)}\n`);
+      return 0;
+    } finally {
+      await broker.close?.();
+    }
+  }
+  if (command.kind === "claimTab") {
+    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    try {
+      const result = await broker.request("claimTab", { stableSessionKey: command.stableSessionKey, tabId: command.tabId });
+      (deps.stdout ?? process.stdout).write(`${JSON.stringify(result, null, 2)}\n`);
       return 0;
     } finally {
       await broker.close?.();

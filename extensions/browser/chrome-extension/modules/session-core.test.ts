@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   claimTab,
+  classifyTabAccess,
   parseRelayPairingUrl,
   matchesSessionAuthority,
 
@@ -47,6 +48,29 @@ describe("Native Messaging session ownership", () => {
     expect(sessionOwnsTab(owners, "session-a", 21)).toBe(false);
     expect(sessionOwnsTab(owners, "session-b", 23)).toBe(true);
   });
+  it("marks current, conflicting, claimable, and approval-gated tabs", () => {
+    const owners = new Map<number, string>([
+      [31, "session-a"],
+      [32, "session-b"],
+    ]);
+    expect(classifyTabAccess(owners, "session-a", 31, true)).toEqual({
+      ownership: "currentSession",
+      claimability: "alreadyShared",
+    });
+    expect(classifyTabAccess(owners, "session-a", 32, true)).toEqual({
+      ownership: "otherSession",
+      claimability: "blocked",
+    });
+    expect(classifyTabAccess(owners, "session-a", 33, true)).toEqual({
+      ownership: "unclaimed",
+      claimability: "claimable",
+    });
+    expect(classifyTabAccess(owners, "session-a", 34, false)).toEqual({
+      ownership: "unclaimed",
+      claimability: "approvalRequired",
+    });
+  });
+
 });
 
 describe("popup approval authority", () => {

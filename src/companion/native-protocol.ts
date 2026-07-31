@@ -34,7 +34,9 @@ export interface SessionApproval {
   access: SessionAccess;
   expiresAt: number | null;
 }
-export interface SharedTabRecord { tabId: number; title: string; url: string; }
+export type TabOwnership = "unclaimed" | "currentSession" | "otherSession";
+export type TabClaimability = "alreadyShared" | "claimable" | "approvalRequired" | "blocked";
+export interface SharedTabRecord { tabId: number; title: string; url: string; ownership: TabOwnership; claimability: TabClaimability; }
 export interface AccessUpgradeRecord {
   id: string;
   sessionId: string;
@@ -63,8 +65,10 @@ export interface HelloProofMessage {
 export interface ApproveSessionMessage extends SessionApproval { version: typeof NATIVE_PROTOCOL_VERSION; type: "approveSession"; requestId?: string; }
 export interface RevokeSessionMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "revokeSession"; requestId?: string; sessionId: string; reason?: string; }
 export interface RevokeDeviceMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "revokeDevice"; requestId: string; }
-export interface ListTabsMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "listTabs"; requestId: string; }
+export interface ListTabsMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "listTabs"; requestId: string; scope: "all" | "session"; sessionId?: string; }
 export interface TabsListedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "tabsListed"; requestId: string; tabs: SharedTabRecord[]; }
+export interface ClaimTabMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "claimTab"; requestId: string; sessionId: string; tabId: number; }
+export interface TabClaimedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "tabClaimed"; requestId: string; sessionId: string; tabId: number; ok: boolean; tab?: SharedTabRecord; error?: string; }
 export interface ApproveAccessMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "approveAccess"; requestId?: string; accessRequestId: string; sessionId: string; requestedAccess: SessionAccess; }
 export interface DeclineAccessMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "declineAccess"; requestId?: string; accessRequestId: string; sessionId: string; }
 
@@ -79,9 +83,9 @@ export interface AccessPendingMessage { version: typeof NATIVE_PROTOCOL_VERSION;
 export interface AccessUpdatedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "accessUpdated"; requestId?: string; accessRequestId: string; session: SessionRecord; }
 export interface AccessDeclinedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "accessDeclined"; requestId?: string; accessRequestId: string; sessionId: string; }
 
-export type ExtensionToHostMessage = HelloMessage | HelloProofMessage | ApproveSessionMessage | RevokeSessionMessage | RevokeDeviceMessage | RelayReadyMessage | RelayFailedMessage | TabsListedMessage | ApproveAccessMessage | DeclineAccessMessage;
+export type ExtensionToHostMessage = HelloMessage | HelloProofMessage | ApproveSessionMessage | RevokeSessionMessage | RevokeDeviceMessage | RelayReadyMessage | RelayFailedMessage | TabsListedMessage | TabClaimedMessage | ApproveAccessMessage | DeclineAccessMessage;
 
-export type HostToExtensionMessage = HelloChallengeMessage | TrustedMessage | SnapshotMessage | SessionPendingMessage | SessionStartedMessage | SessionStoppedMessage | ListTabsMessage | AccessPendingMessage | AccessUpdatedMessage | AccessDeclinedMessage;
+export type HostToExtensionMessage = HelloChallengeMessage | TrustedMessage | SnapshotMessage | SessionPendingMessage | SessionStartedMessage | SessionStoppedMessage | ListTabsMessage | ClaimTabMessage | AccessPendingMessage | AccessUpdatedMessage | AccessDeclinedMessage;
 export type NativeMessage = ExtensionToHostMessage | HostToExtensionMessage;
 
 export interface HandshakeTranscript {
@@ -117,7 +121,7 @@ export function validateSessionApproval(value: unknown): value is SessionApprova
   if (!isRecord(value) || !keysExactly(value, ["sessionId", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "access", "expiresAt"])) return false;
   return validId(value.sessionId) && isString(value.controllerPrincipalId, 256) && validDisplay(value.displayControllerName) && validLabel(value.taskLabel) && validCapabilities(value.requestedCapabilities) && isSessionAccess(value.access) && (value.expiresAt === null || (isInteger(value.expiresAt) && value.expiresAt > 0 && value.expiresAt <= Number.MAX_SAFE_INTEGER));
 }
-function validateSharedTab(value: unknown): value is SharedTabRecord { return isRecord(value) && keysExactly(value, ["tabId", "title", "url"]) && isInteger(value.tabId) && value.tabId >= 0 && isString(value.title, 4096) && isString(value.url, 8192); }
+function validateSharedTab(value: unknown): value is SharedTabRecord { return isRecord(value) && keysExactly(value, ["tabId", "title", "url", "ownership", "claimability"]) && isInteger(value.tabId) && value.tabId >= 0 && isString(value.title, 4096) && isString(value.url, 8192) && (value.ownership === "unclaimed" || value.ownership === "currentSession" || value.ownership === "otherSession") && (value.claimability === "alreadyShared" || value.claimability === "claimable" || value.claimability === "approvalRequired" || value.claimability === "blocked"); }
 function validateAccessUpgrade(value: unknown): value is AccessUpgradeRecord {
   return isRecord(value) &&
     keysExactly(value, ["id", "sessionId", "delta", "requestedAccess", "createdAt"]) &&
@@ -140,8 +144,10 @@ export function validateNativeMessage(value: unknown): value is NativeMessage {
     case "helloProof": return hasVersionAndType(value, "helloProof", ["role", "extensionId", "extensionPublicKey", "companionId", "companionPublicKey", "extensionNonce", "companionNonce", "signature"]) && validHandshakeFields(value, "extension");
     case "approveSession": return hasVersionAndType(value, "approveSession", ["sessionId", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "access", "expiresAt"]) && validateSessionApproval({ sessionId: value.sessionId, controllerPrincipalId: value.controllerPrincipalId, displayControllerName: value.displayControllerName, taskLabel: value.taskLabel, requestedCapabilities: value.requestedCapabilities, access: value.access, expiresAt: value.expiresAt });
     case "revokeDevice": return hasVersionAndType(value, "revokeDevice", []) && typeof value.requestId === "string" && value.requestId.length > 0;
-    case "listTabs": return hasVersionAndType(value, "listTabs", []) && typeof value.requestId === "string";
+    case "listTabs": return hasVersionAndType(value, "listTabs", ["scope"], ["sessionId"]) && (value.scope === "all" || value.scope === "session") && (value.sessionId === undefined || validId(value.sessionId)) && (value.scope !== "session" || validId(value.sessionId));
     case "tabsListed": return hasVersionAndType(value, "tabsListed", ["tabs"]) && typeof value.requestId === "string" && Array.isArray(value.tabs) && value.tabs.length <= 10_000 && value.tabs.every(validateSharedTab);
+    case "claimTab": return hasVersionAndType(value, "claimTab", ["sessionId", "tabId"]) && typeof value.requestId === "string" && validId(value.sessionId) && isInteger(value.tabId) && value.tabId >= 0;
+    case "tabClaimed": return hasVersionAndType(value, "tabClaimed", ["sessionId", "tabId", "ok"], ["tab", "error"]) && typeof value.requestId === "string" && validId(value.sessionId) && isInteger(value.tabId) && value.tabId >= 0 && typeof value.ok === "boolean" && (value.tab === undefined || validateSharedTab(value.tab)) && (value.error === undefined || isString(value.error, 512)) && (value.ok ? value.tab !== undefined && value.tab.ownership === "currentSession" : typeof value.error === "string");
     case "approveAccess": return hasVersionAndType(value, "approveAccess", ["accessRequestId", "sessionId", "requestedAccess"]) && validId(value.accessRequestId) && validId(value.sessionId) && isSessionAccess(value.requestedAccess);
     case "declineAccess": return hasVersionAndType(value, "declineAccess", ["accessRequestId", "sessionId"]) && validId(value.accessRequestId) && validId(value.sessionId);
     case "accessPending": return hasVersionAndType(value, "accessPending", ["request"]) && validateAccessUpgrade(value.request);

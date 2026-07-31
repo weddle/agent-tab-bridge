@@ -19,6 +19,18 @@ describe("atb CLI session boundary", () => {
       stableSessionKey: "review-2026",
       delta: { kind: "domains", tabIds: [], domains: ["example.com"] },
     });
+    expect(parseCliArgs(["tabs"])).toEqual({ kind: "tabs", scope: "all" });
+    expect(parseCliArgs(["tabs", "--session", "review-2026", "--scope", "session"])).toEqual({
+      kind: "tabs",
+      stableSessionKey: "review-2026",
+      scope: "session",
+    });
+    expect(parseCliArgs(["claim-tab", "--session", "review-2026", "--tab", "42"])).toEqual({
+      kind: "claimTab",
+      stableSessionKey: "review-2026",
+      tabId: 42,
+    });
+    expect(() => parseCliArgs(["tabs", "--scope", "session"])).toThrow(/requires --session/);
     expect(() => parseCliArgs(["request-access", "--session", "review-2026"])).toThrow(/exactly one/);
     expect(() => parseCliArgs(["request-access", "--session", "review-2026", "--tab", "1", "--full-access"])).toThrow(/exactly one/);
     expect(parseCliArgs(["run", "--domain", "*.Example.com", "--domain", "docs.example.com", "--", "agent"])).toMatchObject({

@@ -123,6 +123,10 @@ export class TaskSessionManager {
     }
     return await this.revoke(id, reason);
   }
+  getNamed(controllerPrincipalId: string, stableSessionKey: string): TaskSession {
+    return clone(this.requireNamed(controllerPrincipalId, stableSessionKey));
+  }
+
   previewAccessUpgrade(controllerPrincipalId: string, stableSessionKey: string, delta: SessionAccessDelta): { session: TaskSession; access: SessionAccess } {
     const session = this.requireNamed(controllerPrincipalId, stableSessionKey);
     try {

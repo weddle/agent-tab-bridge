@@ -15,6 +15,17 @@ export function claimTab(
 export function releaseTab(tabOwners: Map<number, string>, sessionId: string, tabId: number): boolean;
 export function releaseSessionTabs(tabOwners: Map<number, string>, sessionId: string): number[];
 export function sessionTabIds(tabOwners: Map<number, string>, sessionId: string): number[];
+export type TabAccessState = {
+  ownership: "unclaimed" | "currentSession" | "otherSession";
+  claimability: "alreadyShared" | "claimable" | "approvalRequired" | "blocked";
+};
+export function classifyTabAccess(
+  tabOwners: Map<number, string>,
+  sessionId: string | undefined,
+  tabId: number,
+  canAdopt: boolean,
+): TabAccessState;
+
 
 export type SessionAuthorityRecord = {
   id: string;

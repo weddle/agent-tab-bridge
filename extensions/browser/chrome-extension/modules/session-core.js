@@ -113,6 +113,21 @@ export function sessionTabIds(tabOwners, sessionId) {
   }
   return tabIds;
 }
+/** Describe ownership and whether a session can claim a tab without new approval. */
+export function classifyTabAccess(tabOwners, sessionId, tabId, canAdopt) {
+  const owner = tabOwners.get(tabId);
+  if (typeof sessionId === "string" && owner === sessionId) {
+    return { ownership: "currentSession", claimability: "alreadyShared" };
+  }
+  if (typeof owner === "string") {
+    return { ownership: "otherSession", claimability: "blocked" };
+  }
+  return {
+    ownership: "unclaimed",
+    claimability: canAdopt ? "claimable" : "approvalRequired",
+  };
+}
+
 
 /**
  * A host may transition only the exact popup-approved pending session to
