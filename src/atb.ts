@@ -12,24 +12,37 @@ import { ensureApplicationSupportDirectory, CompanionStateStore } from "./compan
 import { createBrokerSecret, IdentityStore } from "./companion/identity.js";
 import { MAX_TASK_LABEL_LENGTH } from "./companion/native-protocol.js";
 import { assertStableSessionKey } from "./companion/stable-session-key.js";
+import { createProfile, listProfiles, loadProfile, PROFILE_NAME_PATTERN } from "./companion/profiles.js";
 import { normalizeDomain, normalizeSessionAccess, normalizeSessionAccessDelta, type SessionAccess, type SessionAccessDelta } from "./companion/session-access.js";
 
 export type CliCommand =
   | { kind: "install"; extensionManifest?: string; executable?: string; home?: string }
   | { kind: "uninstall"; extensionManifest?: string; executable?: string; home?: string }
   | { kind: "status"; extensionManifest?: string; executable?: string; home?: string }
-  | { kind: "run"; argv: string[]; label?: string; ttlMs?: number; stableSessionKey?: string; access: SessionAccess }
-  | { kind: "open"; label: string; ttlMs?: number; stableSessionKey: string; access: SessionAccess }
-  | { kind: "url"; stableSessionKey: string }
-  | { kind: "tabs"; stableSessionKey?: string; scope: "all" | "session" }
-  | { kind: "claimTab"; stableSessionKey: string; tabId: number }
-  | { kind: "requestAccess"; stableSessionKey: string; delta: SessionAccessDelta }
-  | { kind: "close"; stableSessionKey: string }
+  | { kind: "run"; argv: string[]; label?: string; ttlMs?: number; stableSessionKey?: string; access: SessionAccess; profile?: string }
+  | { kind: "open"; label: string; ttlMs?: number; stableSessionKey: string; access: SessionAccess; profile?: string }
+  | { kind: "url"; stableSessionKey: string; profile?: string }
+  | { kind: "tabs"; stableSessionKey?: string; scope: "all" | "session"; profile?: string }
+  | { kind: "claimTab"; stableSessionKey: string; tabId: number; profile?: string }
+  | { kind: "requestAccess"; stableSessionKey: string; delta: SessionAccessDelta; profile?: string }
+  | { kind: "close"; stableSessionKey: string; profile?: string }
+  | { kind: "profileCreate"; name: string }
+  | { kind: "profileEnroll"; name: string }
+  | { kind: "profileList" }
   | { kind: "nativeHost" };
 
 function requiredOptionValue(option: string, value: string | undefined): string {
   if (!value || value.startsWith("--")) throw new Error(`${option} requires a value`);
   return value;
+}
+
+function onlyOnce(current: string | undefined, option: string): void {
+  if (current !== undefined) throw new Error(`${option} may be specified only once`);
+}
+
+function assertProfileOption(name: string): string {
+  if (!PROFILE_NAME_PATTERN.test(name)) throw new Error("--profile must be 1-64 characters of letters, digits, dot, underscore, or hyphen");
+  return name;
 }
 
 export function parseCliArgs(argv: readonly string[]): CliCommand {
@@ -41,6 +54,7 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     let label: string | undefined;
     let ttlMs: number | undefined;
     let stableSessionKey: string | undefined;
+    let profile: string | undefined;
     const tabIds = [];
     const domains = [];
     let fullAccess = false;
@@ -57,6 +71,9 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
       } else if (value === "--session") {
         if (stableSessionKey !== undefined) throw new Error("--session may be specified only once");
         stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--profile") {
+        onlyOnce(profile, value);
+        profile = assertProfileOption(requiredOptionValue(value, rest[++index]));
       } else if (value === "--tab") {
         const raw = requiredOptionValue(value, rest[++index]);
         if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("--tab requires a non-negative integer tab ID");
@@ -74,10 +91,11 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     const accessModes = Number(tabIds.length > 0) + Number(domains.length > 0) + Number(fullAccess);
     if (accessModes > 1) throw new Error("--tab, --domain, and --full-access are mutually exclusive");
     const access = normalizeSessionAccess(fullAccess ? { level: "full", tabIds: [], domains: [] } : domains.length ? { level: "domains", tabIds: [], domains } : { level: "selectedTabs", tabIds, domains: [] });
-    return { kind: "run", argv: rest.slice(separator + 1), access, ...(label === undefined ? {} : { label }), ...(ttlMs === undefined ? {} : { ttlMs }), ...(stableSessionKey === undefined ? {} : { stableSessionKey }) };
+    return { kind: "run", argv: rest.slice(separator + 1), access, ...(label === undefined ? {} : { label }), ...(ttlMs === undefined ? {} : { ttlMs }), ...(stableSessionKey === undefined ? {} : { stableSessionKey }), ...(profile === undefined ? {} : { profile }) };
   }
   if (first === "request-access") {
     let stableSessionKey;
+    let profile: string | undefined;
     const tabIds = [];
     const domains = [];
     let fullAccess = false;
@@ -86,6 +104,9 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
       if (value === "--session") {
         if (stableSessionKey !== undefined) throw new Error("--session may be specified only once");
         stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--profile") {
+        onlyOnce(profile, value);
+        profile = assertProfileOption(requiredOptionValue(value, rest[++index]));
       } else if (value === "--tab") {
         const raw = requiredOptionValue(value, rest[++index]);
         if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("--tab requires a non-negative integer tab ID");
@@ -103,12 +124,13 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     const modes = Number(tabIds.length > 0) + Number(domains.length > 0) + Number(fullAccess);
     if (modes !== 1) throw new Error("request-access requires exactly one of --tab, --domain, or --full-access");
     const delta = normalizeSessionAccessDelta(fullAccess ? { kind: "full", tabIds: [], domains: [] } : domains.length ? { kind: "domains", tabIds: [], domains } : { kind: "tabs", tabIds, domains: [] });
-    return { kind: "requestAccess", stableSessionKey, delta };
+    return { kind: "requestAccess", stableSessionKey, delta, ...(profile === undefined ? {} : { profile }) };
   }
   if (first === "open") {
     let label: string | undefined;
     let ttlMs: number | undefined;
     let stableSessionKey: string | undefined;
+    let profile: string | undefined;
     const tabIds = [];
     const domains = [];
     let fullAccess = false;
@@ -125,6 +147,9 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
       } else if (value === "--session") {
         if (stableSessionKey !== undefined) throw new Error("--session may be specified only once");
         stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--profile") {
+        onlyOnce(profile, value);
+        profile = assertProfileOption(requiredOptionValue(value, rest[++index]));
       } else if (value === "--tab") {
         const raw = requiredOptionValue(value, rest[++index]);
         if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("--tab requires a non-negative integer tab ID");
@@ -143,20 +168,52 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     const accessModes = Number(tabIds.length > 0) + Number(domains.length > 0) + Number(fullAccess);
     if (accessModes > 1) throw new Error("--tab, --domain, and --full-access are mutually exclusive");
     const access = normalizeSessionAccess(fullAccess ? { level: "full", tabIds: [], domains: [] } : domains.length ? { level: "domains", tabIds: [], domains } : { level: "selectedTabs", tabIds, domains: [] });
-    return { kind: "open", label, stableSessionKey, access, ...(ttlMs === undefined ? {} : { ttlMs }) };
+    return { kind: "open", label, stableSessionKey, access, ...(ttlMs === undefined ? {} : { ttlMs }), ...(profile === undefined ? {} : { profile }) };
   }
   if (first === "url") {
-    if (rest.length !== 2 || rest[0] !== "--session") throw new Error("usage: atb url --session <stable-key>");
-    return { kind: "url", stableSessionKey: assertStableSessionKey(requiredOptionValue("--session", rest[1])) };
+    let stableSessionKey: string | undefined;
+    let profile: string | undefined;
+    for (let index = 0; index < rest.length; index += 1) {
+      const value = rest[index];
+      if (value === "--session") {
+        onlyOnce(stableSessionKey, value);
+        stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--profile") {
+        onlyOnce(profile, value);
+        profile = assertProfileOption(requiredOptionValue(value, rest[++index]));
+      } else throw new Error(`unknown url option: ${value}`);
+    }
+    if (stableSessionKey === undefined) throw new Error("usage: atb url --session <stable-key> [--profile <name>]");
+    return { kind: "url", stableSessionKey, ...(profile === undefined ? {} : { profile }) };
+  }
+  if (first === "profile") {
+    const [action, ...args] = rest;
+    if (action === "create") {
+      if (args.length !== 1) throw new Error("usage: atb profile create <name>");
+      return { kind: "profileCreate", name: assertProfileOption(args[0]) };
+    }
+    if (action === "enroll") {
+      if (args.length !== 1) throw new Error("usage: atb profile enroll <name>");
+      return { kind: "profileEnroll", name: assertProfileOption(args[0]) };
+    }
+    if (action === "list") {
+      if (args.length !== 0) throw new Error("usage: atb profile list");
+      return { kind: "profileList" };
+    }
+    throw new Error("usage: atb profile <create|enroll|list>");
   }
   if (first === "tabs") {
     let stableSessionKey;
+    let profile: string | undefined;
     let scope = "all" as "all" | "session";
     for (let index = 0; index < rest.length; index += 1) {
       const value = rest[index];
       if (value === "--session") {
         if (stableSessionKey !== undefined) throw new Error("--session may be specified only once");
         stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--profile") {
+        onlyOnce(profile, value);
+        profile = assertProfileOption(requiredOptionValue(value, rest[++index]));
       } else if (value === "--scope") {
         const requested = requiredOptionValue(value, rest[++index]);
         if (requested !== "all" && requested !== "session") throw new Error("--scope must be all or session");
@@ -164,17 +221,44 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
       } else throw new Error(`unknown tabs option: ${value}`);
     }
     if (scope === "session" && stableSessionKey === undefined) throw new Error("--scope session requires --session <stable-key>");
-    return { kind: "tabs", scope, ...(stableSessionKey === undefined ? {} : { stableSessionKey }) };
+    return { kind: "tabs", scope, ...(stableSessionKey === undefined ? {} : { stableSessionKey }), ...(profile === undefined ? {} : { profile }) };
   }
   if (first === "claim-tab") {
-    if (rest.length !== 4 || rest[0] !== "--session" || rest[2] !== "--tab") throw new Error("usage: atb claim-tab --session <stable-key> --tab <id>");
-    const raw = requiredOptionValue("--tab", rest[3]);
-    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("--tab requires a non-negative integer tab ID");
-    return { kind: "claimTab", stableSessionKey: assertStableSessionKey(requiredOptionValue("--session", rest[1])), tabId: Number(raw) };
+    let stableSessionKey: string | undefined;
+    let profile: string | undefined;
+    let tabId: number | undefined;
+    for (let index = 0; index < rest.length; index += 1) {
+      const value = rest[index];
+      if (value === "--session") {
+        onlyOnce(stableSessionKey, value);
+        stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--tab") {
+        const raw = requiredOptionValue(value, rest[++index]);
+        if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("--tab requires a non-negative integer tab ID");
+        tabId = Number(raw);
+      } else if (value === "--profile") {
+        onlyOnce(profile, value);
+        profile = assertProfileOption(requiredOptionValue(value, rest[++index]));
+      } else throw new Error(`unknown claim-tab option: ${value}`);
+    }
+    if (stableSessionKey === undefined || tabId === undefined) throw new Error("usage: atb claim-tab --session <stable-key> --tab <id> [--profile <name>]");
+    return { kind: "claimTab", stableSessionKey, tabId, ...(profile === undefined ? {} : { profile }) };
   }
   if (first === "close") {
-    if (rest.length !== 2 || rest[0] !== "--session") throw new Error("usage: atb close --session <stable-key>");
-    return { kind: "close", stableSessionKey: assertStableSessionKey(requiredOptionValue("--session", rest[1])) };
+    let stableSessionKey: string | undefined;
+    let profile: string | undefined;
+    for (let index = 0; index < rest.length; index += 1) {
+      const value = rest[index];
+      if (value === "--session") {
+        onlyOnce(stableSessionKey, value);
+        stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--profile") {
+        onlyOnce(profile, value);
+        profile = assertProfileOption(requiredOptionValue(value, rest[++index]));
+      } else throw new Error(`unknown close option: ${value}`);
+    }
+    if (stableSessionKey === undefined) throw new Error("usage: atb close --session <stable-key> [--profile <name>]");
+    return { kind: "close", stableSessionKey, ...(profile === undefined ? {} : { profile }) };
   }
   if (first === "native-host") return { kind: "nativeHost" };
   if (first === "install" || first === "uninstall" || first === "status") {
@@ -439,31 +523,88 @@ async function runChildWithUrl(argv: readonly string[], cdpUrl: string, deps: Ru
   }
 }
 
+/** Request enrollment for a local profile key; the user confirms the printed code in the popup. */
+export async function enrollAgentProfile(name: string, deps: Pick<RunDeps, "broker"> & { stdout?: NodeJS.WriteStream; directory?: string }): Promise<number> {
+  const record = await loadProfile(name, deps.directory === undefined ? {} : { directory: deps.directory });
+  let removeEvent: (() => void) | undefined;
+  const outcome = Promise.withResolvers<number>();
+  let enrollmentId: string | undefined;
+  const early = new Map<string, string>();
+  try {
+    const onEvent = (event: BrokerEvent) => {
+      const kind = eventName(event);
+      const id = typeof event.enrollmentId === "string" ? event.enrollmentId : undefined;
+      if (kind === "hostclosing") { outcome.reject(new Error("companion host closed while enrollment was pending")); return; }
+      if (kind !== "profileenrolled" && kind !== "enrolldeclined") return;
+      if (!id) return;
+      if (!enrollmentId) { early.set(id, kind); return; }
+      if (id !== enrollmentId) return;
+      if (kind === "profileenrolled") outcome.resolve(0);
+      else outcome.reject(new Error(typeof event.reason === "string" ? event.reason : "enrollment was declined"));
+    };
+    removeEvent = deps.broker.onEvent?.(onEvent) ?? undefined;
+    const result = await deps.broker.request("enrollProfile", { profileName: record.name, publicKeySpki: record.publicKeySpki });
+    const record2 = result && typeof result === "object" ? result as Record<string, unknown> : null;
+    const enrollment = record2?.enrollment && typeof record2.enrollment === "object" ? record2.enrollment as Record<string, unknown> : null;
+    enrollmentId = typeof enrollment?.enrollmentId === "string" ? enrollment.enrollmentId : undefined;
+    const code = typeof enrollment?.code === "string" ? enrollment.code : undefined;
+    if (!enrollmentId || !code) throw new Error("broker did not return an enrollment code");
+    const stdout = deps.stdout ?? process.stdout;
+    stdout.write(`Pairing code: ${code}\n`);
+    stdout.write(`Show this code to the user. To approve, open the Agent Tab Bridge popup in the paired browser and enter the code for profile "${record.name}" (${record.principalId}). The code expires in 2 minutes.\n`);
+    const seen = early.get(enrollmentId);
+    if (seen === "enrolldeclined") throw new Error("enrollment was declined");
+    if (seen !== "profileenrolled") await outcome.promise;
+    stdout.write(`profile ${record.name} enrolled\n`);
+    return 0;
+  } finally {
+    removeEvent?.();
+    await deps.broker.close?.();
+  }
+}
+
 export type AtbMainDeps = Partial<RunDeps> & { nativeHost?: () => Promise<void>; stdout?: NodeJS.WriteStream; stateDirectory?: string };
 export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {}): Promise<number> {
   const command = parseCliArgs(argv);
+  const directoryOption = deps.stateDirectory === undefined ? {} : { directory: deps.stateDirectory };
+  const brokerFor = async (profile?: string) => deps.broker ?? await createCompanionBrokerClient({ ...(deps.stateDirectory === undefined ? {} : { directory: deps.stateDirectory }), ...(profile === undefined ? {} : { profile }) });
   if (command.kind === "nativeHost") {
     await (deps.nativeHost ?? runNativeMessagingHost)();
     return 0;
   }
+  if (command.kind === "profileCreate") {
+    const record = await createProfile(command.name, directoryOption);
+    (deps.stdout ?? process.stdout).write(`created profile ${record.name}\nfingerprint ${record.principalId}\n`);
+    return 0;
+  }
+  if (command.kind === "profileEnroll") {
+    const broker = await brokerFor(undefined);
+    return enrollAgentProfile(command.name, { broker, ...(deps.stdout === undefined ? {} : { stdout: deps.stdout }), ...(deps.stateDirectory === undefined ? {} : { directory: deps.stateDirectory }) });
+  }
+  if (command.kind === "profileList") {
+    const profiles = await listProfiles(directoryOption);
+    const stdout = deps.stdout ?? process.stdout;
+    for (const profile of profiles) stdout.write(`${profile.name}\t${profile.principalId}\n`);
+    return 0;
+  }
   if (command.kind === "run") {
-    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    const broker = await brokerFor(command.profile);
     return runAgentCommand(command.argv, { ...deps, broker } as RunDeps, { label: command.label, ttlMs: command.ttlMs, stableSessionKey: command.stableSessionKey, access: command.access });
   }
   if (command.kind === "open") {
-    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    const broker = await brokerFor(command.profile);
     return openAgentSession({ label: command.label, stableSessionKey: command.stableSessionKey, access: command.access, ...(command.ttlMs === undefined ? {} : { ttlMs: command.ttlMs }) }, { broker, ...(deps.stdout === undefined ? {} : { stdout: deps.stdout }) });
   }
   if (command.kind === "url") {
-    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    const broker = await brokerFor(command.profile);
     return printAgentSessionUrl(command.stableSessionKey, { broker, ...(deps.stdout === undefined ? {} : { stdout: deps.stdout }) });
   }
   if (command.kind === "requestAccess") {
-    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    const broker = await brokerFor(command.profile);
     return requestAgentAccess(command.stableSessionKey, command.delta, { broker });
   }
   if (command.kind === "tabs") {
-    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    const broker = await brokerFor(command.profile);
     try {
       const tabs = await broker.request("listTabs", { scope: command.scope, ...(command.stableSessionKey === undefined ? {} : { stableSessionKey: command.stableSessionKey }) });
       (deps.stdout ?? process.stdout).write(`${JSON.stringify(tabs, null, 2)}\n`);
@@ -473,7 +614,7 @@ export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {})
     }
   }
   if (command.kind === "claimTab") {
-    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    const broker = await brokerFor(command.profile);
     try {
       const result = await broker.request("claimTab", { stableSessionKey: command.stableSessionKey, tabId: command.tabId });
       (deps.stdout ?? process.stdout).write(`${JSON.stringify(result, null, 2)}\n`);
@@ -483,7 +624,7 @@ export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {})
     }
   }
   if (command.kind === "close") {
-    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    const broker = await brokerFor(command.profile);
     return closeAgentSession(command.stableSessionKey, { broker });
   }
   const extensionOrigin = await extensionOriginFromManifest(command.extensionManifest);

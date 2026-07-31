@@ -148,6 +148,24 @@ node dist/src/atb.js url --session research
 
 `atb url` prints the session's loopback `ws://127.0.0.1:...` endpoint exactly once per invocation for the operator to paste into the harness (Hermes `/browser connect` or `browser.cdp_url`; omp `browser.cdpUrl`). The URL is session-scoped and ephemeral: atb never writes it to disk, it stops working the moment the session is revoked or closed, and a new relay means a new URL. Do not persist it in configuration files or logs.
 
+## Agent profiles
+
+By default every broker client authenticates with the shared companion secret and appears in the popup as one anonymous "Local controller". A named profile gives an agent harness its own keypair and its own visible identity:
+
+```bash
+node dist/src/atb.js profile create hermes-research
+node dist/src/atb.js profile enroll hermes-research
+```
+
+`profile enroll` prints a one-time 6-digit pairing code and asks the agent to display it. The user enters that code in the popup's **Agent enrollments** card; a correct entry (3 attempts, 2-minute expiry) pins the profile's public key in the companion's state. From then on the profile authenticates to the broker by signing a per-connection challenge with its private key — the shared secret is never sent — and its sessions are displayed and namespaced under the profile name:
+
+```bash
+node dist/src/atb.js open --profile hermes-research --session research --label "Research task" --domain example.com
+node dist/src/atb.js url --profile hermes-research --session research
+```
+
+Named sessions belong to the principal that opened them: a different profile, or the default controller, cannot fetch or close another principal's session. Profile keys are stored as user-only files under the companion state directory (portable; no macOS Keychain). On a single machine this separates and names principals but is not a boundary against other processes running as the same user; the pairing-code ceremony is the enrollment bootstrap that remains valid when the broker later accepts non-local transports.
+
 Close a named session explicitly when the task is finished:
 
 ```bash

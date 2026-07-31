@@ -1,8 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { type Readable, type Writable } from "node:stream";
 import { startAgentTabRelay } from "../../extensions/browser/src/browser/extension-relay/relay-server.js";
 import { BrokerServer, startBrokerServer } from "./broker.js";
-import { deriveControllerPrincipalId, HostIdentityHandshake, IdentityStore, createBrokerSecret } from "./identity.js";
+import { deriveControllerPrincipalId, fingerprintSpki, HostIdentityHandshake, IdentityStore, createBrokerSecret } from "./identity.js";
 import { NativeMessageDecoder, writeNativeFrame } from "./native-framing.js";
 import { NATIVE_PROTOCOL_VERSION, type AccessUpgradeRecord, type ExtensionToHostMessage, type HostToExtensionMessage, type NativeMessage, type SharedTabRecord } from "./native-protocol.js";
 import { CompanionStateStore } from "./state.js";
@@ -31,6 +31,7 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
   const pendingClaimRequests = new Map<string, { resolve: (tab: SharedTabRecord) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   const pendingAccess = new Map<string, AccessUpgradeRecord>();
   const pendingAccessBySession = new Map<string, string>();
+  const pendingEnrollments = new Map<string, { profileName: string; publicKeySpki: string; fingerprint: string; code: string; expiresAt: number; attempts: number; timer: NodeJS.Timeout }>();
   let outputTail = Promise.resolve();
   const send = (message: HostToExtensionMessage): Promise<void> => {
     const operation = outputTail.then(async () => { if (!ending) await writeNativeFrame(output, message); });
@@ -91,6 +92,23 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
     await send({ version: NATIVE_PROTOCOL_VERSION, type: "accessPending", request });
     return request;
   };
+  const enrollProfile = async (profileName: string, publicKeySpki: string) => {
+    if (!trusted) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
+    for (const pending of pendingEnrollments.values()) if (pending.profileName === profileName) throw new TaskSessionError("sessionConflict", "an enrollment for this profile is already awaiting confirmation");
+    let fingerprint: string;
+    try { fingerprint = fingerprintSpki(publicKeySpki); } catch { throw new TaskSessionError("invalidSession", "publicKeySpki is not a valid key"); }
+    const enrollmentId = randomUUID();
+    const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+    const expiresAt = Date.now() + 2 * 60_000;
+    const timer = setTimeout(() => {
+      if (!pendingEnrollments.delete(enrollmentId)) return;
+      broker?.publish({ event: "enrollDeclined", enrollmentId, profileName, reason: "enrollment code expired" });
+    }, expiresAt - Date.now());
+    timer.unref?.();
+    pendingEnrollments.set(enrollmentId, { profileName, publicKeySpki, fingerprint, code, expiresAt, attempts: 0, timer });
+    await send({ version: NATIVE_PROTOCOL_VERSION, type: "enrollPending", enrollmentId, profileName, profileFingerprint: fingerprint, expiresAt });
+    return { enrollmentId, code, expiresAt };
+  };
   const sessions = new TaskSessionManager({ startRelay: options.startRelay ?? startAgentTabRelay, onEvent: (event) => {
     const session = { ...event.session, requestedCapabilities: [...event.session.requestedCapabilities], access: { ...event.session.access, tabIds: [...event.session.access.tabIds], domains: [...event.session.access.domains] } };
     if (event.type === "pending") { broker?.publish({ event: "pending", sessionId: session.id, session }); void send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionPending", session }).catch(() => {}); }
@@ -107,7 +125,11 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
       void send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionStopped", session, reason: event.reason }).catch(() => {});
     }
   } });
-  broker = await startBrokerServer({ token: state.brokerSecret, sessions, isTrusted: () => trusted !== null, controller: () => trusted ? { principalId: controllerPrincipalId, displayName: "Local controller" } : null, status: () => ({ companionPrincipalId: companion.principalId, controllerPrincipalId }), listTabs, claimTab, requestAccess });
+  broker = await startBrokerServer({ token: state.brokerSecret, sessions, isTrusted: () => trusted !== null, controller: () => trusted ? { principalId: controllerPrincipalId, displayName: "Local controller" } : null, profile: async (name) => {
+    const current = await stateStore.load();
+    const record = (current.enrolledProfiles ?? []).find((profile) => profile.name === name);
+    return record ? { principalId: record.principalId, displayName: record.name, publicKeySpki: record.publicKeySpki } : null;
+  }, enrollProfile, status: () => ({ companionPrincipalId: companion.principalId, controllerPrincipalId }), listTabs, claimTab, requestAccess });
   const handshake = new HostIdentityHandshake(identityStore, stateStore);
   const decoder = new NativeMessageDecoder();
   const requestIds = new Set<string>();
@@ -187,10 +209,37 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
           await send({ version: NATIVE_PROTOCOL_VERSION, type: "accessDeclined", accessRequestId: request.id, sessionId: request.sessionId });
           return;
         }
+        if (message.type === "confirmEnrollment") {
+          const pending = pendingEnrollments.get(message.enrollmentId);
+          if (!pending || pending.expiresAt <= Date.now()) {
+            await send({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: message.requestId, enrollmentId: message.enrollmentId, ok: false, error: "enrollment request is no longer pending" });
+            return;
+          }
+          const expected = Buffer.from(pending.code, "utf8");
+          const presented = Buffer.from(message.code, "utf8");
+          if (presented.length !== expected.length || !timingSafeEqual(expected, presented)) {
+            pending.attempts += 1;
+            if (pending.attempts >= 3) {
+              clearTimeout(pending.timer);
+              pendingEnrollments.delete(message.enrollmentId);
+              broker?.publish({ event: "enrollDeclined", enrollmentId: message.enrollmentId, profileName: pending.profileName, reason: "too many incorrect codes" });
+              await send({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: message.requestId, enrollmentId: message.enrollmentId, ok: false, error: "too many incorrect codes; restart enrollment" });
+              return;
+            }
+            await send({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: message.requestId, enrollmentId: message.enrollmentId, ok: false, error: "incorrect code" });
+            return;
+          }
+          clearTimeout(pending.timer);
+          pendingEnrollments.delete(message.enrollmentId);
+          await stateStore.update((current) => ({ ...current, enrolledProfiles: [...(current.enrolledProfiles ?? []).filter((profile) => profile.name !== pending.profileName), { name: pending.profileName, principalId: pending.fingerprint, publicKeySpki: pending.publicKeySpki, enrolledAt: Date.now() }] }));
+          broker?.publish({ event: "profileEnrolled", enrollmentId: message.enrollmentId, profileName: pending.profileName });
+          await send({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: message.requestId, enrollmentId: message.enrollmentId, ok: true, profileName: pending.profileName });
+          return;
+        }
         if (message.type === "revokeSession" && sessions.get(message.sessionId)) { await sessions.revoke(message.sessionId, message.reason ?? "browserRevoked"); return; }
         if (message.type === "relayReady") { sessions.relayReady(message.sessionId); await snapshot(); return; }
         if (message.type === "relayFailed" && sessions.get(message.sessionId)) await sessions.relayFailed(message.sessionId, "relayFailed");
-      } catch (error) { if (error instanceof NativeOutputFailure) throw error; if (message.type === "helloProof" || message.type === "approveSession" || message.type === "approveAccess" || message.type === "declineAccess" || message.type === "revokeSession" || message.type === "relayReady" || message.type === "relayFailed") return; throw error; }
+      } catch (error) { if (error instanceof NativeOutputFailure) throw error; if (message.type === "helloProof" || message.type === "approveSession" || message.type === "approveAccess" || message.type === "declineAccess" || message.type === "confirmEnrollment" || message.type === "revokeSession" || message.type === "relayReady" || message.type === "relayFailed") return; throw error; }
     }
   });
 }

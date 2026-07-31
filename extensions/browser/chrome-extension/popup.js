@@ -23,6 +23,9 @@ const pendingList = document.getElementById("pendingSessions");
 const accessSection = document.getElementById("accessSection");
 const accessHeading = document.getElementById("accessHeading");
 const accessList = document.getElementById("accessRequests");
+const enrollSection = document.getElementById("enrollSection");
+const enrollHeading = document.getElementById("enrollHeading");
+const enrollList = document.getElementById("enrollRequests");
 const activeSection = document.getElementById("activeSection");
 const activeHeading = document.getElementById("activeHeading");
 const activeList = document.getElementById("activeSessions");
@@ -41,6 +44,7 @@ let state = {
   pendingSessions: [],
   activeSessions: [],
   pendingAccess: [],
+  pendingEnrollments: [],
   sharedTabs: [],
 };
 let currentTab = null;
@@ -56,6 +60,7 @@ const openDetails = new Set();
 /** Session id -> { node, remainingEl, signature } */
 const pendingCards = new Map();
 const accessCards = new Map();
+const enrollCards = new Map();
 const activeCards = new Map();
 
 function makeElement(tag, className, text) {
@@ -410,6 +415,48 @@ function buildAccessCard(request) {
   return { node: card, remainingEl: null, signature: "" };
 }
 
+function enrollSignature(request) {
+  return [
+    sessionKey(request),
+    request?.profileName ?? "",
+    request?.profileFingerprint ?? "",
+  ].join(UNIT);
+}
+
+function buildEnrollCard(request) {
+  const id = sessionKey(request);
+  const card = makeElement("article", "atb-card card pending access-selectedTabs");
+  card.append(makeElement("div", "task", `Enroll agent profile "${request?.profileName ?? "unnamed"}"`));
+  card.append(makeElement("p", "meta", `Key ${abbreviate(request?.profileFingerprint)}`));
+  card.append(makeElement("p", "meta", "Enter the 6-digit code shown by the agent that requested enrollment. If you did not start that agent, ignore this request; it expires on its own."));
+  const input = document.createElement("input");
+  input.type = "text";
+  input.inputMode = "numeric";
+  input.autocomplete = "one-time-code";
+  input.maxLength = 6;
+  input.placeholder = "6-digit code";
+  input.className = "atb-code-input";
+  input.setAttribute("aria-label", `Pairing code for profile ${request?.profileName ?? "unnamed"}`);
+  const confirm = makeButton("Confirm enrollment", "primary");
+  confirm.addEventListener("click", () => {
+    const code = input.value.trim();
+    if (!/^\d{6}$/.test(code)) {
+      showError(new Error("Enter the 6-digit code shown by the requesting agent."));
+      return;
+    }
+    void runMutation(id, confirm, { type: "confirmEnrollment", enrollmentId: id, code }, "The companion rejected this enrollment code.");
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") confirm.click();
+  });
+  const remainingEl = makeElement("p", "meta remaining", formatRemaining(request));
+  card.append(remainingEl);
+  const actions = makeElement("div", "actions");
+  actions.append(input, confirm);
+  card.append(actions);
+  return { node: card, remainingEl, signature: "" };
+}
+
 /** True while the user is typing in, focused on, or selecting text inside node. */
 function holdsUserContext(node) {
   const active = document.activeElement;
@@ -519,6 +566,7 @@ function render() {
   const pending = state.pendingSessions;
   const active = state.activeSessions;
   const access = state.pendingAccess;
+  const enrollments = state.pendingEnrollments;
 
   const identityKnown =
     typeof companion.id === "string" && companion.id !== "" &&
@@ -544,6 +592,9 @@ function render() {
   setHidden(accessSection, access.length === 0);
   setText(accessHeading, `Access upgrades (${access.length})`);
   reconcile(accessList, accessCards, access, accessSignature, buildAccessCard);
+  setHidden(enrollSection, enrollments.length === 0);
+  setText(enrollHeading, `Agent enrollments (${enrollments.length})`);
+  reconcile(enrollList, enrollCards, enrollments, enrollSignature, buildEnrollCard);
 
 
   setHidden(activeSection, nativeStatus !== "connected" && active.length === 0);
@@ -576,6 +627,7 @@ async function refresh() {
       pendingSessions: Array.isArray(result.pendingSessions) ? result.pendingSessions : [],
       activeSessions: Array.isArray(result.activeSessions) ? result.activeSessions : [],
       pendingAccess: Array.isArray(result.pendingAccess) ? result.pendingAccess : [],
+      pendingEnrollments: Array.isArray(result.pendingEnrollments) ? result.pendingEnrollments : [],
       sharedTabs: Array.isArray(result.sharedTabs) ? result.sharedTabs : [],
     };
     currentTab = tab;

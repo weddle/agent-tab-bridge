@@ -204,6 +204,17 @@
       /* Quiet outline, sized to its label — never a full-width filled block. */
       #forgetCompanionButton { align-self: flex-start; }
 
+      .atb-code-input {
+        width: 7.5em;
+        padding: 6px 8px;
+        font-size: 16px;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.2em;
+        border: 1px solid var(--atb-border, #999);
+        border-radius: 6px;
+        background: var(--atb-bg, #fff);
+        color: var(--atb-text, #111);
+      }
       .hidden { display: none !important; }
     </style>
   </head>
@@ -237,6 +248,11 @@
       <section id="accessSection" class="section hidden" aria-labelledby="accessHeading">
         <h2 id="accessHeading">Access upgrades (0)</h2>
         <div id="accessRequests" class="cards"></div>
+      </section>
+
+      <section id="enrollSection" class="section hidden" aria-labelledby="enrollHeading">
+        <h2 id="enrollHeading">Agent enrollments (0)</h2>
+        <div id="enrollRequests" class="cards"></div>
       </section>
 
       <section id="activeSection" class="section hidden" aria-labelledby="activeHeading">

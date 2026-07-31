@@ -82,10 +82,13 @@ export interface SessionStoppedMessage { version: typeof NATIVE_PROTOCOL_VERSION
 export interface AccessPendingMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "accessPending"; requestId?: string; request: AccessUpgradeRecord; }
 export interface AccessUpdatedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "accessUpdated"; requestId?: string; accessRequestId: string; session: SessionRecord; }
 export interface AccessDeclinedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "accessDeclined"; requestId?: string; accessRequestId: string; sessionId: string; }
+export interface EnrollPendingMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "enrollPending"; requestId?: string; enrollmentId: string; profileName: string; profileFingerprint: string; expiresAt: number; }
+export interface ConfirmEnrollmentMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "confirmEnrollment"; requestId: string; enrollmentId: string; code: string; }
+export interface EnrollResultMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "enrollResult"; requestId: string; enrollmentId: string; ok: boolean; profileName?: string; error?: string; }
 
-export type ExtensionToHostMessage = HelloMessage | HelloProofMessage | ApproveSessionMessage | RevokeSessionMessage | RevokeDeviceMessage | RelayReadyMessage | RelayFailedMessage | TabsListedMessage | TabClaimedMessage | ApproveAccessMessage | DeclineAccessMessage;
+export type ExtensionToHostMessage = HelloMessage | HelloProofMessage | ApproveSessionMessage | RevokeSessionMessage | RevokeDeviceMessage | RelayReadyMessage | RelayFailedMessage | TabsListedMessage | TabClaimedMessage | ApproveAccessMessage | DeclineAccessMessage | ConfirmEnrollmentMessage;
 
-export type HostToExtensionMessage = HelloChallengeMessage | TrustedMessage | SnapshotMessage | SessionPendingMessage | SessionStartedMessage | SessionStoppedMessage | ListTabsMessage | ClaimTabMessage | AccessPendingMessage | AccessUpdatedMessage | AccessDeclinedMessage;
+export type HostToExtensionMessage = HelloChallengeMessage | TrustedMessage | SnapshotMessage | SessionPendingMessage | SessionStartedMessage | SessionStoppedMessage | ListTabsMessage | ClaimTabMessage | AccessPendingMessage | AccessUpdatedMessage | AccessDeclinedMessage | EnrollPendingMessage | EnrollResultMessage;
 export type NativeMessage = ExtensionToHostMessage | HostToExtensionMessage;
 
 export interface HandshakeTranscript {
@@ -160,6 +163,9 @@ export function validateNativeMessage(value: unknown): value is NativeMessage {
     case "sessionPending": return hasVersionAndType(value, "sessionPending", ["session"]) && validateSessionRecord(value.session);
     case "sessionStarted": return hasVersionAndType(value, "sessionStarted", ["session"], ["relayUrl"]) && validateSessionRecord(value.session) && (value.relayUrl === undefined || isString(value.relayUrl, 8192));
     case "sessionStopped": return hasVersionAndType(value, "sessionStopped", ["session"], ["reason"]) && validateSessionRecord(value.session) && (value.reason === undefined || isString(value.reason, 256));
+    case "enrollPending": return hasVersionAndType(value, "enrollPending", ["enrollmentId", "profileName", "profileFingerprint", "expiresAt"]) && validId(value.enrollmentId) && validId(value.profileName, 64) && validPrincipalId(value.profileFingerprint) && isInteger(value.expiresAt) && value.expiresAt > 0;
+    case "confirmEnrollment": return hasVersionAndType(value, "confirmEnrollment", ["enrollmentId", "code"]) && typeof value.requestId === "string" && validId(value.enrollmentId) && isString(value.code, 16) && /^\d{6}$/.test(value.code);
+    case "enrollResult": return hasVersionAndType(value, "enrollResult", ["enrollmentId", "ok"], ["profileName", "error"]) && typeof value.requestId === "string" && validId(value.enrollmentId) && typeof value.ok === "boolean" && (value.profileName === undefined || validId(value.profileName, 64)) && (value.error === undefined || isString(value.error, 512));
     default: return false;
   }
 }

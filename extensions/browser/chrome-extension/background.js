@@ -62,6 +62,10 @@ const approvedSessions = new Map();
 const accessRequests = new Map();
 /** Popup-approved upgrades awaiting one exact host confirmation. */
 const approvedAccessRequests = new Map();
+/** Profile enrollments awaiting the user's pairing code. */
+const enrollmentRequests = new Map();
+/** In-flight enrollment confirmations awaiting the host's result, keyed by requestId. */
+const pendingEnrollConfirms = new Map();
 
 let nativePort = null;
 let nativeState = "disconnected";
@@ -84,7 +88,7 @@ function toolbarBadgeCount(count) {
 }
 
 function toolbarSessionCounts() {
-  let pending = accessRequests.size;
+  let pending = accessRequests.size + enrollmentRequests.size;
   let active = 0;
   for (const session of sessions.values()) {
     if (session.state === "pending") {
@@ -832,6 +836,27 @@ async function handleNativeMessage(message, port, generation) {
       await handleSessionStopped(message);
       refreshBadge();
       return;
+    case "enrollPending":
+      if (validId(message.enrollmentId) && typeof message.profileName === "string" && typeof message.profileFingerprint === "string" && Number.isInteger(message.expiresAt)) {
+        enrollmentRequests.set(message.enrollmentId, {
+          enrollmentId: message.enrollmentId,
+          profileName: message.profileName,
+          profileFingerprint: message.profileFingerprint,
+          expiresAt: message.expiresAt,
+        });
+        refreshBadge();
+      }
+      return;
+    case "enrollResult": {
+      const waiting = typeof message.requestId === "string" ? pendingEnrollConfirms.get(message.requestId) : undefined;
+      if (waiting) {
+        pendingEnrollConfirms.delete(message.requestId);
+        waiting.resolve({ ok: message.ok === true, error: typeof message.error === "string" ? message.error : undefined });
+      }
+      if (message.ok === true || (typeof message.error === "string" && !/incorrect code$/.test(message.error))) enrollmentRequests.delete(message.enrollmentId);
+      refreshBadge();
+      return;
+    }
     default:
       return;
   }
@@ -852,6 +877,9 @@ async function handleNativeDisconnect(port, generation) {
     approvedSessions.clear();
     accessRequests.clear();
     approvedAccessRequests.clear();
+    enrollmentRequests.clear();
+    for (const pending of pendingEnrollConfirms.values()) pending.resolve({ ok: false, error: "companion disconnected" });
+    pendingEnrollConfirms.clear();
     refreshBadge();
     scheduleNativeReconnect();
   }
@@ -1648,6 +1676,9 @@ async function forgetCompanion() {
   approvedSessions.clear();
   accessRequests.clear();
   approvedAccessRequests.clear();
+  enrollmentRequests.clear();
+  for (const pending of pendingEnrollConfirms.values()) pending.resolve({ ok: false, error: "companion disconnected" });
+  pendingEnrollConfirms.clear();
   pendingHello = null;
   trustedCompanion = null;
   nativeState = "disconnected";
@@ -1709,6 +1740,7 @@ async function statusDto() {
         currentAccess: session ? { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] } : null,
       };
     }),
+    pendingEnrollments: [...enrollmentRequests.values()].filter((request) => request.expiresAt > Date.now()).map((request) => ({ ...request, id: request.enrollmentId })),
     sharedTabs: await sharedTabsDto(),
   };
 }
@@ -1802,6 +1834,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         approvedAccessRequests.delete(request.id);
         sendResponse({ ok: true });
         refreshBadge();
+        return;
+      }
+      case "confirmEnrollment": {
+        const request = enrollmentRequests.get(message.enrollmentId);
+        if (!request) throw new Error("This enrollment is not awaiting a code.");
+        if (typeof message.code !== "string" || !/^\d{6}$/.test(message.code)) throw new Error("Enter the 6-digit code shown by the requesting agent.");
+        const requestId = newRequestId();
+        const outcome = new Promise((resolve) => {
+          pendingEnrollConfirms.set(requestId, { resolve });
+          setTimeout(() => {
+            if (pendingEnrollConfirms.delete(requestId)) resolve({ ok: false, error: "companion did not answer" });
+          }, 5000);
+        });
+        postNative({
+          version: PROTOCOL_VERSION,
+          type: "confirmEnrollment",
+          requestId,
+          enrollmentId: request.enrollmentId,
+          code: message.code,
+        });
+        const result = await outcome;
+        refreshBadge();
+        if (!result.ok) throw new Error(result.error ?? "enrollment failed");
+        sendResponse({ ok: true, profileName: request.profileName });
         return;
       }
       case "revokeSession": {

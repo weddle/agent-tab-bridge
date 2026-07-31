@@ -25,13 +25,19 @@ export async function atomicWritePrivateJson(filePath: string, value: unknown): 
   await chmod(temp, 0o600); try { await rename(temp, filePath); } catch (error) { await rm(temp, { force: true }); throw error; } await chmod(filePath, 0o600); const directoryHandle = await open(parent, "r"); try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
 }
 export interface PinnedExtensionIdentity { extensionId: string; publicKeySpki: string; fingerprint: string; pinnedAt: number; }
-export interface CompanionState { version: typeof STATE_VERSION; companionPrincipalId: string; pinnedExtensions: PinnedExtensionIdentity[]; sessions: SessionRecord[]; brokerSecret: string; }
+export interface EnrolledProfile { name: string; principalId: string; publicKeySpki: string; enrolledAt: number; }
+export interface CompanionState { version: typeof STATE_VERSION; companionPrincipalId: string; pinnedExtensions: PinnedExtensionIdentity[]; sessions: SessionRecord[]; brokerSecret: string; enrolledProfiles?: EnrolledProfile[]; }
 export interface CompanionStateStatus { version: typeof STATE_VERSION; companionPrincipalId: string; pinnedExtensions: Array<Omit<PinnedExtensionIdentity, "publicKeySpki"> & { publicKeySpkiFingerprint: string }>; sessions: SessionRecord[]; hasBrokerSecret: boolean; }
 function extensionFingerprint(publicKeySpki: string): string | undefined { try { const key = createPublicKey({ key: Buffer.from(publicKeySpki, "base64url"), format: "der", type: "spki" }); const der = key.export({ type: "spki", format: "der" }); return `sha256/${createHash("sha256").update(der).digest("base64")}`; } catch { return undefined; } }
 
 function emptyState(): CompanionState { return { version: STATE_VERSION, companionPrincipalId: "", pinnedExtensions: [], sessions: [], brokerSecret: "" }; }
+function validEnrolledProfile(value: unknown): value is EnrolledProfile {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false; const profile = value as Record<string, unknown>;
+  return typeof profile.name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(profile.name) && typeof profile.principalId === "string" && profile.principalId.startsWith("sha256/") && typeof profile.publicKeySpki === "string" && profile.publicKeySpki.length > 0 && Number.isInteger(profile.enrolledAt);
+}
 function validState(value: unknown): value is CompanionState {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false; const state = value as Record<string, unknown>;
+  if (state.enrolledProfiles !== undefined && (!Array.isArray(state.enrolledProfiles) || !state.enrolledProfiles.every(validEnrolledProfile))) return false;
   return state.version === STATE_VERSION && typeof state.companionPrincipalId === "string" && state.companionPrincipalId.length <= 256 && Array.isArray(state.pinnedExtensions) && state.pinnedExtensions.every((item) => { if (!item || typeof item !== "object" || Array.isArray(item)) return false; const identity = item as Record<string, unknown>; const fingerprint = typeof identity.publicKeySpki === "string" ? extensionFingerprint(identity.publicKeySpki) : undefined; return typeof identity.extensionId === "string" && identity.extensionId.length <= 256 && typeof identity.publicKeySpki === "string" && identity.publicKeySpki.length > 0 && fingerprint !== undefined && identity.fingerprint === fingerprint && Number.isInteger(identity.pinnedAt); }) && Array.isArray(state.sessions) && state.sessions.every(validateSessionRecord) && typeof state.brokerSecret === "string" && state.brokerSecret.length <= 256;
 }
 export class CompanionStateStore {

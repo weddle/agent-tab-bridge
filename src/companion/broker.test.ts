@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createBrokerClient } from "./broker-client.js";
 import { startBrokerServer } from "./broker.js";
+import { createProfile } from "./profiles.js";
+import { generateIdentity } from "./identity.js";
 import { TaskSessionManager } from "./task-sessions.js";
 
 const directories: string[] = [];
@@ -104,6 +106,50 @@ describe("BrokerServer socket ownership", () => {
       const closer = createBrokerClient({ socketPath: broker.socketPath, token });
       await expect(closer.request("closeSession", { stableSessionKey: "research" })).resolves.toMatchObject({ session: { id: opened.session.id, state: "revoked" } });
       await closer.close();
+    } finally {
+      await broker.close();
+    }
+  });
+  it("authenticates profile clients by challenge-response and scopes sessions to the profile principal", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "atb-broker-")); directories.push(directory);
+    const profile = await createProfile("hermes-research", { directory });
+    const enrolled = new Map([[profile.name, { principalId: profile.principalId, displayName: profile.name, publicKeySpki: profile.publicKeySpki }]]);
+    const sessions = new TaskSessionManager({
+      idFactory: () => "profile-session",
+      startRelay: async () => ({ pairingUrl: "ws://127.0.0.1/extension#token", cdpUrl: "ws://127.0.0.1/cdp?token=token", close: async () => undefined }),
+    });
+    const token = "a".repeat(32);
+    const broker = await startBrokerServer({
+      socketPath: join(directory, "broker.sock"),
+      token,
+      sessions,
+      isTrusted: () => true,
+      controller: () => ({ principalId: "controller-token", displayName: "CLI" }),
+      profile: (name) => enrolled.get(name) ?? null,
+    });
+    try {
+      const client = createBrokerClient({ socketPath: broker.socketPath, profile: { name: profile.name, privateKeyPkcs8: profile.privateKeyPkcs8 } });
+      const opened = await client.request("openSession", { taskLabel: "Research", requestedCapabilities: ["cdp"], stableSessionKey: "research" }) as { session: { id: string; controllerPrincipalId: string; displayControllerName: string } };
+      expect(opened.session.controllerPrincipalId).toBe(profile.principalId);
+      expect(opened.session.displayControllerName).toBe(profile.name);
+      await sessions.approve(opened.session.id);
+      sessions.relayReady(opened.session.id);
+      await expect(client.request("sessionUrl", { stableSessionKey: "research" })).resolves.toMatchObject({ cdpUrl: "ws://127.0.0.1/cdp?token=token" });
+      await client.close();
+
+      // The token-authenticated principal must not see the profile's named session.
+      const tokenClient = createBrokerClient({ socketPath: broker.socketPath, token });
+      await expect(tokenClient.request("sessionUrl", { stableSessionKey: "research" })).rejects.toThrow(/not found/);
+      await tokenClient.close();
+
+      const unknown = createBrokerClient({ socketPath: broker.socketPath, profile: { name: "unknown", privateKeyPkcs8: profile.privateKeyPkcs8 } });
+      await expect(unknown.request("status")).rejects.toThrow(/authentication failed/);
+      await unknown.close().catch(() => undefined);
+
+      const impostor = generateIdentity("controller");
+      const wrongKey = createBrokerClient({ socketPath: broker.socketPath, profile: { name: profile.name, privateKeyPkcs8: impostor.privateKeyPkcs8 } });
+      await expect(wrongKey.request("status")).rejects.toThrow(/authentication failed/);
+      await wrongKey.close().catch(() => undefined);
     } finally {
       await broker.close();
     }

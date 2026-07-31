@@ -87,6 +87,20 @@ describe("atb CLI session boundary", () => {
     expect(() => parseCliArgs(["url", "--session", "not/a-key"])).toThrow(/session key/);
   });
 
+
+  it("parses profile commands and per-command profile selection", () => {
+    expect(parseCliArgs(["profile", "create", "hermes-research"])).toEqual({ kind: "profileCreate", name: "hermes-research" });
+    expect(parseCliArgs(["profile", "enroll", "hermes-research"])).toEqual({ kind: "profileEnroll", name: "hermes-research" });
+    expect(parseCliArgs(["profile", "list"])).toEqual({ kind: "profileList" });
+    expect(() => parseCliArgs(["profile"])).toThrow(/usage: atb profile/);
+    expect(() => parseCliArgs(["profile", "create", "bad/name"])).toThrow(/--profile must be/);
+    expect(parseCliArgs(["url", "--session", "research", "--profile", "omp"])).toEqual({ kind: "url", stableSessionKey: "research", profile: "omp" });
+    expect(parseCliArgs(["open", "--session", "research", "--label", "x", "--profile", "omp"])).toMatchObject({ kind: "open", profile: "omp" });
+    expect(parseCliArgs(["run", "--profile", "omp", "--", "agent"])).toMatchObject({ kind: "run", profile: "omp" });
+    expect(parseCliArgs(["close", "--session", "research", "--profile", "omp"])).toEqual({ kind: "close", stableSessionKey: "research", profile: "omp" });
+    expect(parseCliArgs(["claim-tab", "--session", "research", "--tab", "42", "--profile", "omp"])).toEqual({ kind: "claimTab", stableSessionKey: "research", tabId: 42, profile: "omp" });
+    expect(() => parseCliArgs(["open", "--session", "research", "--label", "x", "--profile", "a", "--profile", "b"])).toThrow(/only once/);
+  });
   it("opens a named session without a child and prints its URL only on request", async () => {
     const events = new Set<(event: { event: string; sessionId?: string; cdpUrl?: string }) => void>();
     const requests: Array<{ command: string; params: Record<string, unknown> }> = [];

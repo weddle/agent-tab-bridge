@@ -47,5 +47,11 @@ describe("native protocol validation", () => {
     expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "tabsListed", requestId: "tabs-1", tabs: [{ ...tab, ownership: "session-secret" }] })).toBe(false);
     expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "claimTab", requestId: "claim-1", sessionId: "task-1", tabId: 42 })).toBe(true);
     expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "tabClaimed", requestId: "claim-1", sessionId: "task-1", tabId: 42, ok: true, tab: { ...tab, ownership: "currentSession", claimability: "alreadyShared" } })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "enrollPending", enrollmentId: "enroll-1", profileName: "hermes-research", profileFingerprint: "sha256/abc", expiresAt: 10 })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "enrollPending", enrollmentId: "enroll-1", profileName: "bad/name", profileFingerprint: "sha256/abc", expiresAt: 10 })).toBe(false);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "confirmEnrollment", requestId: "req-1", enrollmentId: "enroll-1", code: "123456" })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "confirmEnrollment", requestId: "req-1", enrollmentId: "enroll-1", code: "12345" })).toBe(false);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: "req-1", enrollmentId: "enroll-1", ok: true, profileName: "hermes-research" })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: "req-1", enrollmentId: "enroll-1", ok: false, error: "incorrect code", unexpected: 1 })).toBe(false);
   });
 });
