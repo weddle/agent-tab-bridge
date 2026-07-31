@@ -31,6 +31,13 @@ describe("BrokerServer socket ownership", () => {
       sessions,
       isTrusted: () => true,
       controller: () => ({ principalId: "controller-1", displayName: "CLI" }),
+      requestAccess: async (_principalId, _stableSessionKey, delta) => ({
+        id: "access-1",
+        sessionId: "named-session",
+        delta,
+        requestedAccess: { level: "domains", tabIds: [], domains: ["example.com"] },
+        createdAt: Date.now(),
+      }),
     });
     try {
       const first = createBrokerClient({ socketPath: broker.socketPath, token });
@@ -47,8 +54,21 @@ describe("BrokerServer socket ownership", () => {
       await later.close();
       expect(sessions.get(opened.session.id)).toMatchObject({ state: "active" });
 
+      const accessClient = createBrokerClient({ socketPath: broker.socketPath, token });
+      await expect(accessClient.request("requestAccess", {
+        stableSessionKey: "research",
+        accessDelta: { kind: "domains", tabIds: [], domains: ["example.com"] },
+      })).resolves.toMatchObject({
+        accessRequest: {
+          id: "access-1",
+          sessionId: opened.session.id,
+          requestedAccess: { level: "domains", domains: ["example.com"] },
+        },
+      });
+      await accessClient.close();
+
       const conflicting = createBrokerClient({ socketPath: broker.socketPath, token });
-      await expect(conflicting.request("openSession", { taskLabel: "Different task", requestedCapabilities: ["cdp"], stableSessionKey: "research" })).rejects.toThrow(/different label or capabilities/);
+      await expect(conflicting.request("openSession", { taskLabel: "Different task", requestedCapabilities: ["cdp"], stableSessionKey: "research" })).rejects.toThrow(/different session authority/);
       await conflicting.close();
 
       const closer = createBrokerClient({ socketPath: broker.socketPath, token });

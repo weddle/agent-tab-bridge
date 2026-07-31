@@ -20,6 +20,9 @@ const connectButton = document.getElementById("connectCompanionButton");
 const pendingSection = document.getElementById("pendingSection");
 const pendingHeading = document.getElementById("pendingHeading");
 const pendingList = document.getElementById("pendingSessions");
+const accessSection = document.getElementById("accessSection");
+const accessHeading = document.getElementById("accessHeading");
+const accessList = document.getElementById("accessRequests");
 const activeSection = document.getElementById("activeSection");
 const activeHeading = document.getElementById("activeHeading");
 const activeList = document.getElementById("activeSessions");
@@ -37,6 +40,7 @@ let state = {
   native: { state: "disconnected", companion: { id: null, name: null, trusted: false, pinned: false } },
   pendingSessions: [],
   activeSessions: [],
+  pendingAccess: [],
   sharedTabs: [],
 };
 let currentTab = null;
@@ -51,6 +55,7 @@ const inFlight = new Set();
 const openDetails = new Set();
 /** Session id -> { node, remainingEl, signature } */
 const pendingCards = new Map();
+const accessCards = new Map();
 const activeCards = new Map();
 
 function makeElement(tag, className, text) {
@@ -146,6 +151,24 @@ function formatCapabilities(capabilities) {
   if (!Array.isArray(capabilities) || capabilities.length === 0) return "None requested";
   return capabilities.map((capability) => String(capability)).join(", ");
 }
+function accessLevel(session) {
+  return ["selectedTabs", "domains", "full"].includes(session?.access?.level)
+    ? session.access.level
+    : "selectedTabs";
+}
+
+function formatAccess(session) {
+  const access = session?.access;
+  if (accessLevel(session) === "full") return "Full website access — any website tab";
+  if (accessLevel(session) === "domains") {
+    return `Sites: ${(access?.domains ?? []).join(", ")} (including subdomains)`;
+  }
+  const tabIds = access?.tabIds ?? [];
+  return tabIds.length
+    ? `Selected tabs: ${tabIds.map((tabId) => `Tab ${tabId}`).join(", ")}`
+    : "Selected tabs only — share tabs manually";
+}
+
 
 function sessionKey(session) {
   return typeof session?.id === "string" ? session.id : "";
@@ -231,6 +254,7 @@ function pendingSignature(session) {
     controllerLabel(session),
     typeof session?.controllerId === "string" ? session.controllerId : "",
     formatCapabilities(session?.capabilities),
+    JSON.stringify(session?.access ?? null),
   ].join(UNIT);
 }
 
@@ -246,6 +270,7 @@ function activeSignature(session) {
     controllerLabel(session),
     typeof session?.controllerId === "string" ? session.controllerId : "",
     formatCapabilities(session?.capabilities),
+    JSON.stringify(session?.access ?? null),
     healthText(session),
     tabs,
     share.label,
@@ -258,6 +283,7 @@ function activeSignature(session) {
 function buildPendingCard(session) {
   const id = sessionKey(session);
   const card = makeElement("article", "atb-card card pending");
+  card.classList.add(`access-${accessLevel(session)}`);
 
   const task = makeElement("div", "task", taskLabel(session));
   task.title = "Unverified task label";
@@ -267,6 +293,7 @@ function buildPendingCard(session) {
     card.append(makeElement("p", "meta", `Principal ${abbreviate(session.controllerId)}`));
   }
   card.append(makeElement("p", "meta", `Capabilities: ${formatCapabilities(session?.capabilities)}`));
+  card.append(makeElement("p", "access-summary", formatAccess(session)));
   const remainingEl = makeElement("p", "meta remaining", formatRemaining(session));
   card.append(remainingEl);
 
@@ -284,6 +311,7 @@ function buildPendingCard(session) {
 function buildActiveCard(session) {
   const id = sessionKey(session);
   const card = makeElement("article", "atb-card card");
+  card.classList.add(`access-${accessLevel(session)}`);
 
   const header = makeElement("div", "card-header");
   const task = makeElement("div", "task", taskLabel(session));
@@ -292,6 +320,7 @@ function buildActiveCard(session) {
   header.append(task, remainingEl);
   card.append(header);
   card.append(makeElement("p", "meta", `Requested by ${controllerLabel(session)} (unverified)`));
+  card.append(makeElement("p", "access-summary", formatAccess(session)));
 
   card.append(makeElement("p", "list-label", "Tabs shared with this session"));
   const tabs = tabsForSession(id);
@@ -322,6 +351,7 @@ function buildActiveCard(session) {
     makeElement("summary", undefined, "Details"),
     makeElement("p", "meta", `Principal ${abbreviate(session?.controllerId)}`),
     makeElement("p", "meta", `Capabilities: ${formatCapabilities(session?.capabilities)}`),
+    makeElement("p", "meta", `Access: ${formatAccess(session)}`),
     makeElement("p", "meta", `Session health: ${healthText(session)}`),
     makeElement("p", "meta", `Session id ${abbreviate(session?.id)}`),
   );
@@ -339,6 +369,45 @@ function buildActiveCard(session) {
   card.append(actions);
 
   return { node: card, remainingEl, signature: "" };
+}
+
+function formatUpgrade(request) {
+  if (request?.delta?.kind === "full") return "Upgrade to full website access";
+  if (request?.delta?.kind === "domains") return `Add sites: ${(request.delta.domains ?? []).join(", ")} (including subdomains)`;
+  return `Adopt tabs: ${(request?.delta?.tabIds ?? []).map((tabId) => `Tab ${tabId}`).join(", ")}`;
+}
+
+function accessSignature(request) {
+  return [
+    sessionKey(request),
+    request?.sessionId ?? "",
+    request?.taskLabel ?? "",
+    request?.controllerName ?? "",
+    JSON.stringify(request?.delta ?? null),
+    JSON.stringify(request?.currentAccess ?? null),
+    JSON.stringify(request?.requestedAccess ?? null),
+  ].join(UNIT);
+}
+
+function buildAccessCard(request) {
+  const id = sessionKey(request);
+  const level = request?.requestedAccess?.level ?? "selectedTabs";
+  const card = makeElement("article", `atb-card card pending access-${level}`);
+  card.append(makeElement("div", "task", request?.taskLabel || "Unnamed task"));
+  card.append(makeElement("p", "meta", `Requested by ${request?.controllerName || "Unnamed controller"} (unverified)`));
+  card.append(makeElement("p", "access-summary", formatUpgrade(request)));
+  const current = { access: request?.currentAccess };
+  const requested = { access: request?.requestedAccess };
+  card.append(makeElement("p", "meta", `Current access — ${formatAccess(current)}`));
+  card.append(makeElement("p", "meta", `Approved access — ${formatAccess(requested)}`));
+  const decline = makeButton("Decline", "secondary");
+  decline.addEventListener("click", () => void mutateAccess("declineAccess", id, decline));
+  const approve = makeButton("Approve upgrade", "primary");
+  approve.addEventListener("click", () => void mutateAccess("approveAccess", id, approve));
+  const actions = makeElement("div", "actions");
+  actions.append(decline, approve);
+  card.append(actions);
+  return { node: card, remainingEl: null, signature: "" };
 }
 
 /** True while the user is typing in, focused on, or selecting text inside node. */
@@ -375,7 +444,7 @@ function reconcile(container, records, sessions, signatureOf, build) {
         record = next;
       }
     }
-    setText(record.remainingEl, formatRemaining(session));
+    if (record.remainingEl) setText(record.remainingEl, formatRemaining(session));
     ordered.push(record.node);
   }
   for (const [id, record] of records) {
@@ -408,7 +477,7 @@ function statusText(nativeStatus, pendingCount, activeCount) {
 
 function renderStatus() {
   const nativeStatus = typeof state.native?.state === "string" ? state.native.state : "disconnected";
-  const pendingCount = state.pendingSessions.length;
+  const pendingCount = state.pendingSessions.length + state.pendingAccess.length;
   const activeCount = state.activeSessions.length;
   const dotState = errorText !== "" ? "error" : nativeStatus;
   const dotClass = `dot ${dotState}`;
@@ -449,6 +518,7 @@ function render() {
   const companion = native.companion ?? {};
   const pending = state.pendingSessions;
   const active = state.activeSessions;
+  const access = state.pendingAccess;
 
   const identityKnown =
     typeof companion.id === "string" && companion.id !== "" &&
@@ -471,6 +541,10 @@ function render() {
   setHidden(pendingSection, pending.length === 0);
   setText(pendingHeading, `Approval requests (${pending.length})`);
   reconcile(pendingList, pendingCards, pending, pendingSignature, buildPendingCard);
+  setHidden(accessSection, access.length === 0);
+  setText(accessHeading, `Access upgrades (${access.length})`);
+  reconcile(accessList, accessCards, access, accessSignature, buildAccessCard);
+
 
   setHidden(activeSection, nativeStatus !== "connected" && active.length === 0);
   setText(activeHeading, `Active sessions (${active.length})`);
@@ -501,6 +575,7 @@ async function refresh() {
       native: result.native ?? {},
       pendingSessions: Array.isArray(result.pendingSessions) ? result.pendingSessions : [],
       activeSessions: Array.isArray(result.activeSessions) ? result.activeSessions : [],
+      pendingAccess: Array.isArray(result.pendingAccess) ? result.pendingAccess : [],
       sharedTabs: Array.isArray(result.sharedTabs) ? result.sharedTabs : [],
     };
     currentTab = tab;
@@ -546,6 +621,14 @@ async function mutateSession(type, sessionId, control) {
     return;
   }
   await runMutation(sessionId, control, { type, sessionId }, "The companion rejected this action.");
+}
+
+async function mutateAccess(type, accessRequestId, control) {
+  if (typeof accessRequestId !== "string" || accessRequestId.length === 0) {
+    showError(new Error("The access request is no longer available. Refresh and try again."));
+    return;
+  }
+  await runMutation(accessRequestId, control, { type, accessRequestId }, "The companion rejected this access decision.");
 }
 
 async function onShare(session, control) {

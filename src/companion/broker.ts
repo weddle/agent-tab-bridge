@@ -5,15 +5,17 @@ import { join } from "node:path";
 import { applicationSupportDirectory, type ApplicationSupportOptions } from "./state.js";
 import { TaskSessionError, type TaskSession, type TaskSessionManager } from "./task-sessions.js";
 import { isStableSessionKey } from "./stable-session-key.js";
+import { isSessionAccessDelta, type SessionAccess, type SessionAccessDelta } from "./session-access.js";
+import type { AccessUpgradeRecord } from "./native-protocol.js";
 
 export const BROKER_MAX_LINE_BYTES = 1024 * 1024;
-export type BrokerCommand = "status" | "openSession" | "revokeSession" | "closeSession";
+export type BrokerCommand = "status" | "listTabs" | "openSession" | "requestAccess" | "revokeSession" | "closeSession";
 export type BrokerAuthRequest = Readonly<{ type: "auth"; token: string }>;
-export type BrokerCommandRequest = Readonly<{ id: string; command: BrokerCommand; taskLabel?: string; requestedCapabilities?: string[]; ttlMs?: number; stableSessionKey?: string; sessionId?: string; reason?: string }>;
+export type BrokerCommandRequest = Readonly<{ id: string; command: BrokerCommand; taskLabel?: string; requestedCapabilities?: string[]; access?: SessionAccess; accessDelta?: SessionAccessDelta; ttlMs?: number; stableSessionKey?: string; sessionId?: string; reason?: string }>;
 export type BrokerAuthOk = Readonly<{ type: "authOk" }>;
 export type BrokerResponse = Readonly<{ id: string; ok: true; result: unknown }> | Readonly<{ id: string; ok: false; error: { code: string; message: string } }>;
-export type BrokerEvent = Readonly<{ event: "pending" | "active" | "revoked" | "hostClosing"; sessionId?: string; session?: TaskSession; cdpUrl?: string; reason?: string }>;
-export type BrokerServerOptions = Readonly<{ socketPath?: string; token: string; sessions: TaskSessionManager; isTrusted: () => boolean; controller: () => Readonly<{ principalId: string; displayName: string }> | null; status?: () => Record<string, unknown> }>;
+export type BrokerEvent = Readonly<{ event: "pending" | "active" | "revoked" | "accessPending" | "accessUpdated" | "accessDeclined" | "hostClosing"; sessionId?: string; session?: TaskSession; accessRequest?: AccessUpgradeRecord; accessRequestId?: string; cdpUrl?: string; reason?: string }>;
+export type BrokerServerOptions = Readonly<{ socketPath?: string; token: string; sessions: TaskSessionManager; isTrusted: () => boolean; controller: () => Readonly<{ principalId: string; displayName: string }> | null; status?: () => Record<string, unknown>; listTabs?: () => Promise<unknown>; requestAccess?: (controllerPrincipalId: string, stableSessionKey: string, delta: SessionAccessDelta) => Promise<AccessUpgradeRecord> | AccessUpgradeRecord }>;
 export function defaultBrokerSocketPath(paths: ApplicationSupportOptions = {}): string { return join(applicationSupportDirectory(paths), "broker.sock"); }
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const id = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 128 && /^[A-Za-z0-9._:-]+$/.test(value);
@@ -65,7 +67,7 @@ export class BrokerServer {
     if (this.closed) return;
     if (!event.sessionId) { const line = JSON.stringify(event) + "\n"; for (const socket of this.clients) if (!socket.destroyed) socket.write(line); return; }
     const owners = this.sessionOwners.get(event.sessionId);
-    if (!owners) { if (event.event === "pending") { const pending = this.pendingEvents.get(event.sessionId) ?? []; pending.push(event); this.pendingEvents.set(event.sessionId, pending); } return; }
+    if (!owners) { if (event.event === "pending" || event.event === "accessPending") { const pending = this.pendingEvents.get(event.sessionId) ?? []; pending.push(event); this.pendingEvents.set(event.sessionId, pending); } return; }
     for (const socket of owners.sockets) if (!socket.destroyed && this.clients.has(socket)) socket.write(JSON.stringify(event) + "\n");
   }
 
@@ -114,7 +116,7 @@ export class BrokerServer {
     });
   }
   private async command(socket: Socket, value: unknown, requestIds: Set<string>): Promise<void> {
-    if (!object(value) || !id(value.id) || (value.command !== "status" && value.command !== "openSession" && value.command !== "revokeSession" && value.command !== "closeSession")) { socket.write('{"id":"","ok":false,"error":{"code":"invalidRequest","message":"invalid broker command"}}\n'); return; }
+    if (!object(value) || !id(value.id) || (value.command !== "status" && value.command !== "listTabs" && value.command !== "openSession" && value.command !== "requestAccess" && value.command !== "revokeSession" && value.command !== "closeSession")) { socket.write('{"id":"","ok":false,"error":{"code":"invalidRequest","message":"invalid broker command"}}\n'); return; }
     const request = value as BrokerCommandRequest;
     if (requestIds.has(request.id)) { socket.write(JSON.stringify({ id: request.id, ok: false, error: { code: "replayedRequest", message: "request ID was already used" } } satisfies BrokerResponse) + "\n"); return; }
     requestIds.add(request.id);
@@ -122,15 +124,28 @@ export class BrokerServer {
       let result: unknown;
       if (request.command === "status") {
         result = { trusted: this.options.isTrusted(), sessions: this.options.sessions.snapshot(), ...(this.options.status?.() ?? {}) };
+      } else if (request.command === "listTabs") {
+        if (!this.options.isTrusted()) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
+        if (!this.options.listTabs) throw new TaskSessionError("invalidSession", "tab enumeration is unavailable");
+        result = await this.options.listTabs();
       } else if (request.command === "openSession") {
         if (!this.options.isTrusted()) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
         const controller = this.options.controller(); if (!controller) throw new TaskSessionError("invalidSession", "browser identity is unavailable");
         if (typeof request.taskLabel !== "string" || !Array.isArray(request.requestedCapabilities)) throw new TaskSessionError("invalidSession", "taskLabel and requestedCapabilities are required");
         if (request.stableSessionKey !== undefined && !isStableSessionKey(request.stableSessionKey)) throw new TaskSessionError("invalidSession", "stableSessionKey is invalid");
-        const session = this.options.sessions.open({ controllerPrincipalId: controller.principalId, controllerName: controller.displayName, taskLabel: request.taskLabel, capabilities: request.requestedCapabilities, ttlMs: request.ttlMs, ...(request.stableSessionKey === undefined ? {} : { stableSessionKey: request.stableSessionKey }) });
+        const session = this.options.sessions.open({ controllerPrincipalId: controller.principalId, controllerName: controller.displayName, taskLabel: request.taskLabel, capabilities: request.requestedCapabilities, access: request.access, ttlMs: request.ttlMs, ...(request.stableSessionKey === undefined ? {} : { stableSessionKey: request.stableSessionKey }) });
         this.bindSessionOwner(session.id, socket, request.stableSessionKey === undefined);
         const cdpUrl = this.options.sessions.cdpUrl(session.id);
         result = { session, ...(cdpUrl === undefined ? {} : { cdpUrl }) };
+      } else if (request.command === "requestAccess") {
+        if (!this.options.isTrusted()) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
+        const controller = this.options.controller(); if (!controller) throw new TaskSessionError("invalidSession", "browser identity is unavailable");
+        if (!isStableSessionKey(request.stableSessionKey)) throw new TaskSessionError("invalidSession", "stableSessionKey is required");
+        if (!isSessionAccessDelta(request.accessDelta)) throw new TaskSessionError("invalidSession", "accessDelta is invalid");
+        if (!this.options.requestAccess) throw new TaskSessionError("invalidSession", "access upgrades are unavailable");
+        const accessRequest = await this.options.requestAccess(controller.principalId, request.stableSessionKey, request.accessDelta);
+        this.bindSessionOwner(accessRequest.sessionId, socket, false);
+        result = { accessRequest };
       } else if (request.command === "closeSession") {
         if (!this.options.isTrusted()) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
         const controller = this.options.controller(); if (!controller) throw new TaskSessionError("invalidSession", "browser identity is unavailable");

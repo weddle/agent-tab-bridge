@@ -22,6 +22,11 @@ export type SessionAuthorityRecord = {
   controllerName: string;
   taskLabel: string;
   capabilities: string[];
+  access: {
+    level: "selectedTabs" | "domains" | "full";
+    tabIds: number[];
+    domains: string[];
+  };
   createdAt: number;
   expiresAt: number | null;
   state: "pending" | "active";

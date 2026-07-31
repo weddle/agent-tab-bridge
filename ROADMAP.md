@@ -6,15 +6,18 @@ When product choices conflict, prefer the ChatGPT/Codex model: explicit capabili
 
 ## Current baseline
 
-The current MVP provides:
+The current trusted-local release provides:
 
-- an ephemeral, authenticated relay bound to `127.0.0.1`;
+- persistent authenticated extension/companion identity with no copied pairing capability;
+- first-class task sessions and an ephemeral authenticated relay bound to `127.0.0.1`;
 - `BROWSER_CDP_URL` compatibility for Hermes and other CDP clients;
-- a visible **Agent Tabs** consent group;
+- browser-local approval for selected-tab, requested-site, or full-website access;
+- separately approved monotonic access upgrades for reusable named sessions;
+- a visibly named and color-coded consent group per session;
 - immediate revocation when a tab leaves the group, the debugger banner is dismissed, or the relay stops; and
-- Brave validation through focused relay tests and a disposable-profile smoke test.
+- focused contract coverage plus disposable-profile browser rendering in Brave and Chrome-for-Testing.
 
-It still requires copying a pairing string, has no persistent device identity or first-class task session, and has not been validated in Chrome. Bookmarks and browsing history are not exposed.
+Bookmarks and browsing history are not exposed.
 
 ## North-star architecture
 
@@ -77,11 +80,11 @@ Major contents:
 - Installer registration for both Brave and Chrome; signed/notarized packaging when distribution begins.
 - Persistent extension/companion device identity, with private material in the OS keychain or an equivalently protected store.
 - Authenticated controller principals: the same-host launcher key or an enrolled hub key, with optional hub-issued harness subkeys. Persistent rules bind to that principal; controller names and task labels remain unverified display text.
-- First-class ephemeral task sessions: controller principal, bounded client-declared task label, mode, requested capabilities, TTL, and independent revocation.
-- One visibly named tab group per active session. Agent-created tabs enter that group; dragging a tab out revokes access. A tab has at most one controller.
-- `atb run -- <agent command>` injects the ephemeral `BROWSER_CDP_URL` only into the child process and revokes it on exit.
-- Popup views for active sessions, shared tabs, controller identity, connection health, and one-click tab/session/device revocation.
-- An explicit CDP method policy that denies profile-scoped operations not required for page control; browser-context creation and access outside session tabs remain unavailable.
+- First-class task sessions: controller principal, bounded client-declared task label, requested capabilities, selected-tab/site/full access, TTL, and independent revocation.
+- One visibly named and access-color-coded tab group per active session. Initially selected tabs and agent-created tabs enter that group; dragging a tab out revokes access. A tab has at most one controller.
+- `atb run -- <agent command>` injects the ephemeral `BROWSER_CDP_URL` only into the child process. Unnamed sessions revoke on child exit; reusable named sessions remain explicitly revocable and support separately approved monotonic access upgrades.
+- Popup views for pending access upgrades, active sessions, shared tabs, controller identity, connection health, and one-click tab/session/device revocation.
+- An explicit CDP method and target policy that denies profile-scoped operations, out-of-session tabs, and navigation or tab creation outside the approved site scope.
 - Brave and Chrome compatibility demonstrated before both are claimed.
 
 **Release boundary:** on a fresh machine, install the extension and companion once. Later tasks require no token or port handling, leave no persistent CDP listener, and die cleanly with the launcher or browser session.

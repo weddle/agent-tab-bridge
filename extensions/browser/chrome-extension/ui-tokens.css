@@ -28,8 +28,10 @@
   --atb-error-surface: light-dark(#fce8e6, #3c2422);
   --atb-error-text: light-dark(#d93025, #f28b82);
   --atb-focus-ring: light-dark(#0b57d0, #a8c7fa);
-  /* Chrome tab-group "blue", the color background.js assigns via TASK_GROUP_COLOR. */
+  /* Chrome tab-group colors used to distinguish approved access levels. */
   --atb-group-blue: light-dark(#1a73e8, #8ab4f8);
+  --atb-group-orange: light-dark(#e37400, #fdd663);
+  --atb-group-red: light-dark(#d93025, #f28b82);
 
   --atb-font: system-ui, -apple-system, "Segoe UI", sans-serif;
   --atb-radius-card: 8px;

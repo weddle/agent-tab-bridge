@@ -43,6 +43,8 @@
         border-radius: var(--atb-space-1);
         background: var(--atb-group-blue);
       }
+      .swatch.domains { background: var(--atb-group-orange); }
+      .swatch.full { background: var(--atb-group-red); }
       .instruction {
         margin-top: 28px;
         padding: var(--atb-space-4);
@@ -57,13 +59,13 @@
       <p class="meta" id="session"></p>
       <p class="meta" id="capabilities"></p>
       <p class="group-chip">
-        <span class="swatch" aria-hidden="true"></span>
-        <span>This session's tab group is blue.</span>
+        <span id="groupSwatch" class="swatch" aria-hidden="true"></span>
+        <span id="groupLabel">This session's selected-tab group is blue.</span>
       </p>
       <section class="atb-card instruction" aria-labelledby="instructions-heading">
         <h2 id="instructions-heading">How tab access works</h2>
-        <p>Only website tabs deliberately moved into this group can be controlled by the approved session.</p>
-        <p>Move a tab into this group, or use Share in the Agent Tab Bridge popup. Moving it out revokes access immediately.</p>
+        <p id="authority">Only website tabs deliberately shared with this session can be controlled.</p>
+        <p id="revocation">Move a tab into this group, or use Share in the Agent Tab Bridge popup. Moving it out revokes access immediately.</p>
         <p>Removing this tab group ends the session.</p>
       </section>
     </main>

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { CompanionStateStore, applicationSupportPath, ensureApplicationSupportDirectory } from "./state.js";
 import { createBrokerSecret, deriveControllerPrincipalId, fingerprintSpki, generateIdentity, HostIdentityHandshake, IdentityStore, signHandshakeTranscript, verifyHandshakeTranscript } from "./identity.js";
+import { NATIVE_PROTOCOL_VERSION } from "./native-protocol.js";
 
 describe("companion identities and private state", () => {
   it("creates P-256 identities and rejects transcript/key substitution", () => {
@@ -59,11 +60,11 @@ describe("companion identities and private state", () => {
       const companionStore = new IdentityStore("companion", { directory: root });
       const extension = generateIdentity("controller");
       const handshake = new HostIdentityHandshake(companionStore);
-      const hello = { version: 1 as const, type: "hello" as const, role: "extension" as const, extensionId: "extension", extensionPublicKey: extension.publicKeySpki, extensionNonce: Buffer.alloc(32, 4).toString("base64url") };
+      const hello = { version: NATIVE_PROTOCOL_VERSION, type: "hello" as const, role: "extension" as const, extensionId: "extension", extensionPublicKey: extension.publicKeySpki, extensionNonce: Buffer.alloc(32, 4).toString("base64url") };
       const challenge = await handshake.createChallenge(hello);
       const transcript = { extensionId: hello.extensionId, extensionPublicKey: hello.extensionPublicKey, extensionNonce: hello.extensionNonce, companionId: challenge.companionId, companionPublicKey: challenge.companionPublicKey, companionNonce: challenge.companionNonce };
       expect(verifyHandshakeTranscript(challenge.companionPublicKey, transcript, challenge.signature)).toBe(true);
-      const proof = { version: 1 as const, type: "helloProof" as const, role: "extension" as const, ...transcript, signature: signHandshakeTranscript(extension.privateKeyPkcs8, transcript) };
+      const proof = { version: NATIVE_PROTOCOL_VERSION, type: "helloProof" as const, role: "extension" as const, ...transcript, signature: signHandshakeTranscript(extension.privateKeyPkcs8, transcript) };
       await expect(handshake.verifyProof(proof)).resolves.toMatchObject({ extensionId: "extension" });
     } finally { await rm(root, { recursive: true, force: true }); }
   });

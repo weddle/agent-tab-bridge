@@ -1,6 +1,8 @@
 /** Versioned control messages exchanged over the Chrome Native Messaging pipe. */
+import { isSessionAccess, isSessionAccessDelta, type SessionAccess, type SessionAccessDelta } from "./session-access.js";
 
-export const NATIVE_PROTOCOL_VERSION = 1 as const;
+
+export const NATIVE_PROTOCOL_VERSION = 2 as const;
 export const NATIVE_MAX_FRAME_BYTES = 1024 * 1024;
 export const MAX_TASK_LABEL_LENGTH = 128;
 export const MAX_DISPLAY_NAME_LENGTH = 128;
@@ -18,6 +20,7 @@ export interface SessionRecord {
   displayControllerName: string;
   taskLabel: string;
   requestedCapabilities: Capability[];
+  access: SessionAccess;
   createdAt: number;
   expiresAt: number | null;
   state: SessionState;
@@ -28,9 +31,17 @@ export interface SessionApproval {
   displayControllerName: string;
   taskLabel: string;
   requestedCapabilities: Capability[];
+  access: SessionAccess;
   expiresAt: number | null;
 }
 export interface SharedTabRecord { tabId: number; title: string; url: string; }
+export interface AccessUpgradeRecord {
+  id: string;
+  sessionId: string;
+  delta: SessionAccessDelta;
+  requestedAccess: SessionAccess;
+  createdAt: number;
+}
 
 /** The extension's first handshake message. Nonces are random base64url values. */
 export interface HelloMessage {
@@ -52,18 +63,25 @@ export interface HelloProofMessage {
 export interface ApproveSessionMessage extends SessionApproval { version: typeof NATIVE_PROTOCOL_VERSION; type: "approveSession"; requestId?: string; }
 export interface RevokeSessionMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "revokeSession"; requestId?: string; sessionId: string; reason?: string; }
 export interface RevokeDeviceMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "revokeDevice"; requestId: string; }
+export interface ListTabsMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "listTabs"; requestId: string; }
+export interface TabsListedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "tabsListed"; requestId: string; tabs: SharedTabRecord[]; }
+export interface ApproveAccessMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "approveAccess"; requestId?: string; accessRequestId: string; sessionId: string; requestedAccess: SessionAccess; }
+export interface DeclineAccessMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "declineAccess"; requestId?: string; accessRequestId: string; sessionId: string; }
 
 export interface RelayReadyMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "relayReady"; requestId?: string; sessionId: string; relayUrl: string; }
 export interface RelayFailedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "relayFailed"; requestId?: string; sessionId: string; error: string; }
 export interface TrustedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "trusted"; requestId?: string; companionPrincipalId: string; extensionFingerprint: string; }
-export interface SnapshotMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "snapshot"; requestId?: string; pending: SessionRecord[]; active: SessionRecord[]; sharedTabs: SharedTabRecord[]; }
+export interface SnapshotMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "snapshot"; requestId?: string; pending: SessionRecord[]; active: SessionRecord[]; sharedTabs: SharedTabRecord[]; pendingAccess: AccessUpgradeRecord[]; }
 export interface SessionPendingMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionPending"; requestId?: string; session: SessionRecord; }
 export interface SessionStartedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionStarted"; requestId?: string; session: SessionRecord; relayUrl?: string; }
 export interface SessionStoppedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionStopped"; requestId?: string; session: SessionRecord; reason?: string; }
+export interface AccessPendingMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "accessPending"; requestId?: string; request: AccessUpgradeRecord; }
+export interface AccessUpdatedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "accessUpdated"; requestId?: string; accessRequestId: string; session: SessionRecord; }
+export interface AccessDeclinedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "accessDeclined"; requestId?: string; accessRequestId: string; sessionId: string; }
 
-export type ExtensionToHostMessage = HelloMessage | HelloProofMessage | ApproveSessionMessage | RevokeSessionMessage | RevokeDeviceMessage | RelayReadyMessage | RelayFailedMessage;
+export type ExtensionToHostMessage = HelloMessage | HelloProofMessage | ApproveSessionMessage | RevokeSessionMessage | RevokeDeviceMessage | RelayReadyMessage | RelayFailedMessage | TabsListedMessage | ApproveAccessMessage | DeclineAccessMessage;
 
-export type HostToExtensionMessage = HelloChallengeMessage | TrustedMessage | SnapshotMessage | SessionPendingMessage | SessionStartedMessage | SessionStoppedMessage;
+export type HostToExtensionMessage = HelloChallengeMessage | TrustedMessage | SnapshotMessage | SessionPendingMessage | SessionStartedMessage | SessionStoppedMessage | ListTabsMessage | AccessPendingMessage | AccessUpdatedMessage | AccessDeclinedMessage;
 export type NativeMessage = ExtensionToHostMessage | HostToExtensionMessage;
 
 export interface HandshakeTranscript {
@@ -91,15 +109,25 @@ const validLabel = (value: unknown): value is string => isString(value, MAX_TASK
 const validCapabilities = (value: unknown): value is Capability[] => Array.isArray(value) && value.length <= MAX_CAPABILITIES && new Set(value).size === value.length && value.every((item) => item === "cdp");
 
 export function validateSessionRecord(value: unknown): value is SessionRecord {
-  if (!isRecord(value) || !keysExactly(value, ["id", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "createdAt", "expiresAt", "state"])) return false;
-  return validId(value.id) && isString(value.controllerPrincipalId, 256) && validDisplay(value.displayControllerName) && validLabel(value.taskLabel) && validCapabilities(value.requestedCapabilities) && isInteger(value.createdAt) && (value.expiresAt === null || (isInteger(value.expiresAt) && value.expiresAt > value.createdAt && value.expiresAt - value.createdAt <= MAX_TTL_MS)) && (value.state === "pending" || value.state === "active" || value.state === "revoked");
+  if (!isRecord(value) || !keysExactly(value, ["id", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "access", "createdAt", "expiresAt", "state"])) return false;
+  return validId(value.id) && isString(value.controllerPrincipalId, 256) && validDisplay(value.displayControllerName) && validLabel(value.taskLabel) && validCapabilities(value.requestedCapabilities) && isSessionAccess(value.access) && isInteger(value.createdAt) && (value.expiresAt === null || (isInteger(value.expiresAt) && value.expiresAt > value.createdAt && value.expiresAt - value.createdAt <= MAX_TTL_MS)) && (value.state === "pending" || value.state === "active" || value.state === "revoked");
 }
 export function assertSessionRecord(value: unknown): SessionRecord { if (!validateSessionRecord(value)) throw new NativeProtocolError("invalid session record"); return value; }
 export function validateSessionApproval(value: unknown): value is SessionApproval {
-  if (!isRecord(value) || !keysExactly(value, ["sessionId", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "expiresAt"])) return false;
-  return validId(value.sessionId) && isString(value.controllerPrincipalId, 256) && validDisplay(value.displayControllerName) && validLabel(value.taskLabel) && validCapabilities(value.requestedCapabilities) && (value.expiresAt === null || (isInteger(value.expiresAt) && value.expiresAt > 0 && value.expiresAt <= Number.MAX_SAFE_INTEGER));
+  if (!isRecord(value) || !keysExactly(value, ["sessionId", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "access", "expiresAt"])) return false;
+  return validId(value.sessionId) && isString(value.controllerPrincipalId, 256) && validDisplay(value.displayControllerName) && validLabel(value.taskLabel) && validCapabilities(value.requestedCapabilities) && isSessionAccess(value.access) && (value.expiresAt === null || (isInteger(value.expiresAt) && value.expiresAt > 0 && value.expiresAt <= Number.MAX_SAFE_INTEGER));
 }
 function validateSharedTab(value: unknown): value is SharedTabRecord { return isRecord(value) && keysExactly(value, ["tabId", "title", "url"]) && isInteger(value.tabId) && value.tabId >= 0 && isString(value.title, 4096) && isString(value.url, 8192); }
+function validateAccessUpgrade(value: unknown): value is AccessUpgradeRecord {
+  return isRecord(value) &&
+    keysExactly(value, ["id", "sessionId", "delta", "requestedAccess", "createdAt"]) &&
+    validId(value.id) &&
+    validId(value.sessionId) &&
+    isSessionAccessDelta(value.delta) &&
+    isSessionAccess(value.requestedAccess) &&
+    isInteger(value.createdAt) &&
+    value.createdAt > 0;
+}
 function validHandshakeFields(value: Record<string, unknown>, role: "extension" | "companion"): boolean {
   const required = ["role", "extensionId", "extensionPublicKey", "companionId", "companionPublicKey", "extensionNonce", "companionNonce", "signature"];
   return keysExactly(value, ["version", "type", ...required], ["requestId"]) && value.role === role && validId(value.extensionId, 256) && validPrincipalId(value.companionId) && isBase64(value.extensionPublicKey) && isBase64(value.companionPublicKey) && isBase64(value.extensionNonce) && isBase64(value.companionNonce) && isBase64(value.signature) && (() => { try { return Buffer.from(value.signature as string, "base64url").length === 64; } catch { return false; } })();
@@ -110,13 +138,19 @@ export function validateNativeMessage(value: unknown): value is NativeMessage {
     case "hello": return hasVersionAndType(value, "hello", ["role", "extensionId", "extensionPublicKey", "extensionNonce"]) && value.role === "extension" && validId(value.extensionId, 256) && isBase64(value.extensionPublicKey) && isBase64(value.extensionNonce);
     case "helloChallenge": return hasVersionAndType(value, "helloChallenge", ["role", "companionId", "companionPublicKey", "extensionId", "extensionPublicKey", "extensionNonce", "companionNonce", "signature"]) && validHandshakeFields(value, "companion");
     case "helloProof": return hasVersionAndType(value, "helloProof", ["role", "extensionId", "extensionPublicKey", "companionId", "companionPublicKey", "extensionNonce", "companionNonce", "signature"]) && validHandshakeFields(value, "extension");
-    case "approveSession": return hasVersionAndType(value, "approveSession", ["sessionId", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "expiresAt"]) && validateSessionApproval({ sessionId: value.sessionId, controllerPrincipalId: value.controllerPrincipalId, displayControllerName: value.displayControllerName, taskLabel: value.taskLabel, requestedCapabilities: value.requestedCapabilities, expiresAt: value.expiresAt });
+    case "approveSession": return hasVersionAndType(value, "approveSession", ["sessionId", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "access", "expiresAt"]) && validateSessionApproval({ sessionId: value.sessionId, controllerPrincipalId: value.controllerPrincipalId, displayControllerName: value.displayControllerName, taskLabel: value.taskLabel, requestedCapabilities: value.requestedCapabilities, access: value.access, expiresAt: value.expiresAt });
     case "revokeDevice": return hasVersionAndType(value, "revokeDevice", []) && typeof value.requestId === "string" && value.requestId.length > 0;
-    case "revokeSession": return hasVersionAndType(value, "revokeSession", ["sessionId"], ["reason"]) && validId(value.sessionId) && (value.reason === undefined || isString(value.reason, 256));
+    case "listTabs": return hasVersionAndType(value, "listTabs", []) && typeof value.requestId === "string";
+    case "tabsListed": return hasVersionAndType(value, "tabsListed", ["tabs"]) && typeof value.requestId === "string" && Array.isArray(value.tabs) && value.tabs.length <= 10_000 && value.tabs.every(validateSharedTab);
+    case "approveAccess": return hasVersionAndType(value, "approveAccess", ["accessRequestId", "sessionId", "requestedAccess"]) && validId(value.accessRequestId) && validId(value.sessionId) && isSessionAccess(value.requestedAccess);
+    case "declineAccess": return hasVersionAndType(value, "declineAccess", ["accessRequestId", "sessionId"]) && validId(value.accessRequestId) && validId(value.sessionId);
+    case "accessPending": return hasVersionAndType(value, "accessPending", ["request"]) && validateAccessUpgrade(value.request);
+    case "accessUpdated": return hasVersionAndType(value, "accessUpdated", ["accessRequestId", "session"]) && validId(value.accessRequestId) && validateSessionRecord(value.session);
+    case "accessDeclined": return hasVersionAndType(value, "accessDeclined", ["accessRequestId", "sessionId"]) && validId(value.accessRequestId) && validId(value.sessionId);
+    case "snapshot": return hasVersionAndType(value, "snapshot", ["pending", "active", "sharedTabs", "pendingAccess"]) && Array.isArray(value.pending) && Array.isArray(value.active) && Array.isArray(value.sharedTabs) && Array.isArray(value.pendingAccess) && value.pending.every(validateSessionRecord) && value.active.every(validateSessionRecord) && value.sharedTabs.every(validateSharedTab) && value.pendingAccess.every(validateAccessUpgrade);
     case "relayReady": return hasVersionAndType(value, "relayReady", ["sessionId", "relayUrl"]) && validId(value.sessionId) && isString(value.relayUrl, 8192) && /^ws:\/\/127\.0\.0\.1(?::\d+)?\//.test(value.relayUrl);
     case "relayFailed": return hasVersionAndType(value, "relayFailed", ["sessionId", "error"]) && validId(value.sessionId) && isString(value.error, 512);
     case "trusted": return hasVersionAndType(value, "trusted", ["companionPrincipalId", "extensionFingerprint"]) && validPrincipalId(value.companionPrincipalId) && validPrincipalId(value.extensionFingerprint);
-    case "snapshot": return hasVersionAndType(value, "snapshot", ["pending", "active", "sharedTabs"]) && Array.isArray(value.pending) && Array.isArray(value.active) && Array.isArray(value.sharedTabs) && value.pending.every(validateSessionRecord) && value.active.every(validateSessionRecord) && value.sharedTabs.every(validateSharedTab);
     case "sessionPending": return hasVersionAndType(value, "sessionPending", ["session"]) && validateSessionRecord(value.session);
     case "sessionStarted": return hasVersionAndType(value, "sessionStarted", ["session"], ["relayUrl"]) && validateSessionRecord(value.session) && (value.relayUrl === undefined || isString(value.relayUrl, 8192));
     case "sessionStopped": return hasVersionAndType(value, "sessionStopped", ["session"], ["reason"]) && validateSessionRecord(value.session) && (value.reason === undefined || isString(value.reason, 256));

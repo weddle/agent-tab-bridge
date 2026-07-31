@@ -103,8 +103,16 @@
         gap: var(--atb-space-1);
         padding: var(--atb-space-3);
       }
-      /* Approval requests are the only high-salience surface. */
-      .card.pending { border-left: 3px solid var(--atb-warning); }
+      .card.access-selectedTabs { border-left: 3px solid var(--atb-accent-fill); }
+      .card.access-domains { border-left: 3px solid var(--atb-warning); }
+      .card.access-full { border-left: 3px solid var(--atb-danger); }
+      /* Approval state is expressed separately from the access-level accent. */
+      .card.pending { box-shadow: inset 0 2px 0 var(--atb-warning); }
+      .access-summary {
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .card.access-full .access-summary { color: var(--atb-danger); }
       .card-header {
         display: flex;
         justify-content: space-between;
@@ -224,6 +232,11 @@
       <section id="pendingSection" class="section hidden" aria-labelledby="pendingHeading">
         <h2 id="pendingHeading">Approval requests (0)</h2>
         <div id="pendingSessions" class="cards"></div>
+      </section>
+
+      <section id="accessSection" class="section hidden" aria-labelledby="accessHeading">
+        <h2 id="accessHeading">Access upgrades (0)</h2>
+        <div id="accessRequests" class="cards"></div>
       </section>
 
       <section id="activeSection" class="section hidden" aria-labelledby="activeHeading">

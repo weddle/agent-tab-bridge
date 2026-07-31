@@ -1,7 +1,7 @@
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { closeAgentSession, main, parseCliArgs, runAgentCommand, type BrokerClient } from "./atb.js";
+import { closeAgentSession, main, parseCliArgs, requestAgentAccess, runAgentCommand, type BrokerClient } from "./atb.js";
 import { extensionOriginFromManifest } from "./companion/manifest.js";
 describe("atb CLI session boundary", () => {
   it("parses validated run options and rejects removed or unknown public options", () => {
@@ -11,8 +11,25 @@ describe("atb CLI session boundary", () => {
       label: "review tabs",
       ttlMs: 5000,
       argv: ["agent", "--task"],
+      access: { level: "selectedTabs", tabIds: [], domains: [] },
     });
     expect(parseCliArgs(["close", "--session", "review-2026"])).toEqual({ kind: "close", stableSessionKey: "review-2026" });
+    expect(parseCliArgs(["request-access", "--session", "review-2026", "--domain", "*.Example.com"])).toEqual({
+      kind: "requestAccess",
+      stableSessionKey: "review-2026",
+      delta: { kind: "domains", tabIds: [], domains: ["example.com"] },
+    });
+    expect(() => parseCliArgs(["request-access", "--session", "review-2026"])).toThrow(/exactly one/);
+    expect(() => parseCliArgs(["request-access", "--session", "review-2026", "--tab", "1", "--full-access"])).toThrow(/exactly one/);
+    expect(parseCliArgs(["run", "--domain", "*.Example.com", "--domain", "docs.example.com", "--", "agent"])).toMatchObject({
+      kind: "run",
+      access: { level: "domains", tabIds: [], domains: ["docs.example.com", "example.com"] },
+    });
+    expect(parseCliArgs(["run", "--full-access", "--", "agent"])).toMatchObject({
+      kind: "run",
+      access: { level: "full", tabIds: [], domains: [] },
+    });
+    expect(() => parseCliArgs(["run", "--tab", "7", "--domain", "example.com", "--", "agent"])).toThrow(/mutually exclusive/);
     expect(() => parseCliArgs(["run", "--label", "--", "agent"])).toThrow(/--label requires a value/);
     expect(() => parseCliArgs(["run", "--session", "not/a-key", "--", "agent"])).toThrow(/session key/);
     expect(() => parseCliArgs(["close", "--session", "not/a-key"])).toThrow(/session key/);
@@ -38,6 +55,7 @@ describe("atb CLI session boundary", () => {
     expect(parseCliArgs(["run", "--", "agent", "--task"])).toEqual({
       kind: "run",
       argv: ["agent", "--task"],
+      access: { level: "selectedTabs", tabIds: [], domains: [] },
     });
     expect(() => parseCliArgs(["run", "--pairing", "secret"])).toThrow();
   });
@@ -80,7 +98,7 @@ describe("atb CLI session boundary", () => {
       expect(requests.map(({ command }) => command)).toEqual(["openSession", "revokeSession"]);
       expect(requests[0]).toEqual({
         command: "openSession",
-        params: { taskLabel: "agent", requestedCapabilities: ["cdp"] },
+        params: { taskLabel: "agent", requestedCapabilities: ["cdp"], access: { level: "selectedTabs", tabIds: [], domains: [] } },
       });
       expect(stdoutWrite).not.toHaveBeenCalled();
     } finally {
@@ -109,7 +127,7 @@ describe("atb CLI session boundary", () => {
     })).resolves.toBe(0);
     expect(requests[0]).toEqual({
       command: "openSession",
-      params: { taskLabel: "from-main", requestedCapabilities: ["cdp"], ttlMs: 2000 },
+      params: { taskLabel: "from-main", requestedCapabilities: ["cdp"], access: { level: "selectedTabs", tabIds: [], domains: [] }, ttlMs: 2000 },
     });
   });
   it("leaves named sessions open after a child exits and closes them only explicitly", async () => {
@@ -131,8 +149,36 @@ describe("atb CLI session boundary", () => {
     await expect(runAgentCommand(["agent"], { broker, spawn, processEnv: {} }, { stableSessionKey: "research", label: "Research" })).resolves.toBe(0);
     await expect(closeAgentSession("research", { broker })).resolves.toBe(0);
     expect(requests).toEqual([
-      { command: "openSession", params: { taskLabel: "Research", requestedCapabilities: ["cdp"], stableSessionKey: "research" } },
+      { command: "openSession", params: { taskLabel: "Research", requestedCapabilities: ["cdp"], access: { level: "selectedTabs", tabIds: [], domains: [] }, stableSessionKey: "research" } },
       { command: "closeSession", params: { stableSessionKey: "research" } },
     ]);
+  });
+  it("waits for explicit approval of an incremental access request", async () => {
+    const listeners = new Set<(event: Record<string, unknown>) => void>();
+    const broker: BrokerClient = {
+      onEvent(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      async request(command, params = {}) {
+        expect(command).toBe("requestAccess");
+        expect(params).toEqual({
+          stableSessionKey: "research",
+          accessDelta: { kind: "domains", tabIds: [], domains: ["example.com"] },
+        });
+        queueMicrotask(() => {
+          for (const listener of listeners) {
+            listener({ event: "accessUpdated", sessionId: "session-1", accessRequestId: "access-1" });
+          }
+        });
+        return { accessRequest: { id: "access-1", sessionId: "session-1" } };
+      },
+      async close() {},
+    };
+    await expect(requestAgentAccess(
+      "research",
+      { kind: "domains", tabIds: [], domains: ["example.com"] },
+      { broker },
+    )).resolves.toBe(0);
   });
 });

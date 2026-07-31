@@ -23,7 +23,7 @@ import {
   toBase64Url,
 } from "./modules/native-identity.js";
 const NATIVE_HOST_NAME = "com.agenttabbridge.companion";
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const TASK_GROUP_COLOR = "blue";
 const MAX_TASK_LABEL_LENGTH = 128;
 const CDP_POLICY_ERROR = "CDP method is not permitted by Agent Tab Bridge";
@@ -57,6 +57,10 @@ const intentionalDebuggerDetaches = new Set();
 const stoppingSessions = new Map();
 /** Popup-approved records awaiting exactly one matching active transition. */
 const approvedSessions = new Map();
+/** Access upgrades awaiting a separate popup decision. */
+const accessRequests = new Map();
+/** Popup-approved upgrades awaiting one exact host confirmation. */
+const approvedAccessRequests = new Map();
 
 let nativePort = null;
 let nativeState = "disconnected";
@@ -79,7 +83,7 @@ function toolbarBadgeCount(count) {
 }
 
 function toolbarSessionCounts() {
-  let pending = 0;
+  let pending = accessRequests.size;
   let active = 0;
   for (const session of sessions.values()) {
     if (session.state === "pending") {
@@ -140,6 +144,105 @@ function newRequestId() {
 function validId(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
+function normalizeAccess(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 3 ||
+    !["level", "tabIds", "domains"].every((field) => Object.hasOwn(value, field)) ||
+    !["selectedTabs", "domains", "full"].includes(value.level) ||
+    !Array.isArray(value.tabIds) ||
+    value.tabIds.length > 64 ||
+    value.tabIds.some((tabId) => !Number.isInteger(tabId) || tabId < 0) ||
+    !Array.isArray(value.domains) ||
+    value.domains.length > 64 ||
+    value.domains.some((domain) => typeof domain !== "string" || !/^[a-z0-9.-]+$/.test(domain))
+  ) {
+    return null;
+  }
+  const tabIds = [...new Set(value.tabIds)].sort((left, right) => left - right);
+  const domains = [...new Set(value.domains)].sort();
+  if (
+    tabIds.length !== value.tabIds.length ||
+    domains.length !== value.domains.length ||
+    tabIds.some((tabId, index) => tabId !== value.tabIds[index]) ||
+    domains.some((domain, index) => domain !== value.domains[index]) ||
+    (value.level === "selectedTabs" && domains.length !== 0) ||
+    (value.level === "domains" && domains.length === 0) ||
+    (value.level === "full" && (tabIds.length !== 0 || domains.length !== 0))
+  ) {
+    return null;
+  }
+  return { level: value.level, tabIds, domains };
+}
+function normalizeAccessDelta(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 3 ||
+    !["kind", "tabIds", "domains"].every((field) => Object.hasOwn(value, field)) ||
+    !["tabs", "domains", "full"].includes(value.kind) ||
+    !Array.isArray(value.tabIds) ||
+    value.tabIds.length > 64 ||
+    value.tabIds.some((tabId) => !Number.isInteger(tabId) || tabId < 0) ||
+    !Array.isArray(value.domains) ||
+    value.domains.length > 64 ||
+    value.domains.some((domain) => typeof domain !== "string" || !/^[a-z0-9.-]+$/.test(domain))
+  ) {
+    return null;
+  }
+  const tabIds = [...new Set(value.tabIds)].sort((left, right) => left - right);
+  const domains = [...new Set(value.domains)].sort();
+  if (
+    tabIds.length !== value.tabIds.length ||
+    domains.length !== value.domains.length ||
+    tabIds.some((tabId, index) => tabId !== value.tabIds[index]) ||
+    domains.some((domain, index) => domain !== value.domains[index]) ||
+    (value.kind === "tabs" && (tabIds.length === 0 || domains.length !== 0)) ||
+    (value.kind === "domains" && (domains.length === 0 || tabIds.length !== 0)) ||
+    (value.kind === "full" && (tabIds.length !== 0 || domains.length !== 0))
+  ) {
+    return null;
+  }
+  return { kind: value.kind, tabIds, domains };
+}
+
+function upgradedAccess(current, delta) {
+  if (!current || !delta || current.level === "full") return null;
+  if (delta.kind === "full") return { level: "full", tabIds: [], domains: [] };
+  const tabIds = [...new Set([...current.tabIds, ...(delta.kind === "tabs" ? delta.tabIds : [])])].sort((left, right) => left - right);
+  const domains = [...new Set([...current.domains, ...(delta.kind === "domains" ? delta.domains : [])])].sort();
+  const upgraded = normalizeAccess({ level: domains.length ? "domains" : "selectedTabs", tabIds, domains });
+  return upgraded && JSON.stringify(upgraded) !== JSON.stringify(current) ? upgraded : null;
+}
+
+function normalizeAccessRequest(raw) {
+  const value = raw?.request && typeof raw.request === "object" ? raw.request : raw;
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 5 ||
+    !["id", "sessionId", "delta", "requestedAccess", "createdAt"].every((field) => Object.hasOwn(value, field)) ||
+    !validId(value.id) ||
+    !validId(value.sessionId) ||
+    !Number.isInteger(value.createdAt) ||
+    value.createdAt <= 0
+  ) {
+    return null;
+  }
+  const session = sessions.get(value.sessionId);
+  const delta = normalizeAccessDelta(value.delta);
+  const requestedAccess = normalizeAccess(value.requestedAccess);
+  const expected = upgradedAccess(session?.access, delta);
+  if (!session || session.state !== "active" || !delta || !requestedAccess || JSON.stringify(expected) !== JSON.stringify(requestedAccess)) {
+    return null;
+  }
+  return { id: value.id, sessionId: value.sessionId, delta, requestedAccess, createdAt: value.createdAt };
+}
+
 
 
 
@@ -151,6 +254,7 @@ function normalizeSession(raw, expectedState) {
     "displayControllerName",
     "taskLabel",
     "requestedCapabilities",
+    "access",
     "createdAt",
     "expiresAt",
     "state",
@@ -173,6 +277,7 @@ function normalizeSession(raw, expectedState) {
     value.requestedCapabilities.length > 1 ||
     new Set(value.requestedCapabilities).size !== value.requestedCapabilities.length ||
     value.requestedCapabilities.some((capability) => capability !== "cdp") ||
+    !normalizeAccess(value.access) ||
     !Number.isInteger(value.createdAt) ||
     (value.expiresAt !== null &&
       (!Number.isInteger(value.expiresAt) ||
@@ -189,6 +294,7 @@ function normalizeSession(raw, expectedState) {
     controllerName: value.displayControllerName,
     taskLabel: value.taskLabel,
     capabilities: value.requestedCapabilities,
+    access: normalizeAccess(value.access),
     createdAt: value.createdAt,
     expiresAt: value.expiresAt,
     state: value.state,
@@ -202,6 +308,7 @@ function sessionDto(session) {
     controllerName: session.controllerName,
     taskLabel: session.taskLabel,
     capabilities: session.capabilities,
+    access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] },
     createdAt: session.createdAt,
     expiresAt: session.expiresAt,
     state: session.state,
@@ -212,6 +319,37 @@ function sessionIsActive(sessionId) {
   const session = sessions.get(sessionId);
   return session?.state === "active" && relaySockets.has(sessionId) && readyRelaySessions.has(sessionId);
 }
+function taskGroupColor(session) {
+  if (session.access.level === "full") return "red";
+  if (session.access.level === "domains") return "orange";
+  return TASK_GROUP_COLOR;
+}
+
+function sessionAllowsUrl(session, rawUrl) {
+  if (!session || typeof rawUrl !== "string") return false;
+  let url;
+  try { url = new URL(rawUrl); } catch { return false; }
+  if (session.access.level === "full") {
+    return url.protocol === "http:" || url.protocol === "https:" || rawUrl === "about:blank";
+  }
+  if (session.access.level !== "domains" || (url.protocol !== "http:" && url.protocol !== "https:")) {
+    return false;
+  }
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+  return session.access.domains.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+}
+
+function sessionCanAdoptTab(session, tab) {
+  return (
+    !!session &&
+    Number.isInteger(tab?.id) &&
+    !isSessionPageTab(tab) &&
+    (session.access.level === "full" ||
+      session.access.tabIds.includes(tab.id) ||
+      (session.access.level === "domains" && sessionAllowsUrl(session, tab.url)))
+  );
+}
+
 
 function taskGroupTitle(session) {
   const label = session.taskLabel || "Task";
@@ -224,6 +362,9 @@ function sessionPageUrl(session) {
   url.searchParams.set("controller", session.controllerName);
   url.searchParams.set("label", session.taskLabel);
   url.searchParams.set("capabilities", session.capabilities.join(", "));
+  url.searchParams.set("access", session.access.level);
+  if (session.access.tabIds.length) url.searchParams.set("tabIds", session.access.tabIds.join(","));
+  if (session.access.domains.length) url.searchParams.set("domains", session.access.domains.join(","));
   return url.toString();
 }
 
@@ -421,24 +562,26 @@ async function handleNativeSnapshot(message) {
   const incoming = new Map();
   for (const raw of rawSessions) {
     const session = normalizeSession(raw);
-    if (session) {
-      incoming.set(session.id, session);
-    }
+    if (session) incoming.set(session.id, session);
   }
-
   for (const sessionId of [...sessions.keys()]) {
-    if (!incoming.has(sessionId)) {
-      await stopSession(sessionId, { removeSession: true });
-    }
+    if (!incoming.has(sessionId)) await stopSession(sessionId, { removeSession: true });
   }
   for (const session of incoming.values()) {
     const existing = sessions.get(session.id);
+    if (
+      existing?.state === "active" &&
+      session.state === "active" &&
+      JSON.stringify(existing.access) !== JSON.stringify(session.access)
+    ) {
+      postSessionRevocation(session.id, "session access changed without an approved upgrade");
+      await stopSession(session.id, { removeSession: true });
+      continue;
+    }
     sessions.set(session.id, { ...existing, ...session });
     if (session.state === "revoked" || session.state === "pending") {
       await stopSession(session.id, { removeSession: session.state === "revoked" });
-      if (session.state === "pending") {
-        sessions.set(session.id, session);
-      }
+      if (session.state === "pending") sessions.set(session.id, session);
     } else if (!relaySockets.has(session.id)) {
       // A relay credential is intentionally memory-only. A resurrected worker
       // cannot reconnect an old active task, so remove its authority instead.
@@ -446,6 +589,89 @@ async function handleNativeSnapshot(message) {
       postSessionRevocation(session.id, "extension relay state was lost");
     }
   }
+  const incomingAccess = new Map();
+  for (const raw of Array.isArray(message.pendingAccess) ? message.pendingAccess : []) {
+    const request = normalizeAccessRequest(raw);
+    if (request) incomingAccess.set(request.id, request);
+  }
+  accessRequests.clear();
+  for (const [id, request] of incomingAccess) accessRequests.set(id, request);
+  for (const id of [...approvedAccessRequests.keys()]) {
+    if (!incomingAccess.has(id)) approvedAccessRequests.delete(id);
+  }
+}
+
+function sameSessionIdentity(left, right) {
+  return (
+    !!left &&
+    !!right &&
+    left.id === right.id &&
+    left.controllerId === right.controllerId &&
+    left.controllerName === right.controllerName &&
+    left.taskLabel === right.taskLabel &&
+    left.createdAt === right.createdAt &&
+    left.expiresAt === right.expiresAt &&
+    JSON.stringify(left.capabilities) === JSON.stringify(right.capabilities)
+  );
+}
+
+async function handleAccessPending(message) {
+  const request = normalizeAccessRequest(message);
+  if (request) accessRequests.set(request.id, request);
+}
+
+async function rejectAccessUpdate(sessionId, reason) {
+  if (validId(sessionId)) {
+    postSessionRevocation(sessionId, reason);
+    await stopSession(sessionId, { removeSession: true });
+  }
+}
+
+async function handleAccessUpdated(message) {
+  const session = normalizeSession(message, "active");
+  const request = accessRequests.get(message?.accessRequestId);
+  const approval = approvedAccessRequests.get(message?.accessRequestId);
+  const known = session ? sessions.get(session.id) : null;
+  if (
+    !session ||
+    !request ||
+    !approval ||
+    request.sessionId !== session.id ||
+    approval.id !== request.id ||
+    !sameSessionIdentity(known, session) ||
+    JSON.stringify(request.requestedAccess) !== JSON.stringify(session.access)
+  ) {
+    await rejectAccessUpdate(message?.session?.id ?? request?.sessionId, "session access changed without the exact popup-approved upgrade");
+    return;
+  }
+  const anchorId = sessionAnchors.get(session.id);
+  if (Number.isInteger(anchorId)) {
+    try {
+      await chrome.tabs.update(anchorId, { url: sessionPageUrl(session) });
+    } catch {
+      await rejectAccessUpdate(session.id, "session access page could not be updated");
+      return;
+    }
+  }
+  const groupId = sessionGroups.get(session.id);
+  if (Number.isInteger(groupId)) {
+    try {
+      await chrome.tabGroups.update(groupId, { title: taskGroupTitle(session), color: taskGroupColor(session) });
+    } catch {
+      await rejectAccessUpdate(session.id, "session access indicator could not be updated");
+      return;
+    }
+  }
+  sessions.set(session.id, session);
+  accessRequests.delete(request.id);
+  approvedAccessRequests.delete(request.id);
+  await syncSessionTabs(session.id);
+}
+
+function handleAccessDeclined(message) {
+  if (!validId(message?.accessRequestId)) return;
+  accessRequests.delete(message.accessRequestId);
+  approvedAccessRequests.delete(message.accessRequestId);
 }
 
 async function rejectSessionStart(sessionId, reason) {
@@ -507,6 +733,22 @@ async function handleSessionStopped(message) {
   approvedSessions.delete(session.id);
   await stopSession(session.id, { removeSession: true });
 }
+async function enumerableBrowserTabs() {
+  const tabs = await chrome.tabs.query({});
+  return tabs
+    .filter((tab) => {
+      if (!Number.isInteger(tab.id) || isSessionPageTab(tab) || typeof tab.url !== "string") return false;
+      if (tab.url === "about:blank") return true;
+      try {
+        const url = new URL(tab.url);
+        return url.protocol === "http:" || url.protocol === "https:";
+      } catch {
+        return false;
+      }
+    })
+    .map((tab) => ({ tabId: tab.id, title: tab.title || "Untitled tab", url: tab.url }));
+}
+
 
 async function handleNativeMessage(message, port, generation) {
   if (nativePort !== port || generation !== nativeGeneration || !message || typeof message !== "object") {
@@ -524,6 +766,16 @@ async function handleNativeMessage(message, port, generation) {
     return;
   }
   switch (message.type) {
+    case "listTabs":
+      if (typeof message.requestId === "string") {
+        postNative({
+          version: PROTOCOL_VERSION,
+          type: "tabsListed",
+          requestId: message.requestId,
+          tabs: await enumerableBrowserTabs(),
+        });
+      }
+      return;
     case "snapshot":
       await handleNativeSnapshot(message);
       refreshBadge();
@@ -534,6 +786,18 @@ async function handleNativeMessage(message, port, generation) {
       return;
     case "sessionStarted":
       await handleSessionStarted(message);
+      refreshBadge();
+      return;
+    case "accessPending":
+      await handleAccessPending(message);
+      refreshBadge();
+      return;
+    case "accessUpdated":
+      await handleAccessUpdated(message);
+      refreshBadge();
+      return;
+    case "accessDeclined":
+      handleAccessDeclined(message);
       refreshBadge();
       return;
     case "sessionStopped":
@@ -558,6 +822,8 @@ async function handleNativeDisconnect(port, generation) {
   } finally {
     sessions.clear();
     approvedSessions.clear();
+    accessRequests.clear();
+    approvedAccessRequests.clear();
     refreshBadge();
     scheduleNativeReconnect();
   }
@@ -756,7 +1022,16 @@ async function handleRelayOpen(sessionId, socket, relayUrl) {
   const session = sessions.get(sessionId);
   readyRelaySessions.add(sessionId);
   try {
-    await ensureSessionGroup(sessionId);
+    if (session.access.tabIds.length > 0) {
+      const firstTab = await chrome.tabs.get(session.access.tabIds[0]);
+      await ensureSessionGroup(sessionId, firstTab.windowId);
+      for (const tabId of session.access.tabIds) {
+        await claimAndGroupTab(sessionId, tabId);
+      }
+      await syncSessionTabs(sessionId);
+    } else {
+      await ensureSessionGroup(sessionId);
+    }
     if (!reportRelayReady(sessionId, relayUrl)) {
       throw new Error("Native Messaging companion disconnected before relay readiness.");
     }
@@ -856,12 +1131,18 @@ async function tabStillBelongsToSession(sessionId, tab) {
 }
 
 async function assertSessionTab(sessionId, tabId) {
-  if (!sessionIsActive(sessionId) || !sessionOwnsTab(tabOwners, sessionId, tabId)) {
-    throw new Error(
-      "Tab is not shared with this active task session. Move it into this session's group or use Share in Agent Tab Bridge.",
-    );
+  if (!sessionIsActive(sessionId)) {
+    throw new Error("Only an active task session can control tabs.");
   }
-  const tab = await chrome.tabs.get(tabId);
+  let tab = await chrome.tabs.get(tabId);
+  if (!sessionOwnsTab(tabOwners, sessionId, tabId)) {
+    const session = sessions.get(sessionId);
+    if (!sessionCanAdoptTab(session, tab)) {
+      throw new Error("This tab is outside the session's approved tab, domain, or full-access grant.");
+    }
+    await claimAndGroupTab(sessionId, tabId);
+    tab = await chrome.tabs.get(tabId);
+  }
   if (!(await tabStillBelongsToSession(sessionId, tab))) {
     throw new Error("Tab is no longer shared with this task session.");
   }
@@ -884,7 +1165,7 @@ async function requireSessionGroupInWindow(sessionId, groupId, windowId) {
   return groupId;
 }
 
-async function ensureSessionGroup(sessionId) {
+async function ensureSessionGroup(sessionId, windowId = null) {
   const session = sessions.get(sessionId);
   if (!session) {
     throw new Error("The task session is no longer available.");
@@ -918,6 +1199,7 @@ async function ensureSessionGroup(sessionId) {
       const anchor = await chrome.tabs.create({
         url: sessionPageUrl(session),
         active: false,
+        ...(Number.isInteger(windowId) ? { windowId } : {}),
       });
       if (!Number.isInteger(anchor.id)) {
         throw new Error("Browser did not return a session tab ID.");
@@ -932,7 +1214,7 @@ async function ensureSessionGroup(sessionId) {
       }
       await chrome.tabGroups.update(groupId, {
         title: taskGroupTitle(session),
-        color: TASK_GROUP_COLOR,
+        color: taskGroupColor(session),
       });
       if (!sessionIsActive(sessionId)) {
         throw new Error("Task session stopped while its group was being created.");
@@ -985,7 +1267,7 @@ async function claimAndGroupTab(sessionId, tabId) {
       throw new Error("This tab is already shared with another task session.");
     }
     claimed = true;
-    const groupId = await ensureSessionGroup(sessionId);
+    const groupId = await ensureSessionGroup(sessionId, tab.windowId);
     await requireSessionGroupInWindow(sessionId, groupId, tab.windowId);
     if (tab.groupId !== groupId) {
       await chrome.tabs.group({ tabIds: [tabId], groupId });
@@ -1137,6 +1419,12 @@ async function stopSession(sessionId, { removeSession = true } = {}) {
     if (removeSession) {
       sessions.delete(sessionId);
       approvedSessions.delete(sessionId);
+      for (const [requestId, request] of accessRequests) {
+        if (request.sessionId === sessionId) {
+          accessRequests.delete(requestId);
+          approvedAccessRequests.delete(requestId);
+        }
+      }
     }
   })();
   stoppingSessions.set(sessionId, task);
@@ -1217,6 +1505,10 @@ async function handleRelayCommand(sessionId, socket, message) {
         return;
       }
       case "createTab": {
+        const session = sessions.get(sessionId);
+        if (!sessionAllowsUrl(session, message.url)) {
+          throw new Error("Opening this URL is outside the session's approved domain or full-access grant.");
+        }
         const tab = await chrome.tabs.create({
           url: message.url,
           active: message.background !== true,
@@ -1326,6 +1618,8 @@ async function forgetCompanion() {
   }
   sessions.clear();
   approvedSessions.clear();
+  accessRequests.clear();
+  approvedAccessRequests.clear();
   pendingHello = null;
   trustedCompanion = null;
   nativeState = "disconnected";
@@ -1376,6 +1670,17 @@ async function statusDto() {
     activeSessions: sessionValues
       .filter((session) => sessionIsActive(session.id))
       .map(sessionDto),
+    pendingAccess: [...accessRequests.values()].map((request) => {
+      const session = sessions.get(request.sessionId);
+      return {
+        ...request,
+        delta: { ...request.delta, tabIds: [...request.delta.tabIds], domains: [...request.delta.domains] },
+        requestedAccess: { ...request.requestedAccess, tabIds: [...request.requestedAccess.tabIds], domains: [...request.requestedAccess.domains] },
+        taskLabel: session?.taskLabel ?? "Unnamed task",
+        controllerName: session?.controllerName ?? "Unnamed controller",
+        currentAccess: session ? { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] } : null,
+      };
+    }),
     sharedTabs: await sharedTabsDto(),
   };
 }
@@ -1425,12 +1730,50 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             taskLabel: session.taskLabel,
             requestedCapabilities: session.capabilities,
             expiresAt: session.expiresAt,
+            access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] },
           });
         } catch (error) {
           approvedSessions.delete(session.id);
           throw error;
         }
         sendResponse({ ok: true });
+        return;
+      }
+      case "approveAccess": {
+        const request = accessRequests.get(message.accessRequestId);
+        if (!request) throw new Error("This access upgrade is not awaiting approval.");
+        if (approvedAccessRequests.has(request.id)) throw new Error("This access upgrade approval is already pending.");
+        approvedAccessRequests.set(request.id, request);
+        try {
+          postNative({
+            version: PROTOCOL_VERSION,
+            type: "approveAccess",
+            requestId: newRequestId(),
+            accessRequestId: request.id,
+            sessionId: request.sessionId,
+            requestedAccess: { ...request.requestedAccess, tabIds: [...request.requestedAccess.tabIds], domains: [...request.requestedAccess.domains] },
+          });
+        } catch (error) {
+          approvedAccessRequests.delete(request.id);
+          throw error;
+        }
+        sendResponse({ ok: true });
+        return;
+      }
+      case "declineAccess": {
+        const request = accessRequests.get(message.accessRequestId);
+        if (!request) throw new Error("This access upgrade is not awaiting approval.");
+        postNative({
+          version: PROTOCOL_VERSION,
+          type: "declineAccess",
+          requestId: newRequestId(),
+          accessRequestId: request.id,
+          sessionId: request.sessionId,
+        });
+        accessRequests.delete(request.id);
+        approvedAccessRequests.delete(request.id);
+        sendResponse({ ok: true });
+        refreshBadge();
         return;
       }
       case "revokeSession": {
@@ -1490,6 +1833,19 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   void (async () => {
+    if (typeof changeInfo.url === "string") {
+      const ownerSessionId = tabOwners.get(tabId);
+      const ownerSession = ownerSessionId ? sessions.get(ownerSessionId) : null;
+      if (
+        ownerSession?.access.level === "domains" &&
+        !ownerSession.access.tabIds.includes(tabId) &&
+        !sessionAllowsUrl(ownerSession, changeInfo.url)
+      ) {
+        await revokeTabAccess(ownerSessionId, tabId, "tab left its approved domains");
+        await syncActiveRelaySessions();
+        return;
+      }
+    }
     if (typeof changeInfo.groupId === "number") {
       const anchorSessionId = [...sessionAnchors.entries()].find(([, anchorId]) => anchorId === tabId)?.[0];
       if (anchorSessionId) {

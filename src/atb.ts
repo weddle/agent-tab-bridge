@@ -12,12 +12,15 @@ import { ensureApplicationSupportDirectory, CompanionStateStore } from "./compan
 import { createBrokerSecret, IdentityStore } from "./companion/identity.js";
 import { MAX_TASK_LABEL_LENGTH } from "./companion/native-protocol.js";
 import { assertStableSessionKey } from "./companion/stable-session-key.js";
+import { normalizeDomain, normalizeSessionAccess, normalizeSessionAccessDelta, type SessionAccess, type SessionAccessDelta } from "./companion/session-access.js";
 
 export type CliCommand =
   | { kind: "install"; extensionManifest?: string; executable?: string; home?: string }
   | { kind: "uninstall"; extensionManifest?: string; executable?: string; home?: string }
   | { kind: "status"; extensionManifest?: string; executable?: string; home?: string }
-  | { kind: "run"; argv: string[]; label?: string; ttlMs?: number; stableSessionKey?: string }
+  | { kind: "run"; argv: string[]; label?: string; ttlMs?: number; stableSessionKey?: string; access: SessionAccess }
+  | { kind: "tabs" }
+  | { kind: "requestAccess"; stableSessionKey: string; delta: SessionAccessDelta }
   | { kind: "close"; stableSessionKey: string }
   | { kind: "nativeHost" };
 
@@ -31,10 +34,13 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   const [first, ...rest] = argv;
   if (first === "run") {
     const separator = rest.indexOf("--");
-    if (separator < 0 || separator === rest.length - 1) throw new Error("usage: atb run [--session <stable-key>] [--label <text>] [--ttl-ms <integer>] -- <command> [args...]");
+    if (separator < 0 || separator === rest.length - 1) throw new Error("usage: atb run [--session <stable-key>] [--label <text>] [--ttl-ms <integer>] [--tab <id> ... | --domain <host> ... | --full-access] -- <command> [args...]");
     let label: string | undefined;
     let ttlMs: number | undefined;
     let stableSessionKey: string | undefined;
+    const tabIds = [];
+    const domains = [];
+    let fullAccess = false;
     for (let index = 0; index < separator; index += 1) {
       const value = rest[index];
       if (value === "--label") {
@@ -48,12 +54,57 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
       } else if (value === "--session") {
         if (stableSessionKey !== undefined) throw new Error("--session may be specified only once");
         stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--tab") {
+        const raw = requiredOptionValue(value, rest[++index]);
+        if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("--tab requires a non-negative integer tab ID");
+        tabIds.push(Number(raw));
+      } else if (value === "--domain") {
+        domains.push(normalizeDomain(requiredOptionValue(value, rest[++index])));
+      } else if (value === "--full-access") {
+        if (fullAccess) throw new Error("--full-access may be specified only once");
+        fullAccess = true;
       } else {
         throw new Error(`unknown run option: ${value}`);
       }
     }
     if (stableSessionKey !== undefined && !label?.trim()) throw new Error("--session requires a non-empty --label");
-    return { kind: "run", argv: rest.slice(separator + 1), ...(label === undefined ? {} : { label }), ...(ttlMs === undefined ? {} : { ttlMs }), ...(stableSessionKey === undefined ? {} : { stableSessionKey }) };
+    const accessModes = Number(tabIds.length > 0) + Number(domains.length > 0) + Number(fullAccess);
+    if (accessModes > 1) throw new Error("--tab, --domain, and --full-access are mutually exclusive");
+    const access = normalizeSessionAccess(fullAccess ? { level: "full", tabIds: [], domains: [] } : domains.length ? { level: "domains", tabIds: [], domains } : { level: "selectedTabs", tabIds, domains: [] });
+    return { kind: "run", argv: rest.slice(separator + 1), access, ...(label === undefined ? {} : { label }), ...(ttlMs === undefined ? {} : { ttlMs }), ...(stableSessionKey === undefined ? {} : { stableSessionKey }) };
+  }
+  if (first === "request-access") {
+    let stableSessionKey;
+    const tabIds = [];
+    const domains = [];
+    let fullAccess = false;
+    for (let index = 0; index < rest.length; index += 1) {
+      const value = rest[index];
+      if (value === "--session") {
+        if (stableSessionKey !== undefined) throw new Error("--session may be specified only once");
+        stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--tab") {
+        const raw = requiredOptionValue(value, rest[++index]);
+        if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("--tab requires a non-negative integer tab ID");
+        tabIds.push(Number(raw));
+      } else if (value === "--domain") {
+        domains.push(normalizeDomain(requiredOptionValue(value, rest[++index])));
+      } else if (value === "--full-access") {
+        if (fullAccess) throw new Error("--full-access may be specified only once");
+        fullAccess = true;
+      } else {
+        throw new Error(`unknown request-access option: ${value}`);
+      }
+    }
+    if (stableSessionKey === undefined) throw new Error("request-access requires --session <stable-key>");
+    const modes = Number(tabIds.length > 0) + Number(domains.length > 0) + Number(fullAccess);
+    if (modes !== 1) throw new Error("request-access requires exactly one of --tab, --domain, or --full-access");
+    const delta = normalizeSessionAccessDelta(fullAccess ? { kind: "full", tabIds: [], domains: [] } : domains.length ? { kind: "domains", tabIds: [], domains } : { kind: "tabs", tabIds, domains: [] });
+    return { kind: "requestAccess", stableSessionKey, delta };
+  }
+  if (first === "tabs") {
+    if (rest.length !== 0) throw new Error("usage: atb tabs");
+    return { kind: "tabs" };
   }
   if (first === "close") {
     if (rest.length !== 2 || rest[0] !== "--session") throw new Error("usage: atb close --session <stable-key>");
@@ -123,7 +174,7 @@ function signalNumber(signal: NodeJS.Signals): number {
 }
 
 /** Run one approved session; unnamed sessions are revoked when their child exits. */
-export async function runAgentCommand(argv: readonly string[], deps: RunDeps, options: { label?: string; ttlMs?: number; stableSessionKey?: string } = {}): Promise<number> {
+export async function runAgentCommand(argv: readonly string[], deps: RunDeps, options: { label?: string; ttlMs?: number; stableSessionKey?: string; access?: SessionAccess } = {}): Promise<number> {
   if (options.stableSessionKey !== undefined) {
     assertStableSessionKey(options.stableSessionKey);
     if (!options.label?.trim()) throw new Error("--session requires a non-empty --label");
@@ -156,6 +207,7 @@ export async function runAgentCommand(argv: readonly string[], deps: RunDeps, op
     const result = await deps.broker.request("openSession", {
       taskLabel: boundedLabel(argv, options.label),
       requestedCapabilities: ["cdp"],
+      access: normalizeSessionAccess(options.access),
       ...(ttlMs === undefined ? {} : { ttlMs }),
       ...(options.stableSessionKey === undefined ? {} : { stableSessionKey: options.stableSessionKey }),
     });
@@ -180,6 +232,48 @@ export async function runAgentCommand(argv: readonly string[], deps: RunDeps, op
     await deps.broker.close?.();
   }
 }
+export async function requestAgentAccess(stableSessionKey: string, delta: SessionAccessDelta, deps: Pick<RunDeps, "broker">): Promise<number> {
+  assertStableSessionKey(stableSessionKey);
+  let accessRequestId: string | undefined;
+  let sessionId: string | undefined;
+  let removeEvent: (() => void) | undefined;
+  const early = new Map<string, { name: string; reason: unknown }>();
+  const outcome = Promise.withResolvers<number>();
+  try {
+    const onEvent = (event: BrokerEvent) => {
+      const name = eventName(event);
+      const requestId = typeof event.accessRequestId === "string" ? event.accessRequestId : undefined;
+      const eventSession = eventSessionId(event);
+      if (name === "hostclosing" || (name === "revoked" && sessionId !== undefined && eventSession === sessionId)) {
+        outcome.reject(new Error(name === "hostclosing" ? "companion host closed while access approval was pending" : "session closed while access approval was pending"));
+        return;
+      }
+      if (sessionId && eventSession && eventSession !== sessionId) return;
+      if (!accessRequestId && requestId) {
+        early.set(requestId, { name, reason: event.reason });
+        return;
+      }
+      if (requestId !== accessRequestId) return;
+      if (name === "accessupdated") outcome.resolve(0);
+      else if (name === "accessdeclined") outcome.reject(new Error(typeof event.reason === "string" ? event.reason : "access upgrade was declined"));
+    };
+    removeEvent = deps.broker.onEvent?.(onEvent) ?? undefined;
+    const result = await deps.broker.request("requestAccess", { stableSessionKey, accessDelta: normalizeSessionAccessDelta(delta) });
+    const record = result && typeof result === "object" ? result as Record<string, unknown> : null;
+    const request = record?.accessRequest && typeof record.accessRequest === "object" ? record.accessRequest as Record<string, unknown> : null;
+    accessRequestId = typeof request?.id === "string" ? request.id : undefined;
+    sessionId = typeof request?.sessionId === "string" ? request.sessionId : undefined;
+    if (!accessRequestId || !sessionId) throw new Error("broker did not return an access request");
+    const immediate = early.get(accessRequestId);
+    if (immediate?.name === "accessupdated") return 0;
+    if (immediate?.name === "accessdeclined") throw new Error(typeof immediate.reason === "string" ? immediate.reason : "access upgrade was declined");
+    return await outcome.promise;
+  } finally {
+    removeEvent?.();
+    await deps.broker.close?.();
+  }
+}
+
 export async function closeAgentSession(stableSessionKey: string, deps: Pick<RunDeps, "broker">): Promise<number> {
   assertStableSessionKey(stableSessionKey);
   try {
@@ -221,7 +315,21 @@ export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {})
   }
   if (command.kind === "run") {
     const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
-    return runAgentCommand(command.argv, { ...deps, broker } as RunDeps, { label: command.label, ttlMs: command.ttlMs, stableSessionKey: command.stableSessionKey });
+    return runAgentCommand(command.argv, { ...deps, broker } as RunDeps, { label: command.label, ttlMs: command.ttlMs, stableSessionKey: command.stableSessionKey, access: command.access });
+  }
+  if (command.kind === "requestAccess") {
+    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    return requestAgentAccess(command.stableSessionKey, command.delta, { broker });
+  }
+  if (command.kind === "tabs") {
+    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    try {
+      const tabs = await broker.request("listTabs");
+      (deps.stdout ?? process.stdout).write(`${JSON.stringify(tabs, null, 2)}\n`);
+      return 0;
+    } finally {
+      await broker.close?.();
+    }
   }
   if (command.kind === "close") {
     const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });

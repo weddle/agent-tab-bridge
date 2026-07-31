@@ -116,8 +116,8 @@ export function sessionTabIds(tabOwners, sessionId) {
 
 /**
  * A host may transition only the exact popup-approved pending session to
- * active. Display text, expiry, controller, and requested capability are all
- * authority-bearing for that approval and must remain unchanged.
+ * active. Display text, expiry, controller, requested capability, and access
+ * scope are authority-bearing and must remain unchanged.
  */
 export function matchesSessionAuthority(pending, active) {
   return (
@@ -134,6 +134,7 @@ export function matchesSessionAuthority(pending, active) {
     Array.isArray(pending.capabilities) &&
     Array.isArray(active.capabilities) &&
     pending.capabilities.length === active.capabilities.length &&
-    pending.capabilities.every((capability, index) => capability === active.capabilities[index])
+    pending.capabilities.every((capability, index) => capability === active.capabilities[index]) &&
+    JSON.stringify(pending.access) === JSON.stringify(active.access)
   );
 }

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { encodeNativeFrame, NativeFramingError, NativeMessageDecoder } from "./native-framing.js";
-import { parseNativeMessage } from "./native-protocol.js";
+import { NATIVE_PROTOCOL_VERSION, parseNativeMessage } from "./native-protocol.js";
 
 const hello = {
-  version: 1 as const,
+  version: NATIVE_PROTOCOL_VERSION,
   type: "hello" as const,
   role: "extension" as const,
   extensionId: "extension-id",
@@ -43,10 +43,10 @@ describe("Native Messaging framing contract", () => {
 
   it("keeps protocol validation at the transport edge", () => {
     expect(parseNativeMessage(JSON.stringify(hello))).toEqual(hello);
-    expect(parseNativeMessage(JSON.stringify({ ...hello, version: 2 }))).toBeNull();
+    expect(parseNativeMessage(JSON.stringify({ ...hello, version: 1 }))).toBeNull();
     expect(parseNativeMessage(JSON.stringify({ ...hello, unexpected: true }))).toBeNull();
     const approval = {
-      version: 1 as const,
+      version: NATIVE_PROTOCOL_VERSION,
       type: "approveSession" as const,
       sessionId: "session-1",
       controllerPrincipalId: "controller-1",

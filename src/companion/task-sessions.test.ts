@@ -123,13 +123,36 @@ describe("TaskSessionManager integration contract", () => {
     expect(reused.id).toBe(first.id);
     expect(manager.cdpUrl(reused.id)).toBe(relays[0]?.cdpUrl);
     expect(startRelay).toHaveBeenCalledTimes(1);
-    expect(() => manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "Different task", capabilities: ["cdp"], stableSessionKey: "research" })).toThrow(/different label or capabilities/);
+    expect(() => manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "Different task", capabilities: ["cdp"], stableSessionKey: "research" })).toThrow(/different session authority/);
     expect(() => manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "Research", capabilities: ["cdp", "cdp"], stableSessionKey: "research" })).toThrow(/only the cdp capability/);
 
     const anotherController = manager.open({ controllerPrincipalId: "controller-2", controllerName: "CLI", taskLabel: "Research", capabilities: ["cdp"], stableSessionKey: "research" });
     expect(anotherController).toMatchObject({ id: "session-2", state: "pending" });
     await expect(manager.revokeNamed("controller-1", "research")).resolves.toMatchObject({ id: first.id, state: "revoked" });
     expect(manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "Research", capabilities: ["cdp"], stableSessionKey: "research" })).toMatchObject({ id: "session-3", state: "pending" });
+  });
+  it("applies only monotonic access upgrades to active sessions", async () => {
+    const events: Array<{ type: string; accessRequest?: { id: string }; access?: { level: string } }> = [];
+    const { startRelay } = makeRelayFactory();
+    const manager = new TaskSessionManager({ startRelay, onEvent: (event) => events.push(event) });
+    const session = manager.open({
+      controllerPrincipalId: "controller-1",
+      controllerName: "CLI",
+      taskLabel: "scoped research",
+      capabilities: ["cdp"],
+      access: { level: "selectedTabs", tabIds: [7], domains: [] },
+      stableSessionKey: "scoped",
+    });
+    await manager.approve(session.id);
+    manager.relayReady(session.id);
+
+    const delta = { kind: "domains", tabIds: [], domains: ["example.com"] } as const;
+    const pending = manager.previewAccessUpgrade("controller-1", "scoped", delta);
+    expect(pending.access).toEqual({ level: "domains", tabIds: [7], domains: ["example.com"] });
+    const updated = manager.applyAccessUpgrade(session.id, delta, pending.access);
+    expect(updated.access).toEqual({ level: "domains", tabIds: [7], domains: ["example.com"] });
+    expect(events.at(-1)?.type).toBe("active");
+    expect(() => manager.previewAccessUpgrade("controller-1", "scoped", { kind: "tabs", tabIds: [7], domains: [] })).toThrow(/does not add authority/);
   });
   it("bounds revoked tombstones while keeping recent revoke idempotence", async () => {
     let next = 0;

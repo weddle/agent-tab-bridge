@@ -31,9 +31,9 @@ The capability URL is short-lived. It must not be committed, stored in persisten
 
 ## Status
 
-Release 1's trusted-local workflow is implemented. The companion is installed once, the extension and companion authenticate and pin each other, each `atb run` request requires an explicit browser-local approval, and only tabs shared into that task's visible group appear over CDP. No user copies a token or port.
+Release 1's trusted-local workflow is implemented. The companion is installed once, the extension and companion authenticate and pin each other, each `atb run` request requires an explicit browser-local approval, and the approval grants one visibly distinct access level: selected tabs, requested sites (including their subdomains), or full website access. Only tabs adopted into that task's visible group appear over CDP. No user copies a token or port.
 
-The focused contract suite and disposable Brave and Chrome-for-Testing profiles cover companion authentication, task approval, one explicitly shared page read through authenticated CDP, launcher-scoped revocation, browser disconnect, and one-click device trust removal.
+The focused contract suite and disposable browser rendering cover companion authentication, task and incremental-access approval, access-level enforcement, authenticated CDP target containment, launcher-scoped revocation, browser disconnect, and one-click device trust removal.
 
 See [`ROADMAP.md`](ROADMAP.md) for the later trusted-LAN, bookmarks/history, managed-action, and Guardian Auto releases.
 
@@ -60,13 +60,34 @@ The manifest's committed public key gives the unpacked extension a stable ID. Th
 
 ## Run a task
 
-Launch the agent as a child of `atb run`:
+Launch the agent as a child of `atb run`. With no access option, the session starts in selected-tab mode and tabs are shared manually:
 
 ```bash
 node dist/src/atb.js run --label "Research task" -- hermes
 ```
 
-The popup shows the authenticated controller principal, unverified display label, requested capability, and TTL. Approve the task, then share only the intended tabs with that session. `atb` injects the ephemeral `BROWSER_CDP_URL` only into the child process; it is never printed, persisted, or copied by the user. Child exit, browser loss, session revocation, tab-group removal, or debugger detachment removes the corresponding authority.
+Request exactly one initial access level when the task starts:
+
+```bash
+node dist/src/atb.js run --session research --label "Research task" --tab 246 -- hermes
+node dist/src/atb.js run --session research --label "Research task" --domain example.com -- hermes
+node dist/src/atb.js run --session research --label "Research task" --full-access -- hermes
+```
+
+`--tab` and `--domain` may each be repeated. A domain includes its subdomains. Full access is intentionally the highest-salience approval and still controls only tabs in the session's colored group; it does not expose ungrouped personal tabs.
+
+The popup shows the authenticated controller principal, unverified task label, requested capability, access level, and TTL. Approve the task once. Selected tabs named on the command line are adopted into the task group; domain and full-access sessions can open permitted sites directly. Dragging any controlled tab out of the group revokes that tab immediately.
+
+Named sessions remain active after their child command exits. A later command may request a monotonic access upgrade without restarting the session:
+
+```bash
+node dist/src/atb.js request-access --session research --tab 311
+node dist/src/atb.js request-access --session research --domain docs.example.org
+node dist/src/atb.js request-access --session research --full-access
+node dist/src/atb.js close --session research
+```
+
+Every upgrade is separately displayed and approved or declined in the popup. Access can expand from selected tabs to requested sites to full access, but never silently narrows or broadens. `atb` injects the ephemeral `BROWSER_CDP_URL` only into a launched child process; it is never printed, persisted, or copied by the user. Browser loss, session revocation, tab-group removal, or debugger detachment removes the corresponding authority.
 
 To remove the Native Messaging registration:
 
