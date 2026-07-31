@@ -1,5 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createConnection, createServer } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createBrokerClient } from "./broker-client.js";
@@ -19,6 +21,34 @@ describe("BrokerServer socket ownership", () => {
     const first = await startBrokerServer(options);
     await expect(startBrokerServer(options)).rejects.toThrow("already running");
     await first.close();
+  });
+  it("waits for a closing server to release the socket path before rebinding", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "atb-broker-")); directories.push(directory);
+    const socketPath = join(directory, "broker.sock");
+    const closingServer = createServer();
+    await new Promise<void>((resolve, reject) => {
+      closingServer.once("error", reject);
+      closingServer.listen(socketPath, () => { closingServer.off("error", reject); resolve(); });
+    });
+    const heldConnection = createConnection(socketPath);
+    await new Promise<void>((resolve, reject) => {
+      heldConnection.once("connect", resolve);
+      heldConnection.once("error", reject);
+    });
+    const closing = new Promise<void>((resolve) => closingServer.close(() => resolve()));
+    const sessions = new TaskSessionManager({ startRelay: async () => ({ pairingUrl: "ws://127.0.0.1/extension#token", cdpUrl: "ws://127.0.0.1/cdp?token=token", close: async () => undefined }) });
+    const replacementPromise = startBrokerServer({ socketPath, token: "a".repeat(32), sessions, isTrusted: () => false, controller: () => null });
+    await delay(25);
+    heldConnection.destroy();
+    await closing;
+    const replacement = await replacementPromise;
+    try {
+      const client = createBrokerClient({ socketPath, token: "a".repeat(32) });
+      await expect(client.request("status")).resolves.toMatchObject({ trusted: false });
+      await client.close();
+    } finally {
+      await replacement.close();
+    }
   });
   it("reuses a named approved session across separate broker clients and closes it by stable key", async () => {
     const directory = await mkdtemp(join(tmpdir(), "atb-broker-")); directories.push(directory);

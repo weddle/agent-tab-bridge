@@ -66,6 +66,14 @@ const approvedAccessRequests = new Map();
 const enrollmentRequests = new Map();
 /** In-flight enrollment confirmations awaiting the host's result, keyed by requestId. */
 const pendingEnrollConfirms = new Map();
+/** Enrolled agent profiles reported by the companion's latest snapshot. */
+let enrolledProfiles = [];
+/**
+ * Standing grants: auto-approve a NEW session from an enrolled profile up to
+ * the remembered level. Full access is never remembered, and access upgrades
+ * always prompt. Persisted in chrome.storage.local; revocable in the popup.
+ */
+let standingGrants = [];
 
 let nativePort = null;
 let nativeState = "disconnected";
@@ -149,6 +157,68 @@ function newRequestId() {
 function validId(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
+
+function validGrant(value) {
+  return !!value && typeof value === "object" &&
+    validId(value.controllerId) &&
+    typeof value.controllerName === "string" &&
+    (value.level === "selectedTabs" || value.level === "domains") &&
+    Array.isArray(value.domains) && value.domains.every((domain) => typeof domain === "string") &&
+    Number.isInteger(value.createdAt);
+}
+
+async function loadStandingGrants() {
+  try {
+    const stored = await chrome.storage.local.get("standingGrants");
+    standingGrants = Array.isArray(stored?.standingGrants) ? stored.standingGrants.filter(validGrant) : [];
+  } catch {
+    standingGrants = [];
+  }
+}
+
+async function saveStandingGrants() {
+  if (standingGrants.length === 0) {
+    await chrome.storage.local.remove("standingGrants");
+  } else {
+    await chrome.storage.local.set({ standingGrants });
+  }
+  const stored = await chrome.storage.local.get("standingGrants");
+  const persisted = Array.isArray(stored?.standingGrants) ? stored.standingGrants.filter(validGrant) : [];
+  if (JSON.stringify(persisted) !== JSON.stringify(standingGrants)) {
+    throw new Error("Standing grant storage did not retain the requested policy.");
+  }
+}
+
+function grantFor(controllerId) {
+  return standingGrants.find((grant) => grant.controllerId === controllerId) ?? null;
+}
+
+function enrolledPrincipal(controllerId) {
+  return enrolledProfiles.some((profile) => profile.principalId === controllerId);
+}
+
+/** A grant never covers full access; domain requests must be a subset of the remembered domains. */
+function accessWithinGrant(access, grant) {
+  if (!grant || !access || access.level === "full") return false;
+  if (access.level === "selectedTabs") return true;
+  if (access.level === "domains") return grant.level === "domains" && access.domains.every((domain) => grant.domains.includes(domain));
+  return false;
+}
+
+async function rememberGrant(session) {
+  if (session.access.level === "full" || !enrolledPrincipal(session.controllerId)) return;
+  const existing = grantFor(session.controllerId);
+  const priorDomains = existing?.level === "domains" ? existing.domains : [];
+  const domains = session.access.level === "domains" ? [...new Set([...priorDomains, ...session.access.domains])] : priorDomains;
+  const level = session.access.level === "domains" || existing?.level === "domains" ? "domains" : "selectedTabs";
+  standingGrants = [
+    ...standingGrants.filter((grant) => grant.controllerId !== session.controllerId),
+    { controllerId: session.controllerId, controllerName: session.controllerName, level, domains, createdAt: existing?.createdAt ?? Date.now() },
+  ];
+  await saveStandingGrants();
+}
+
+const standingGrantsReady = loadStandingGrants();
 function normalizeAccess(value) {
   if (
     !value ||
@@ -559,7 +629,45 @@ async function handleTrusted(message, port, generation) {
   refreshBadge();
 }
 
+
+/** Popup-equivalent approval used by both the popup route and standing grants. */
+function approveSessionNow(session) {
+  const approval = {
+    requestId: newRequestId(),
+    session: { ...session, capabilities: [...session.capabilities] },
+  };
+  approvedSessions.set(session.id, approval);
+  try {
+    postNative({
+      version: PROTOCOL_VERSION,
+      type: "approveSession",
+      requestId: approval.requestId,
+      sessionId: session.id,
+      controllerPrincipalId: session.controllerId,
+      displayControllerName: session.controllerName,
+      taskLabel: session.taskLabel,
+      requestedCapabilities: session.capabilities,
+      expiresAt: session.expiresAt,
+      access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] },
+    });
+  } catch (error) {
+    approvedSessions.delete(session.id);
+    throw error;
+  }
+}
+
+/** Auto-approve a pending session covered by a standing grant for an enrolled profile. */
+async function maybeAutoApprove(session) {
+  await standingGrantsReady;
+  if (!session || session.state !== "pending" || approvedSessions.has(session.id)) return;
+  if (!enrolledPrincipal(session.controllerId)) return;
+  if (!accessWithinGrant(session.access, grantFor(session.controllerId))) return;
+  try { approveSessionNow(session); } catch { /* the popup path remains available */ }
+}
 async function handleNativeSnapshot(message) {
+  enrolledProfiles = (Array.isArray(message.enrolledProfiles) ? message.enrolledProfiles : [])
+    .filter((profile) => !!profile && typeof profile === "object" && validId(profile.name) && validId(profile.principalId) && Number.isInteger(profile.enrolledAt))
+    .map(({ name, principalId, enrolledAt }) => ({ name, principalId, enrolledAt }));
   const rawSessions = [
     ...(Array.isArray(message.pending) ? message.pending : []),
     ...(Array.isArray(message.active) ? message.active : []),
@@ -586,7 +694,7 @@ async function handleNativeSnapshot(message) {
     sessions.set(session.id, { ...existing, ...session });
     if (session.state === "revoked" || session.state === "pending") {
       await stopSession(session.id, { removeSession: session.state === "revoked" });
-      if (session.state === "pending") sessions.set(session.id, session);
+      if (session.state === "pending") { sessions.set(session.id, session); await maybeAutoApprove(session); }
     } else if (!relaySockets.has(session.id)) {
       // A relay credential is intentionally memory-only. A resurrected worker
       // cannot reconnect an old active task, so remove its authority instead.
@@ -700,6 +808,7 @@ async function handleSessionPending(message) {
   }
   await stopSession(session.id, { removeSession: false });
   sessions.set(session.id, session);
+  await maybeAutoApprove(session);
 }
 
 async function handleSessionStarted(message) {
@@ -1705,6 +1814,7 @@ async function forgetCompanion() {
 }
 
 async function statusDto() {
+  await standingGrantsReady;
   let pinnedCompanion = null;
   let storedPinUnreadable = false;
   try {
@@ -1741,6 +1851,8 @@ async function statusDto() {
       };
     }),
     pendingEnrollments: [...enrollmentRequests.values()].filter((request) => request.expiresAt > Date.now()).map((request) => ({ ...request, id: request.enrollmentId })),
+    enrolledProfiles: enrolledProfiles.map((profile) => ({ ...profile, id: profile.principalId })),
+    standingGrants: standingGrants.map((grant) => ({ ...grant, id: grant.controllerId, domains: [...grant.domains] })),
     sharedTabs: await sharedTabsDto(),
   };
 }
@@ -1774,28 +1886,27 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         if (approvedSessions.has(session.id)) {
           throw new Error("Approval is already awaiting the companion's matching session start.");
         }
-        const approval = {
-          requestId: newRequestId(),
-          session: { ...session, capabilities: [...session.capabilities] },
-        };
-        approvedSessions.set(session.id, approval);
-        try {
-          postNative({
-            version: PROTOCOL_VERSION,
-            type: "approveSession",
-            requestId: approval.requestId,
-            sessionId: session.id,
-            controllerPrincipalId: session.controllerId,
-            displayControllerName: session.controllerName,
-            taskLabel: session.taskLabel,
-            requestedCapabilities: session.capabilities,
-            expiresAt: session.expiresAt,
-            access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] },
-          });
-        } catch (error) {
-          approvedSessions.delete(session.id);
-          throw error;
-        }
+        await standingGrantsReady;
+        approveSessionNow(session);
+        if (message.remember === true) await rememberGrant(session);
+        sendResponse({ ok: true });
+        return;
+      }
+      case "revokeGrant": {
+        await standingGrantsReady;
+        if (!validId(message.controllerId)) throw new Error("No standing grant was selected.");
+        standingGrants = standingGrants.filter((grant) => grant.controllerId !== message.controllerId);
+        await saveStandingGrants();
+        sendResponse({ ok: true });
+        return;
+      }
+      case "revokeProfile": {
+        await standingGrantsReady;
+        const profile = enrolledProfiles.find((record) => record.name === message.profileName);
+        if (!profile) throw new Error("This agent profile is not enrolled.");
+        postNative({ version: PROTOCOL_VERSION, type: "revokeProfile", requestId: newRequestId(), profileName: profile.name });
+        standingGrants = standingGrants.filter((grant) => grant.controllerId !== profile.principalId);
+        await saveStandingGrants();
         sendResponse({ ok: true });
         return;
       }

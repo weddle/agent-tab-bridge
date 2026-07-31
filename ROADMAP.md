@@ -83,7 +83,8 @@ Implemented in the prototype:
 - One visibly named, access-color-coded tab group per session.
 - `atb run -- <agent command>` with an ephemeral child-only `BROWSER_CDP_URL`.
 - Reusable named sessions, separately approved monotonic access upgrades, tab inventory, and explicit tab claiming.
-- Popup views for pending approvals, active sessions, shared tabs, controller identity, connection health, and tab/session/device revocation.
+- Named agent-profile enrollment with challenge-response authentication, revocation, and profile-keyed standing grants for selected-tab or domain-scoped session starts.
+- Popup views for pending approvals, active sessions, shared tabs, enrolled profiles, standing grants, controller identity, connection health, and tab/session/profile/device revocation.
 - CDP target and method policies that deny profile-scoped operations, out-of-session targets, and site-scope violations.
 
 Remaining before calling Release 1 complete:

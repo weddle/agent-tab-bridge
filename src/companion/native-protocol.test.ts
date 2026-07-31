@@ -53,5 +53,11 @@ describe("native protocol validation", () => {
     expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "confirmEnrollment", requestId: "req-1", enrollmentId: "enroll-1", code: "12345" })).toBe(false);
     expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: "req-1", enrollmentId: "enroll-1", ok: true, profileName: "hermes-research" })).toBe(true);
     expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: "req-1", enrollmentId: "enroll-1", ok: false, error: "incorrect code", unexpected: 1 })).toBe(false);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "revokeProfile", requestId: "req-2", profileName: "hermes-research" })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "revokeProfile", requestId: "req-2", profileName: "bad/name" })).toBe(false);
+    const snapshot = { version: NATIVE_PROTOCOL_VERSION, type: "snapshot", pending: [], active: [], sharedTabs: [], pendingAccess: [] } as const;
+    expect(validateNativeMessage(snapshot)).toBe(true);
+    expect(validateNativeMessage({ ...snapshot, enrolledProfiles: [{ name: "hermes-research", principalId: "sha256/abc", enrolledAt: 10 }] })).toBe(true);
+    expect(validateNativeMessage({ ...snapshot, enrolledProfiles: [{ name: "hermes-research", principalId: "not-a-fingerprint", enrolledAt: 10 }] })).toBe(false);
   });
 });

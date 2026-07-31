@@ -265,6 +265,14 @@
     <footer class="device" aria-labelledby="deviceHeading">
       <h2 id="deviceHeading">Device</h2>
       <p id="deviceIdentity" class="meta">No companion paired.</p>
+      <div id="profilesBlock" class="hidden">
+        <h3 id="profilesHeading" class="meta">Enrolled agent profiles</h3>
+        <ul id="profilesList" class="tabs" aria-labelledby="profilesHeading"></ul>
+      </div>
+      <div id="grantsBlock" class="hidden">
+        <h3 id="grantsHeading" class="meta">Standing grants</h3>
+        <ul id="grantsList" class="tabs" aria-labelledby="grantsHeading"></ul>
+      </div>
       <p id="forgetCompanionHint" class="hint">
         Stops all sessions and removes the stored companion identity. Pairing must be repeated
         before access can be granted again.

@@ -9,6 +9,7 @@ import { TaskSessionError, type TaskSession, type TaskSessionManager } from "./t
 import { isStableSessionKey } from "./stable-session-key.js";
 import { isSessionAccessDelta, type SessionAccess, type SessionAccessDelta } from "./session-access.js";
 import type { AccessUpgradeRecord } from "./native-protocol.js";
+import { setTimeout as delay } from "node:timers/promises";
 
 export const BROKER_MAX_LINE_BYTES = 1024 * 1024;
 export type BrokerCommand = "status" | "listTabs" | "claimTab" | "openSession" | "sessionUrl" | "requestAccess" | "revokeSession" | "closeSession" | "enrollProfile";
@@ -24,14 +25,11 @@ const id = (value: unknown): value is string => typeof value === "string" && val
 function matches(expected: string, actual: unknown): boolean { if (typeof actual !== "string") return false; const a = Buffer.from(expected), b = Buffer.from(actual), p = Buffer.alloc(a.length); b.copy(p, 0, 0, Math.min(a.length, b.length)); return a.length === b.length && timingSafeEqual(a, p); }
 function code(error: unknown): string { return error instanceof TaskSessionError ? error.code : "invalidRequest"; }
 function message(error: unknown): string { return error instanceof Error ? error.message : "invalid broker request"; }
-async function prepareSocketPath(socketPath: string): Promise<void> {
-  try {
-    if (!(await lstat(socketPath)).isSocket()) throw new Error("broker socket path exists and is not a socket");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
-  }
-  const live = await new Promise<boolean>((resolve, reject) => {
+const SOCKET_CLOSE_GRACE_MS = 1_000;
+const SOCKET_CLOSE_POLL_MS = 10;
+
+async function socketAcceptsConnections(socketPath: string): Promise<boolean> {
+  return await new Promise<boolean>((resolve, reject) => {
     const probe = createConnection(socketPath);
     probe.once("connect", () => { probe.destroy(); resolve(true); });
     probe.once("error", (error) => {
@@ -40,7 +38,37 @@ async function prepareSocketPath(socketPath: string): Promise<void> {
       else reject(error);
     });
   });
-  if (live) throw new Error("Agent Tab Bridge broker is already running");
+}
+async function prepareSocketPath(socketPath: string): Promise<void> {
+  try {
+    if (!(await lstat(socketPath)).isSocket()) throw new Error("broker socket path exists and is not a socket");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (await socketAcceptsConnections(socketPath)) {
+    throw new Error("Agent Tab Bridge broker is already running");
+  }
+
+  // A closing Unix server stops accepting before Node removes its socket path.
+  // Wait for that cleanup instead of unlinking early: binding a replacement
+  // during this window lets the old server remove the replacement's pathname.
+  const deadline = Date.now() + SOCKET_CLOSE_GRACE_MS;
+  while (Date.now() < deadline) {
+    try {
+      await lstat(socketPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    await delay(SOCKET_CLOSE_POLL_MS);
+  }
+
+  // A crashed process can leave a genuinely stale pathname. Re-probe before
+  // removing it so a broker that appeared during the grace period wins.
+  if (await socketAcceptsConnections(socketPath)) {
+    throw new Error("Agent Tab Bridge broker is already running");
+  }
   await rm(socketPath);
 }
 

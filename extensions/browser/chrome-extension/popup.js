@@ -34,6 +34,10 @@ const deviceIdentity = document.getElementById("deviceIdentity");
 const forgetButton = document.getElementById("forgetCompanionButton");
 const forgetAnnounce = document.getElementById("forgetAnnounce");
 
+const profilesBlock = document.getElementById("profilesBlock");
+const profilesList = document.getElementById("profilesList");
+const grantsBlock = document.getElementById("grantsBlock");
+const grantsList = document.getElementById("grantsList");
 const POLL_INTERVAL_MS = 2_000;
 const FORGET_CONFIRM_MS = 5_000;
 const DEVICE_KEY = "\u0000device";
@@ -45,6 +49,8 @@ let state = {
   activeSessions: [],
   pendingAccess: [],
   pendingEnrollments: [],
+  enrolledProfiles: [],
+  standingGrants: [],
   sharedTabs: [],
 };
 let currentTab = null;
@@ -260,6 +266,7 @@ function pendingSignature(session) {
     typeof session?.controllerId === "string" ? session.controllerId : "",
     formatCapabilities(session?.capabilities),
     JSON.stringify(session?.access ?? null),
+    state.enrolledProfiles.some((profile) => profile?.principalId === session?.controllerId) ? "enrolled" : "",
   ].join(UNIT);
 }
 
@@ -302,10 +309,21 @@ function buildPendingCard(session) {
   const remainingEl = makeElement("p", "meta remaining", formatRemaining(session));
   card.append(remainingEl);
 
+  let remember = null;
+  const isEnrolledProfile = state.enrolledProfiles.some((profile) => profile?.principalId === session?.controllerId);
+  if (isEnrolledProfile && accessLevel(session) !== "full") {
+    const label = makeElement("label", "meta remember");
+    remember = document.createElement("input");
+    remember.type = "checkbox";
+    remember.className = "atb-remember";
+    label.append(remember, document.createTextNode(" Remember for this agent: auto-approve future sessions up to this level (never full access)"));
+    card.append(label);
+  }
+
   const decline = makeButton("Decline", "secondary");
   decline.addEventListener("click", () => void mutateSession("revokeSession", id, decline));
   const approve = makeButton("Approve", "primary");
-  approve.addEventListener("click", () => void mutateSession("approveSession", id, approve));
+  approve.addEventListener("click", () => void runMutation(id, approve, { type: "approveSession", sessionId: id, remember: remember?.checked === true }, "The companion rejected this action."));
   const actions = makeElement("div", "actions");
   actions.append(decline, approve);
   card.append(actions);
@@ -602,7 +620,37 @@ function render() {
   reconcile(activeList, activeCards, active, activeSignature, buildActiveCard);
   setHidden(activeEmpty, active.length > 0);
 
+  renderProfilesAndGrants();
   renderDevice(companion);
+}
+
+function renderProfilesAndGrants() {
+  const profiles = state.enrolledProfiles;
+  const grants = state.standingGrants;
+  setHidden(profilesBlock, profiles.length === 0);
+  setHidden(grantsBlock, grants.length === 0);
+  if (holdsUserContext(profilesList) || holdsUserContext(grantsList)) return;
+  profilesList.replaceChildren(...profiles.map((profile) => {
+    const item = makeElement("li");
+    item.append(
+      makeElement("span", "tab-title", `${profile.name} · ${abbreviate(profile.principalId)}`),
+    );
+    const revoke = makeButton("Revoke", "secondary");
+    if (inFlight.has(profile.principalId)) revoke.disabled = true;
+    revoke.addEventListener("click", () => void runMutation(profile.principalId, revoke, { type: "revokeProfile", profileName: profile.name }, "The companion rejected this profile revocation."));
+    item.append(revoke);
+    return item;
+  }));
+  grantsList.replaceChildren(...grants.map((grant) => {
+    const item = makeElement("li");
+    const scope = grant.level === "domains" ? `sites: ${grant.domains.join(", ") || "none"}` : "selected tabs only";
+    item.append(makeElement("span", "tab-title", `${grant.controllerName} · auto-approve up to ${scope}`));
+    const forget = makeButton("Forget", "secondary");
+    if (inFlight.has(`grant:${grant.controllerId}`)) forget.disabled = true;
+    forget.addEventListener("click", () => void runMutation(`grant:${grant.controllerId}`, forget, { type: "revokeGrant", controllerId: grant.controllerId }, "The standing grant could not be removed."));
+    item.append(forget);
+    return item;
+  }));
 }
 
 async function queryActiveTab() {
@@ -628,6 +676,8 @@ async function refresh() {
       activeSessions: Array.isArray(result.activeSessions) ? result.activeSessions : [],
       pendingAccess: Array.isArray(result.pendingAccess) ? result.pendingAccess : [],
       pendingEnrollments: Array.isArray(result.pendingEnrollments) ? result.pendingEnrollments : [],
+      enrolledProfiles: Array.isArray(result.enrolledProfiles) ? result.enrolledProfiles : [],
+      standingGrants: Array.isArray(result.standingGrants) ? result.standingGrants : [],
       sharedTabs: Array.isArray(result.sharedTabs) ? result.sharedTabs : [],
     };
     currentTab = tab;

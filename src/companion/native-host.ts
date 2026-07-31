@@ -149,7 +149,9 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
   };
   const snapshot = async () => {
     const all = sessions.snapshot().map((session) => ({ ...session, requestedCapabilities: [...session.requestedCapabilities], access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] } }));
-    await send({ version: NATIVE_PROTOCOL_VERSION, type: "snapshot", pending: all.filter(({ state }) => state === "pending"), active: all.filter(({ state }) => state === "active"), sharedTabs: [], pendingAccess: [...pendingAccess.values()] });
+    const current = await stateStore.load();
+    const enrolledProfiles = (current.enrolledProfiles ?? []).map(({ name, principalId, enrolledAt }) => ({ name, principalId, enrolledAt }));
+    await send({ version: NATIVE_PROTOCOL_VERSION, type: "snapshot", pending: all.filter(({ state }) => state === "pending"), active: all.filter(({ state }) => state === "active"), sharedTabs: [], pendingAccess: [...pendingAccess.values()], enrolledProfiles });
   };
   await new Promise<void>((resolve) => {
     finishHost = () => { if (ending) return; ending = true; void outputTail.then(stop, stop).then(() => resolve(), () => resolve()); };
@@ -236,10 +238,20 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
           await send({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: message.requestId, enrollmentId: message.enrollmentId, ok: true, profileName: pending.profileName });
           return;
         }
+        if (message.type === "revokeProfile") {
+          const current = await stateStore.load();
+          const record = (current.enrolledProfiles ?? []).find((profile) => profile.name === message.profileName);
+          if (record) {
+            await stateStore.update((state) => ({ ...state, enrolledProfiles: (state.enrolledProfiles ?? []).filter((profile) => profile.name !== message.profileName) }));
+            await Promise.allSettled(sessions.snapshot().filter((session) => session.controllerPrincipalId === record.principalId && session.state !== "revoked").map(async (session) => await sessions.revoke(session.id, "profileRevoked")));
+          }
+          await snapshot();
+          return;
+        }
         if (message.type === "revokeSession" && sessions.get(message.sessionId)) { await sessions.revoke(message.sessionId, message.reason ?? "browserRevoked"); return; }
         if (message.type === "relayReady") { sessions.relayReady(message.sessionId); await snapshot(); return; }
         if (message.type === "relayFailed" && sessions.get(message.sessionId)) await sessions.relayFailed(message.sessionId, "relayFailed");
-      } catch (error) { if (error instanceof NativeOutputFailure) throw error; if (message.type === "helloProof" || message.type === "approveSession" || message.type === "approveAccess" || message.type === "declineAccess" || message.type === "confirmEnrollment" || message.type === "revokeSession" || message.type === "relayReady" || message.type === "relayFailed") return; throw error; }
+      } catch (error) { if (error instanceof NativeOutputFailure) throw error; if (message.type === "helloProof" || message.type === "approveSession" || message.type === "approveAccess" || message.type === "declineAccess" || message.type === "confirmEnrollment" || message.type === "revokeProfile" || message.type === "revokeSession" || message.type === "relayReady" || message.type === "relayFailed") return; throw error; }
     }
   });
 }

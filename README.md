@@ -88,6 +88,8 @@ Agent Tab Bridge separates device trust, session scope, and actual tab control:
 | Layer | What it grants | What it does not grant |
 |---|---|---|
 | Paired companion | Authenticated Native Messaging and enumeration of eligible HTTP/HTTPS tab IDs, titles, URLs, and ownership state | Page content or CDP control |
+| Enrolled agent profile | Challenge-response broker authentication under a named public-key principal | Any browser session or tab access by itself |
+| Standing session grant | Automatic approval of future sessions from one enrolled principal up to selected-tab or listed-domain scope | Full website access, access upgrades, or authority for another principal |
 | Approved task session | Permission to claim selected tab IDs, matching domains, or any website under an elevated full-access grant | Control of tabs not in that session's group |
 | Session-owned tab group | CDP discovery and control for those grouped tabs through that session's relay | Access to ungrouped tabs or tabs owned by another session |
 
@@ -165,6 +167,10 @@ node dist/src/atb.js url --profile hermes-research --session research
 ```
 
 Named sessions belong to the principal that opened them: a different profile, or the default controller, cannot fetch or close another principal's session. Profile keys are stored as user-only files under the companion state directory (portable; no macOS Keychain). On a single machine this separates and names principals but is not a boundary against other processes running as the same user; the pairing-code ceremony is the enrollment bootstrap that remains valid when the broker later accepts non-local transports.
+
+For an enrolled profile, a session approval can optionally remember its selected-tab or domain scope. The extension stores that standing grant in `chrome.storage.local`, keyed to the profile principal, and future sessions at or below the remembered scope are approved automatically. Full website access is never remembered, and every monotonic access upgrade still requires a separate popup approval.
+
+The popup lists enrolled profiles and standing grants under **Device**. **Forget** removes one standing grant immediately. **Revoke** removes the companion's enrollment record, revokes that principal's live and pending sessions, and removes its standing grant; it does not delete the agent-side private key, which can be enrolled again later.
 
 Close a named session explicitly when the task is finished:
 
