@@ -10,12 +10,15 @@ import path from "node:path";
 import { extensionOriginFromManifest, installNativeManifests, nativeManifestStatus, uninstallNativeManifests, DEFAULT_NATIVE_HOST_NAME } from "./companion/manifest.js";
 import { ensureApplicationSupportDirectory, CompanionStateStore } from "./companion/state.js";
 import { createBrokerSecret, IdentityStore } from "./companion/identity.js";
+import { MAX_TASK_LABEL_LENGTH } from "./companion/native-protocol.js";
+import { assertStableSessionKey } from "./companion/stable-session-key.js";
 
 export type CliCommand =
   | { kind: "install"; extensionManifest?: string; executable?: string; home?: string }
   | { kind: "uninstall"; extensionManifest?: string; executable?: string; home?: string }
   | { kind: "status"; extensionManifest?: string; executable?: string; home?: string }
-  | { kind: "run"; argv: string[]; label?: string; ttlMs?: number }
+  | { kind: "run"; argv: string[]; label?: string; ttlMs?: number; stableSessionKey?: string }
+  | { kind: "close"; stableSessionKey: string }
   | { kind: "nativeHost" };
 
 function requiredOptionValue(option: string, value: string | undefined): string {
@@ -28,9 +31,10 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   const [first, ...rest] = argv;
   if (first === "run") {
     const separator = rest.indexOf("--");
-    if (separator < 0 || separator === rest.length - 1) throw new Error("usage: atb run [--label <text>] [--ttl-ms <integer>] -- <command> [args...]");
+    if (separator < 0 || separator === rest.length - 1) throw new Error("usage: atb run [--session <stable-key>] [--label <text>] [--ttl-ms <integer>] -- <command> [args...]");
     let label: string | undefined;
     let ttlMs: number | undefined;
+    let stableSessionKey: string | undefined;
     for (let index = 0; index < separator; index += 1) {
       const value = rest[index];
       if (value === "--label") {
@@ -41,11 +45,19 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
         const parsed = Number(raw);
         if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error("--ttl-ms requires a positive integer");
         ttlMs = parsed;
+      } else if (value === "--session") {
+        if (stableSessionKey !== undefined) throw new Error("--session may be specified only once");
+        stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
       } else {
         throw new Error(`unknown run option: ${value}`);
       }
     }
-    return { kind: "run", argv: rest.slice(separator + 1), ...(label === undefined ? {} : { label }), ...(ttlMs === undefined ? {} : { ttlMs }) };
+    if (stableSessionKey !== undefined && !label?.trim()) throw new Error("--session requires a non-empty --label");
+    return { kind: "run", argv: rest.slice(separator + 1), ...(label === undefined ? {} : { label }), ...(ttlMs === undefined ? {} : { ttlMs }), ...(stableSessionKey === undefined ? {} : { stableSessionKey }) };
+  }
+  if (first === "close") {
+    if (rest.length !== 2 || rest[0] !== "--session") throw new Error("usage: atb close --session <stable-key>");
+    return { kind: "close", stableSessionKey: assertStableSessionKey(requiredOptionValue("--session", rest[1])) };
   }
   if (first === "native-host") return { kind: "nativeHost" };
   if (first === "install" || first === "uninstall" || first === "status") {
@@ -85,9 +97,11 @@ export type BrokerClient = {
 export type ChildLike = Pick<ChildProcess, "once" | "on" | "kill">;
 export type RunDeps = { broker: BrokerClient; spawn?: typeof nodeSpawn; processEnv?: NodeJS.ProcessEnv; signalSource?: NodeJS.Process };
 
-const MAX_LABEL_LENGTH = 256;
+const MAX_LABEL_LENGTH = MAX_TASK_LABEL_LENGTH;
 function boundedLabel(argv: readonly string[], explicit?: string): string {
-  return (explicit?.trim() || path.basename(argv[0] ?? "agent")).slice(0, MAX_LABEL_LENGTH);
+  const label = explicit?.trim() || path.basename(argv[0] ?? "agent");
+  if (label.length > MAX_LABEL_LENGTH) throw new Error(`label must be at most ${MAX_LABEL_LENGTH} characters`);
+  return label;
 }
 function eventName(event: BrokerEvent): string { return String(event.event ?? event.type ?? "").toLowerCase(); }
 function eventSessionId(event: BrokerEvent): string | undefined {
@@ -108,8 +122,12 @@ function signalNumber(signal: NodeJS.Signals): number {
   return osConstants.signals[signal] ?? 1;
 }
 
-/** Run one approved session and revoke it on every child, broker, or signal path. */
-export async function runAgentCommand(argv: readonly string[], deps: RunDeps, options: { label?: string; ttlMs?: number } = {}): Promise<number> {
+/** Run one approved session; unnamed sessions are revoked when their child exits. */
+export async function runAgentCommand(argv: readonly string[], deps: RunDeps, options: { label?: string; ttlMs?: number; stableSessionKey?: string } = {}): Promise<number> {
+  if (options.stableSessionKey !== undefined) {
+    assertStableSessionKey(options.stableSessionKey);
+    if (!options.label?.trim()) throw new Error("--session requires a non-empty --label");
+  }
   if (!argv.length) throw new Error("run command must not be empty");
   const ttlMs = options.ttlMs === undefined
     ? undefined
@@ -139,6 +157,7 @@ export async function runAgentCommand(argv: readonly string[], deps: RunDeps, op
       taskLabel: boundedLabel(argv, options.label),
       requestedCapabilities: ["cdp"],
       ...(ttlMs === undefined ? {} : { ttlMs }),
+      ...(options.stableSessionKey === undefined ? {} : { stableSessionKey: options.stableSessionKey }),
     });
     if (result && typeof result === "object") {
       const record = result as Record<string, unknown>;
@@ -157,7 +176,16 @@ export async function runAgentCommand(argv: readonly string[], deps: RunDeps, op
     return await runChildWithUrl(argv, cdpUrl, deps, sessionId);
   } finally {
     removeEvent?.();
-    if (sessionId) await revokeQuietly(deps.broker, sessionId);
+    if (sessionId && options.stableSessionKey === undefined) await revokeQuietly(deps.broker, sessionId);
+    await deps.broker.close?.();
+  }
+}
+export async function closeAgentSession(stableSessionKey: string, deps: Pick<RunDeps, "broker">): Promise<number> {
+  assertStableSessionKey(stableSessionKey);
+  try {
+    await deps.broker.request("closeSession", { stableSessionKey });
+    return 0;
+  } finally {
     await deps.broker.close?.();
   }
 }
@@ -193,7 +221,11 @@ export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {})
   }
   if (command.kind === "run") {
     const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
-    return runAgentCommand(command.argv, { ...deps, broker } as RunDeps, { label: command.label, ttlMs: command.ttlMs });
+    return runAgentCommand(command.argv, { ...deps, broker } as RunDeps, { label: command.label, ttlMs: command.ttlMs, stableSessionKey: command.stableSessionKey });
+  }
+  if (command.kind === "close") {
+    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    return closeAgentSession(command.stableSessionKey, { broker });
   }
   const extensionOrigin = await extensionOriginFromManifest(command.extensionManifest);
   const executablePath = path.resolve(command.executable ?? process.argv[1] ?? process.execPath);

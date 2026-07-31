@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { createBrokerClient } from "./broker-client.js";
 import { startBrokerServer } from "./broker.js";
 import { TaskSessionManager } from "./task-sessions.js";
 
@@ -16,5 +17,45 @@ describe("BrokerServer socket ownership", () => {
     const first = await startBrokerServer(options);
     await expect(startBrokerServer(options)).rejects.toThrow("already running");
     await first.close();
+  });
+  it("reuses a named approved session across separate broker clients and closes it by stable key", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "atb-broker-")); directories.push(directory);
+    const sessions = new TaskSessionManager({
+      idFactory: () => "named-session",
+      startRelay: async () => ({ pairingUrl: "ws://127.0.0.1/extension#token", cdpUrl: "ws://127.0.0.1/cdp?token=token", close: async () => undefined }),
+    });
+    const token = "a".repeat(32);
+    const broker = await startBrokerServer({
+      socketPath: join(directory, "broker.sock"),
+      token,
+      sessions,
+      isTrusted: () => true,
+      controller: () => ({ principalId: "controller-1", displayName: "CLI" }),
+    });
+    try {
+      const first = createBrokerClient({ socketPath: broker.socketPath, token });
+      const opened = await first.request("openSession", { taskLabel: "Research", requestedCapabilities: ["cdp"], stableSessionKey: "research" }) as { session: { id: string } };
+      await first.close();
+      await sessions.approve(opened.session.id);
+      sessions.relayReady(opened.session.id);
+
+      const later = createBrokerClient({ socketPath: broker.socketPath, token });
+      await expect(later.request("openSession", { taskLabel: "Research", requestedCapabilities: ["cdp"], stableSessionKey: "research" })).resolves.toMatchObject({
+        session: { id: opened.session.id },
+        cdpUrl: "ws://127.0.0.1/cdp?token=token",
+      });
+      await later.close();
+      expect(sessions.get(opened.session.id)).toMatchObject({ state: "active" });
+
+      const conflicting = createBrokerClient({ socketPath: broker.socketPath, token });
+      await expect(conflicting.request("openSession", { taskLabel: "Different task", requestedCapabilities: ["cdp"], stableSessionKey: "research" })).rejects.toThrow(/different label or capabilities/);
+      await conflicting.close();
+
+      const closer = createBrokerClient({ socketPath: broker.socketPath, token });
+      await expect(closer.request("closeSession", { stableSessionKey: "research" })).resolves.toMatchObject({ session: { id: opened.session.id, state: "revoked" } });
+      await closer.close();
+    } finally {
+      await broker.close();
+    }
   });
 });

@@ -4,11 +4,12 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { join } from "node:path";
 import { applicationSupportDirectory, type ApplicationSupportOptions } from "./state.js";
 import { TaskSessionError, type TaskSession, type TaskSessionManager } from "./task-sessions.js";
+import { isStableSessionKey } from "./stable-session-key.js";
 
 export const BROKER_MAX_LINE_BYTES = 1024 * 1024;
-export type BrokerCommand = "status" | "openSession" | "revokeSession";
+export type BrokerCommand = "status" | "openSession" | "revokeSession" | "closeSession";
 export type BrokerAuthRequest = Readonly<{ type: "auth"; token: string }>;
-export type BrokerCommandRequest = Readonly<{ id: string; command: BrokerCommand; taskLabel?: string; requestedCapabilities?: string[]; ttlMs?: number; sessionId?: string; reason?: string }>;
+export type BrokerCommandRequest = Readonly<{ id: string; command: BrokerCommand; taskLabel?: string; requestedCapabilities?: string[]; ttlMs?: number; stableSessionKey?: string; sessionId?: string; reason?: string }>;
 export type BrokerAuthOk = Readonly<{ type: "authOk" }>;
 export type BrokerResponse = Readonly<{ id: string; ok: true; result: unknown }> | Readonly<{ id: string; ok: false; error: { code: string; message: string } }>;
 export type BrokerEvent = Readonly<{ event: "pending" | "active" | "revoked" | "hostClosing"; sessionId?: string; session?: TaskSession; cdpUrl?: string; reason?: string }>;
@@ -43,7 +44,7 @@ async function prepareSocketPath(socketPath: string): Promise<void> {
 export class BrokerServer {
   readonly socketPath: string;
   private readonly clients = new Set<Socket>();
-  private readonly sessionOwners = new Map<string, Socket>();
+  private readonly sessionOwners = new Map<string, { sockets: Set<Socket>; revokeOnDisconnect: boolean }>();
   private readonly pendingEvents = new Map<string, BrokerEvent[]>();
 
   private readonly connections = new Set<Socket>();
@@ -63,9 +64,9 @@ export class BrokerServer {
   publish(event: BrokerEvent): void {
     if (this.closed) return;
     if (!event.sessionId) { const line = JSON.stringify(event) + "\n"; for (const socket of this.clients) if (!socket.destroyed) socket.write(line); return; }
-    const owner = this.sessionOwners.get(event.sessionId);
-    if (!owner) { if (event.event === "pending") { const pending = this.pendingEvents.get(event.sessionId) ?? []; pending.push(event); this.pendingEvents.set(event.sessionId, pending); } return; }
-    if (!owner.destroyed && this.clients.has(owner)) owner.write(JSON.stringify(event) + "\n");
+    const owners = this.sessionOwners.get(event.sessionId);
+    if (!owners) { if (event.event === "pending") { const pending = this.pendingEvents.get(event.sessionId) ?? []; pending.push(event); this.pendingEvents.set(event.sessionId, pending); } return; }
+    for (const socket of owners.sockets) if (!socket.destroyed && this.clients.has(socket)) socket.write(JSON.stringify(event) + "\n");
   }
 
   async close(): Promise<void> {
@@ -73,8 +74,10 @@ export class BrokerServer {
     for (const socket of this.connections) { socket.end('{"event":"hostClosing"}\n'); socket.destroy(); }
     this.clients.clear(); this.connections.clear(); this.sessionOwners.clear(); this.pendingEvents.clear(); await new Promise<void>((resolve) => this.server.close(() => resolve())); await rm(this.socketPath, { force: true });
   }
-  private bindSessionOwner(sessionId: string, socket: Socket): void {
-    this.sessionOwners.set(sessionId, socket);
+  private bindSessionOwner(sessionId: string, socket: Socket, revokeOnDisconnect: boolean): void {
+    const owners = this.sessionOwners.get(sessionId) ?? { sockets: new Set<Socket>(), revokeOnDisconnect };
+    owners.sockets.add(socket);
+    this.sessionOwners.set(sessionId, owners);
     const pending = this.pendingEvents.get(sessionId);
     if (pending) { this.pendingEvents.delete(sessionId); for (const event of pending) if (!socket.destroyed) socket.write(JSON.stringify(event) + "\n"); }
   }
@@ -82,7 +85,18 @@ export class BrokerServer {
   private accept(socket: Socket): void {
     if (this.closed) { socket.destroy(); return; }
     this.connections.add(socket); let input = Buffer.alloc(0), authenticated = false; const requestIds = new Set<string>();
-    socket.on("error", () => {}); socket.on("close", () => { this.clients.delete(socket); this.connections.delete(socket); const owned = [...this.sessionOwners.entries()].filter(([, owner]) => owner === socket).map(([sessionId]) => sessionId); for (const [sessionId] of owned) this.sessionOwners.delete(sessionId); void Promise.allSettled(owned.map(async (sessionId) => await this.options.sessions.revoke(sessionId, "controllerDisconnected"))); });
+    socket.on("error", () => {}); socket.on("close", () => {
+      this.clients.delete(socket);
+      this.connections.delete(socket);
+      const revokeOnDisconnect: string[] = [];
+      for (const [sessionId, owners] of this.sessionOwners) {
+        if (!owners.sockets.delete(socket)) continue;
+        if (owners.sockets.size !== 0) continue;
+        this.sessionOwners.delete(sessionId);
+        if (owners.revokeOnDisconnect) revokeOnDisconnect.push(sessionId);
+      }
+      void Promise.allSettled(revokeOnDisconnect.map(async (sessionId) => await this.options.sessions.revoke(sessionId, "controllerDisconnected")));
+    });
     socket.on("data", (chunk: Buffer) => {
       input = input.length ? Buffer.concat([input, chunk]) : Buffer.from(chunk);
       if (input.length > BROKER_MAX_LINE_BYTES) { socket.destroy(); return; }
@@ -100,7 +114,7 @@ export class BrokerServer {
     });
   }
   private async command(socket: Socket, value: unknown, requestIds: Set<string>): Promise<void> {
-    if (!object(value) || !id(value.id) || (value.command !== "status" && value.command !== "openSession" && value.command !== "revokeSession")) { socket.write('{"id":"","ok":false,"error":{"code":"invalidRequest","message":"invalid broker command"}}\n'); return; }
+    if (!object(value) || !id(value.id) || (value.command !== "status" && value.command !== "openSession" && value.command !== "revokeSession" && value.command !== "closeSession")) { socket.write('{"id":"","ok":false,"error":{"code":"invalidRequest","message":"invalid broker command"}}\n'); return; }
     const request = value as BrokerCommandRequest;
     if (requestIds.has(request.id)) { socket.write(JSON.stringify({ id: request.id, ok: false, error: { code: "replayedRequest", message: "request ID was already used" } } satisfies BrokerResponse) + "\n"); return; }
     requestIds.add(request.id);
@@ -112,12 +126,20 @@ export class BrokerServer {
         if (!this.options.isTrusted()) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
         const controller = this.options.controller(); if (!controller) throw new TaskSessionError("invalidSession", "browser identity is unavailable");
         if (typeof request.taskLabel !== "string" || !Array.isArray(request.requestedCapabilities)) throw new TaskSessionError("invalidSession", "taskLabel and requestedCapabilities are required");
-        const session = this.options.sessions.open({ controllerPrincipalId: controller.principalId, controllerName: controller.displayName, taskLabel: request.taskLabel, capabilities: request.requestedCapabilities, ttlMs: request.ttlMs });
-        this.bindSessionOwner(session.id, socket);
-        result = { session };
+        if (request.stableSessionKey !== undefined && !isStableSessionKey(request.stableSessionKey)) throw new TaskSessionError("invalidSession", "stableSessionKey is invalid");
+        const session = this.options.sessions.open({ controllerPrincipalId: controller.principalId, controllerName: controller.displayName, taskLabel: request.taskLabel, capabilities: request.requestedCapabilities, ttlMs: request.ttlMs, ...(request.stableSessionKey === undefined ? {} : { stableSessionKey: request.stableSessionKey }) });
+        this.bindSessionOwner(session.id, socket, request.stableSessionKey === undefined);
+        const cdpUrl = this.options.sessions.cdpUrl(session.id);
+        result = { session, ...(cdpUrl === undefined ? {} : { cdpUrl }) };
+      } else if (request.command === "closeSession") {
+        if (!this.options.isTrusted()) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
+        const controller = this.options.controller(); if (!controller) throw new TaskSessionError("invalidSession", "browser identity is unavailable");
+        if (!isStableSessionKey(request.stableSessionKey)) throw new TaskSessionError("invalidSession", "stableSessionKey is required");
+        result = { session: await this.options.sessions.revokeNamed(controller.principalId, request.stableSessionKey, request.reason ?? "cliClosed") };
       } else {
         if (typeof request.sessionId !== "string") throw new TaskSessionError("invalidSession", "sessionId is required");
-        if (this.sessionOwners.get(request.sessionId) !== socket) throw new TaskSessionError("invalidSession", "session is owned by another controller");
+        if (this.options.sessions.isReusable(request.sessionId)) throw new TaskSessionError("invalidSession", "named reusable sessions must be closed with their stable session key");
+        if (!this.sessionOwners.get(request.sessionId)?.sockets.has(socket)) throw new TaskSessionError("invalidSession", "session is owned by another controller");
         result = { session: await this.options.sessions.revoke(request.sessionId, request.reason ?? "cliRevoked") };
       }
       socket.write(JSON.stringify({ id: request.id, ok: true, result } satisfies BrokerResponse) + "\n");

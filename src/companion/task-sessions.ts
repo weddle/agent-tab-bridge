@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { isStableSessionKey } from "./stable-session-key.js";
 export const TASK_SESSION_CAPABILITIES = ["cdp"] as const;
 export type TaskSessionCapability = (typeof TASK_SESSION_CAPABILITIES)[number];
 export type TaskSessionState = "pending" | "active" | "revoked";
@@ -7,44 +8,68 @@ export const MAX_REVOKED_TASK_SESSION_TOMBSTONES = 64;
 export const MAX_TASK_SESSION_TTL_MS = 24 * 60 * 60_000;
 export type TaskSession = Readonly<{ id: string; controllerPrincipalId: string; displayControllerName: string; taskLabel: string; requestedCapabilities: readonly TaskSessionCapability[]; createdAt: number; expiresAt: number | null; state: TaskSessionState }>;
 export type TaskSessionRelay = Readonly<{ pairingUrl: string; cdpUrl: string; close: () => Promise<void> }>;
-export type OpenTaskSessionInput = Readonly<{ controllerPrincipalId: string; controllerName: string; taskLabel: string; capabilities: readonly string[]; ttlMs?: number }>;
+export type OpenTaskSessionInput = Readonly<{ controllerPrincipalId: string; controllerName: string; taskLabel: string; capabilities: readonly string[]; ttlMs?: number; stableSessionKey?: string }>;
 export type SessionApproval = Readonly<{ session: TaskSession; pairingUrl: string }>;
 export type SessionLifecycleEvent = Readonly<{ type: "pending"; session: TaskSession }> | Readonly<{ type: "active"; session: TaskSession; cdpUrl: string }> | Readonly<{ type: "revoked"; session: TaskSession; reason: string }>;
 export type TaskSessionManagerOptions = Readonly<{ startRelay: () => Promise<TaskSessionRelay>; now?: () => number; setTimer?: (callback: () => void, delayMs: number) => NodeJS.Timeout; clearTimer?: (timer: NodeJS.Timeout | null) => void; idFactory?: () => string; onEvent?: (event: SessionLifecycleEvent) => void }>;
-type Stored = { session: TaskSession; relay: TaskSessionRelay | null; approval: Promise<SessionApproval> | null; ready: boolean; timer: NodeJS.Timeout | null; revoking: Promise<TaskSession> | null };
-export class TaskSessionError extends Error { constructor(readonly code: "invalidSession" | "unsupportedCapability" | "invalidTtl" | "notPending" | "notActive" | "notFound", message: string) { super(message); this.name = "TaskSessionError"; } }
+type Stored = { session: TaskSession; stableSessionKey: string | null; relay: TaskSessionRelay | null; approval: Promise<SessionApproval> | null; ready: boolean; timer: NodeJS.Timeout | null; revoking: Promise<TaskSession> | null };
+export class TaskSessionError extends Error { constructor(readonly code: "invalidSession" | "unsupportedCapability" | "invalidTtl" | "notPending" | "notActive" | "notFound" | "sessionConflict", message: string) { super(message); this.name = "TaskSessionError"; } }
 const clone = (session: TaskSession): TaskSession => ({ ...session, requestedCapabilities: [...session.requestedCapabilities] });
 const changed = (session: TaskSession, state: TaskSessionState): TaskSession => ({ ...session, state, requestedCapabilities: [...session.requestedCapabilities] });
-function display(value: string, field: string): string { const result = value.trim().slice(0, 128); if (!result) throw new TaskSessionError("invalidSession", `${field} must not be empty`); return result; }
+function text(value: string, field: string, max = 128): string { const result = value.trim(); if (!result) throw new TaskSessionError("invalidSession", `${field} must not be empty`); if (result.length > max) throw new TaskSessionError("invalidSession", `${field} is too long`); return result; }
+const sameCapabilities = (left: readonly TaskSessionCapability[], right: readonly TaskSessionCapability[]): boolean => left.length === right.length && left.every((capability, index) => capability === right[index]);
 /** Isolated sessions: a pending session never creates or owns a relay. */
 export class TaskSessionManager {
   private readonly stored = new Map<string, Stored>();
+  /** In-memory only: never copied into a native-session DTO or persisted state. */
+  private readonly reusableSessionIds = new Map<string, string>();
   private readonly now: () => number; private readonly ids: () => string;
   private readonly setTimer: (callback: () => void, delayMs: number) => NodeJS.Timeout;
   private readonly clearTimer: (timer: NodeJS.Timeout | null) => void;
   constructor(private readonly options: TaskSessionManagerOptions) { this.now = options.now ?? Date.now; this.ids = options.idFactory ?? crypto.randomUUID; this.setTimer = options.setTimer ?? ((callback, delay) => setTimeout(callback, delay)); this.clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer ?? undefined)); }
   open(input: OpenTaskSessionInput): TaskSession {
-    const capabilities = [...new Set(input.capabilities)]; if (!capabilities.length || capabilities.some((capability) => capability !== "cdp")) throw new TaskSessionError("unsupportedCapability", "only the cdp capability is supported");
+    const capabilities = [...input.capabilities];
+    if (!capabilities.length || new Set(capabilities).size !== capabilities.length || capabilities.some((capability) => capability !== "cdp")) throw new TaskSessionError("unsupportedCapability", "only the cdp capability is supported");
     const ttl = input.ttlMs;
     if (ttl !== undefined && (!Number.isSafeInteger(ttl) || ttl <= 0 || ttl > MAX_TASK_SESSION_TTL_MS)) throw new TaskSessionError("invalidTtl", "invalid session TTL");
+    const controllerPrincipalId = text(input.controllerPrincipalId, "controller principal ID", 256);
+    const controllerName = text(input.controllerName, "controller name");
+    const taskLabel = text(input.taskLabel, "task label");
+    if (input.stableSessionKey !== undefined && !isStableSessionKey(input.stableSessionKey)) throw new TaskSessionError("invalidSession", "stable session key is invalid");
+    const stableSessionKey = input.stableSessionKey ?? null;
+    const reusableKey = stableSessionKey === null ? null : this.reusableKey(controllerPrincipalId, stableSessionKey);
+    if (reusableKey !== null) {
+      const existingId = this.reusableSessionIds.get(reusableKey);
+      const existing = existingId === undefined ? undefined : this.stored.get(existingId);
+      if (existing?.session.state === "active") {
+        if (existing.session.taskLabel !== taskLabel || !sameCapabilities(existing.session.requestedCapabilities, capabilities as TaskSessionCapability[])) throw new TaskSessionError("sessionConflict", "named session key is already active with a different label or capabilities");
+        return clone(existing.session);
+      }
+      if (existing?.session.state === "pending") {
+        if (existing.session.taskLabel !== taskLabel || !sameCapabilities(existing.session.requestedCapabilities, capabilities as TaskSessionCapability[])) throw new TaskSessionError("sessionConflict", "named session key is already pending with a different label or capabilities");
+        throw new TaskSessionError("notActive", "named session approval is still pending");
+      }
+      if (existingId !== undefined) this.reusableSessionIds.delete(reusableKey);
+    }
     const now = this.now();
     const session: TaskSession = {
       id: this.ids(),
-      controllerPrincipalId: display(input.controllerPrincipalId, "controller principal ID"),
-      displayControllerName: display(input.controllerName, "controller name"),
-      taskLabel: display(input.taskLabel, "task label"),
+      controllerPrincipalId,
+      displayControllerName: controllerName,
+      taskLabel,
       requestedCapabilities: capabilities as TaskSessionCapability[],
       createdAt: now,
       expiresAt: ttl === undefined ? null : now + ttl,
       state: "pending",
     };
     if (this.stored.has(session.id)) throw new TaskSessionError("invalidSession", "session ID collision");
-    const stored: Stored = { session, relay: null, approval: null, ready: false, timer: null, revoking: null };
+    const stored: Stored = { session, stableSessionKey, relay: null, approval: null, ready: false, timer: null, revoking: null };
     if (ttl !== undefined) {
       stored.timer = this.setTimer(() => { void this.revoke(session.id, "ttlExpired").catch(() => {}); }, ttl);
       stored.timer.unref?.();
     }
     this.stored.set(session.id, stored);
+    if (reusableKey !== null) this.reusableSessionIds.set(reusableKey, session.id);
     this.emit({ type: "pending", session: clone(session) });
     return clone(session);
   }
@@ -56,7 +81,24 @@ export class TaskSessionManager {
   }
   relayReady(id: string): TaskSession { const stored = this.require(id); if (stored.session.state !== "active" || !stored.relay) throw new TaskSessionError("notActive", "session relay is not active"); if (!stored.ready) { stored.ready = true; this.emit({ type: "active", session: clone(stored.session), cdpUrl: stored.relay.cdpUrl }); } return clone(stored.session); }
   async relayFailed(id: string, reason = "relayFailed"): Promise<TaskSession> { return await this.revoke(id, reason); }
-  async revoke(id: string, reason = "revoked"): Promise<TaskSession> { const stored = this.require(id); if (stored.revoking) return await stored.revoking; if (stored.session.state === "revoked") return clone(stored.session); stored.session = changed(stored.session, "revoked"); stored.ready = false; this.clearTimer(stored.timer); stored.timer = null; const relay = stored.relay; stored.relay = null; stored.revoking = (async () => { this.emit({ type: "revoked", session: clone(stored.session), reason }); try { if (relay) await relay.close(); } finally { this.compactRevoked(); } return clone(stored.session); })(); return await stored.revoking; }
+  async revoke(id: string, reason = "revoked"): Promise<TaskSession> {
+    const stored = this.require(id);
+    if (stored.revoking) return await stored.revoking;
+    if (stored.session.state === "revoked") return clone(stored.session);
+    stored.session = changed(stored.session, "revoked");
+    this.forgetReusableSession(stored);
+    stored.ready = false;
+    this.clearTimer(stored.timer);
+    stored.timer = null;
+    const relay = stored.relay;
+    stored.relay = null;
+    stored.revoking = (async () => {
+      this.emit({ type: "revoked", session: clone(stored.session), reason });
+      try { if (relay) await relay.close(); } finally { this.compactRevoked(); }
+      return clone(stored.session);
+    })();
+    return await stored.revoking;
+  }
 
   private compactRevoked(): void { const revoked = [...this.stored.entries()].filter(([, stored]) => stored.session.state === "revoked"); revoked.sort(([, left], [, right]) => left.session.createdAt - right.session.createdAt); while (revoked.length > MAX_REVOKED_TASK_SESSION_TOMBSTONES) { const oldest = revoked.shift(); if (oldest) this.stored.delete(oldest[0]); } }
 
@@ -65,6 +107,26 @@ export class TaskSessionManager {
   get(id: string): TaskSession | undefined { const stored = this.stored.get(id); return stored ? clone(stored.session) : undefined; }
   snapshot(): TaskSession[] { return [...this.stored.values()].filter(({ session }) => session.state !== "revoked").map(({ session }) => clone(session)); }
   cdpUrl(id: string): string | undefined { const stored = this.stored.get(id); return stored?.ready && stored.session.state === "active" ? stored.relay?.cdpUrl : undefined; }
+  /** Explicitly closes the caller's named reusable session. */
+  async revokeNamed(controllerPrincipalId: string, stableSessionKey: string, reason = "cliClosed"): Promise<TaskSession> {
+    if (!isStableSessionKey(stableSessionKey)) throw new TaskSessionError("invalidSession", "stable session key is invalid");
+    const reusableKey = this.reusableKey(text(controllerPrincipalId, "controller principal ID", 256), stableSessionKey);
+    const id = this.reusableSessionIds.get(reusableKey);
+    if (!id) throw new TaskSessionError("notFound", "named session was not found");
+    const stored = this.stored.get(id);
+    if (!stored || stored.session.state === "revoked") {
+      this.reusableSessionIds.delete(reusableKey);
+      throw new TaskSessionError("notFound", "named session was not found");
+    }
+    return await this.revoke(id, reason);
+  }
+  isReusable(id: string): boolean { const stored = this.stored.get(id); return !!stored && stored.stableSessionKey !== null && stored.session.state !== "revoked"; }
+  private reusableKey(controllerPrincipalId: string, stableSessionKey: string): string { return JSON.stringify([controllerPrincipalId, stableSessionKey]); }
+  private forgetReusableSession(stored: Stored): void {
+    if (stored.stableSessionKey === null) return;
+    const key = this.reusableKey(stored.session.controllerPrincipalId, stored.stableSessionKey);
+    if (this.reusableSessionIds.get(key) === stored.session.id) this.reusableSessionIds.delete(key);
+  }
   private require(id: string): Stored { const stored = this.stored.get(id); if (!stored) throw new TaskSessionError("notFound", "session was not found"); return stored; }
   private emit(event: SessionLifecycleEvent): void { try { this.options.onEvent?.(event); } catch {} }
 }

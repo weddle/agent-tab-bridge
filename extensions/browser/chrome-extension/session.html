@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Tab Bridge session</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0;
+        min-width: 320px;
+        min-height: 100vh;
+        box-sizing: border-box;
+        padding: 32px;
+        font: 16px/1.45 system-ui, -apple-system, sans-serif;
+        background: Canvas;
+        color: CanvasText;
+      }
+      main {
+        max-width: 680px;
+        margin: 0 auto;
+      }
+      h1 { margin: 0 0 8px; font-size: 24px; }
+      h2 { margin: 24px 0 4px; font-size: 16px; }
+      p { margin: 4px 0; }
+      .description { font-size: 18px; font-weight: 600; }
+      .meta { color: GrayText; overflow-wrap: anywhere; }
+      .instruction {
+        margin-top: 28px;
+        padding: 16px;
+        border: 1px solid GrayText;
+        border-radius: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Agent Tab Bridge session</h1>
+      <p class="description" id="description">Approved local controller session</p>
+      <p class="meta" id="controller"></p>
+      <p class="meta" id="session"></p>
+      <p class="meta" id="capabilities"></p>
+      <section class="instruction" aria-labelledby="instructions-heading">
+        <h2 id="instructions-heading">How tab access works</h2>
+        <p>Only website tabs deliberately moved into this group can be controlled by the approved session.</p>
+        <p>Move a tab into this group, or use Share in the Agent Tab Bridge popup. Moving it out revokes access immediately.</p>
+      </section>
+    </main>
+    <script>
+      const params = new URLSearchParams(location.search);
+      const text = (name, fallback) => params.get(name) || fallback;
+      document.getElementById("description").textContent = text("label", "Approved local controller session");
+      document.getElementById("controller").textContent = `Requester: ${text("controller", "Unnamed controller")}`;
+      document.getElementById("session").textContent = `Session: ${text("sessionId", "Unavailable")}`;
+      document.getElementById("capabilities").textContent = `Approved capabilities: ${text("capabilities", "None")}`;
+    </script>
+  </body>
+</html>

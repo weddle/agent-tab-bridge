@@ -111,6 +111,26 @@ describe("TaskSessionManager integration contract", () => {
     await manager.relayFailed(disconnected.id, "relay-failed");
     expect(relays[1]?.close).toHaveBeenCalledTimes(1);
   });
+  it("reuses only an active named session with the same controller, label, and capabilities", async () => {
+    const { relays, startRelay } = makeRelayFactory();
+    const manager = new TaskSessionManager({ startRelay, idFactory: (() => { let next = 0; return () => `session-${++next}`; })() });
+    const first = manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "Research", capabilities: ["cdp"], stableSessionKey: "research" });
+    await manager.approve(first.id);
+    manager.relayReady(first.id);
+    expect(manager.snapshot()[0]).not.toHaveProperty("stableSessionKey");
+
+    const reused = manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "Research", capabilities: ["cdp"], stableSessionKey: "research" });
+    expect(reused.id).toBe(first.id);
+    expect(manager.cdpUrl(reused.id)).toBe(relays[0]?.cdpUrl);
+    expect(startRelay).toHaveBeenCalledTimes(1);
+    expect(() => manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "Different task", capabilities: ["cdp"], stableSessionKey: "research" })).toThrow(/different label or capabilities/);
+    expect(() => manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "Research", capabilities: ["cdp", "cdp"], stableSessionKey: "research" })).toThrow(/only the cdp capability/);
+
+    const anotherController = manager.open({ controllerPrincipalId: "controller-2", controllerName: "CLI", taskLabel: "Research", capabilities: ["cdp"], stableSessionKey: "research" });
+    expect(anotherController).toMatchObject({ id: "session-2", state: "pending" });
+    await expect(manager.revokeNamed("controller-1", "research")).resolves.toMatchObject({ id: first.id, state: "revoked" });
+    expect(manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "Research", capabilities: ["cdp"], stableSessionKey: "research" })).toMatchObject({ id: "session-3", state: "pending" });
+  });
   it("bounds revoked tombstones while keeping recent revoke idempotence", async () => {
     let next = 0;
     const manager = new TaskSessionManager({ startRelay: async () => ({ pairingUrl: "ws://127.0.0.1/pair", cdpUrl: "ws://127.0.0.1/cdp", close: async () => undefined }), idFactory: () => `session-${++next}` });

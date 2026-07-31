@@ -27,6 +27,7 @@ const PROTOCOL_VERSION = 1;
 const TASK_GROUP_COLOR = "blue";
 const MAX_TASK_LABEL_LENGTH = 128;
 const CDP_POLICY_ERROR = "CDP method is not permitted by Agent Tab Bridge";
+const SESSION_PAGE_URL = chrome.runtime.getURL("session.html");
 const BADGE = {
   disconnected: { text: "", color: "#000000" },
   connecting: { text: "…", color: "#F59E0B" },
@@ -42,6 +43,8 @@ const relaySockets = new Map();
 const readyRelaySessions = new Set();
 /** Prevent a startup error and its resulting close event from reporting twice. */
 const failedRelaySockets = new WeakSet();
+/** Extension-owned session page tab per active task session; never a relay target. */
+const sessionAnchors = new Map();
 /** Authoritative extension-created group ID per task session; titles are display-only. */
 const sessionGroups = new Map();
 /** Serializes first-group creation so a session never acquires competing groups. */
@@ -176,6 +179,24 @@ function sessionIsActive(sessionId) {
 function taskGroupTitle(session) {
   const label = session.taskLabel || "Task";
   return `Agent Tab Bridge · ${label}`;
+}
+
+function sessionPageUrl(session) {
+  const url = new URL(SESSION_PAGE_URL);
+  url.searchParams.set("sessionId", session.id);
+  url.searchParams.set("controller", session.controllerName);
+  url.searchParams.set("label", session.taskLabel);
+  url.searchParams.set("capabilities", session.capabilities.join(", "));
+  return url.toString();
+}
+
+function isSessionPageTab(tab) {
+  return (
+    Number.isInteger(tab?.id) &&
+    (sessionAnchors.has(tab.id) ||
+      tab.url === SESSION_PAGE_URL ||
+      (typeof tab.url === "string" && tab.url.startsWith(`${SESSION_PAGE_URL}?`)))
+  );
 }
 
 function stopNativeReconnect() {
@@ -510,6 +531,19 @@ async function terminateNativeConnection(port, generation) {
   await handleNativeDisconnect(port, generation);
 }
 
+async function removeOrphanedSessionPages() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    await Promise.all(
+      tabs
+        .filter((tab) => isSessionPageTab(tab))
+        .map((tab) => chrome.tabs.remove(tab.id).catch(() => {})),
+    );
+  } catch {
+    // Browser startup may not expose tabs until the first window exists.
+  }
+}
+
 async function connectNative() {
   if (!nativeReconnectAllowed || nativePort) {
     return;
@@ -562,7 +596,9 @@ function sendRelay(sessionId, message) {
 async function sessionRelayTabs() {
   try {
     const tabs = await chrome.tabs.query({});
-    return tabs.filter((tab) => Number.isInteger(tab.id)).map(toRelayTabInfo);
+    return tabs
+      .filter((tab) => Number.isInteger(tab.id) && !isSessionPageTab(tab))
+      .map(toRelayTabInfo);
   } catch {
     return [];
   }
@@ -673,14 +709,23 @@ async function handleRelayOpen(sessionId, socket, relayUrl) {
     return;
   }
   await sendRelayHello(sessionId);
-  if (!reportRelayReady(sessionId, relayUrl)) {
-    throw new Error("Native Messaging companion disconnected before relay readiness.");
-  }
   if (relaySockets.get(sessionId) !== socket || !sessions.has(sessionId)) {
     throw new Error("The local relay was removed during startup.");
   }
   const session = sessions.get(sessionId);
   readyRelaySessions.add(sessionId);
+  try {
+    await ensureSessionGroup(sessionId);
+    if (!reportRelayReady(sessionId, relayUrl)) {
+      throw new Error("Native Messaging companion disconnected before relay readiness.");
+    }
+  } catch (error) {
+    readyRelaySessions.delete(sessionId);
+    throw error;
+  }
+  if (relaySockets.get(sessionId) !== socket || !sessions.has(sessionId)) {
+    throw new Error("The local relay was removed during startup.");
+  }
   sessions.set(sessionId, { ...session, state: "active" });
   return true;
 }
@@ -771,7 +816,9 @@ async function tabStillBelongsToSession(sessionId, tab) {
 
 async function assertSessionTab(sessionId, tabId) {
   if (!sessionIsActive(sessionId) || !sessionOwnsTab(tabOwners, sessionId, tabId)) {
-    throw new Error("Tab is not shared with this active task session.");
+    throw new Error(
+      "Tab is not shared with this active task session. Move it into this session's group or use Share in Agent Tab Bridge.",
+    );
   }
   const tab = await chrome.tabs.get(tabId);
   if (!(await tabStillBelongsToSession(sessionId, tab))) {
@@ -796,34 +843,74 @@ async function requireSessionGroupInWindow(sessionId, groupId, windowId) {
   return groupId;
 }
 
-async function ensureSessionGroup(sessionId, tab) {
+async function ensureSessionGroup(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) {
+    throw new Error("The task session is no longer available.");
+  }
+
   const knownGroupId = sessionGroups.get(sessionId);
-  if (Number.isInteger(knownGroupId)) {
-    return await requireSessionGroupInWindow(sessionId, knownGroupId, tab.windowId);
+  const knownAnchorId = sessionAnchors.get(sessionId);
+  if (Number.isInteger(knownGroupId) && Number.isInteger(knownAnchorId)) {
+    try {
+      const anchor = await chrome.tabs.get(knownAnchorId);
+      await requireSessionGroupInWindow(sessionId, knownGroupId, anchor.windowId);
+      if (anchor.groupId !== knownGroupId) {
+        await chrome.tabs.group({ tabIds: [knownAnchorId], groupId: knownGroupId });
+      }
+      return knownGroupId;
+    } catch {
+      sessionAnchors.delete(sessionId);
+      sessionGroups.delete(sessionId);
+    }
   }
 
   const inFlight = creatingSessionGroups.get(sessionId);
   if (inFlight) {
-    return await requireSessionGroupInWindow(sessionId, await inFlight, tab.windowId);
+    return await inFlight;
   }
 
   const creation = (async () => {
-    const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+    let anchorId = null;
+    let groupId = sessionGroups.get(sessionId);
     try {
+      const anchor = await chrome.tabs.create({
+        url: sessionPageUrl(session),
+        active: false,
+      });
+      if (!Number.isInteger(anchor.id)) {
+        throw new Error("Browser did not return a session tab ID.");
+      }
+      anchorId = anchor.id;
+
+      if (Number.isInteger(groupId)) {
+        await requireSessionGroupInWindow(sessionId, groupId, anchor.windowId);
+        await chrome.tabs.group({ tabIds: [anchorId], groupId });
+      } else {
+        groupId = await chrome.tabs.group({ tabIds: [anchorId] });
+      }
       await chrome.tabGroups.update(groupId, {
-        title: taskGroupTitle(sessions.get(sessionId)),
+        title: taskGroupTitle(session),
         color: TASK_GROUP_COLOR,
       });
       if (!sessionIsActive(sessionId)) {
         throw new Error("Task session stopped while its group was being created.");
       }
+      sessionAnchors.set(sessionId, anchorId);
       sessionGroups.set(sessionId, groupId);
       return groupId;
     } catch (error) {
-      try {
-        await chrome.tabs.ungroup([tab.id]);
-      } catch {
-        // The browser may already have removed the tab or group.
+      if (Number.isInteger(anchorId)) {
+        try {
+          await chrome.tabs.ungroup([anchorId]);
+        } catch {
+          // The browser may already have removed the group.
+        }
+        try {
+          await chrome.tabs.remove(anchorId);
+        } catch {
+          // The browser may already have removed the anchor.
+        }
       }
       throw error;
     }
@@ -845,19 +932,27 @@ async function claimAndGroupTab(sessionId, tabId) {
   if (!sessionIsActive(sessionId)) {
     throw new Error("Only an active task session can control tabs.");
   }
-  const claim = claimTab(tabOwners, sessionId, tabId);
-  if (!claim.ok) {
-    throw new Error("This tab is already shared with another task session.");
-  }
 
+  let claimed = false;
   try {
     const tab = await chrome.tabs.get(tabId);
-    const groupId = await ensureSessionGroup(sessionId, tab);
+    if (isSessionPageTab(tab)) {
+      throw new Error("The Agent Tab Bridge session page is not a shareable browser tab.");
+    }
+    const claim = claimTab(tabOwners, sessionId, tabId);
+    if (!claim.ok) {
+      throw new Error("This tab is already shared with another task session.");
+    }
+    claimed = true;
+    const groupId = await ensureSessionGroup(sessionId);
+    await requireSessionGroupInWindow(sessionId, groupId, tab.windowId);
     if (tab.groupId !== groupId) {
       await chrome.tabs.group({ tabIds: [tabId], groupId });
     }
   } catch (error) {
-    releaseTab(tabOwners, sessionId, tabId);
+    if (claimed) {
+      releaseTab(tabOwners, sessionId, tabId);
+    }
     throw error;
   }
 }
@@ -895,7 +990,6 @@ async function attachDebugger(sessionId, tabId) {
   }
 
   const attaching = (async () => {
-    await claimAndGroupTab(sessionId, tabId);
     await assertSessionTab(sessionId, tabId);
     const currentOwner = attachedTabs.get(tabId);
     if (currentOwner && currentOwner !== sessionId) {
@@ -933,6 +1027,7 @@ async function attachDebugger(sessionId, tabId) {
   }
 }
 
+
 async function revokeTabAccess(sessionId, tabId, reason, { notifyRelay = true } = {}) {
   if (!releaseTab(tabOwners, sessionId, tabId)) {
     return;
@@ -946,9 +1041,6 @@ async function revokeTabAccess(sessionId, tabId, reason, { notifyRelay = true } 
     }
   } catch {
     // Closed tabs and already-removed groups have no remaining access.
-  }
-  if (sessionTabIds(tabOwners, sessionId).length === 0) {
-    sessionGroups.delete(sessionId);
   }
   if (notifyRelay && sessionIsActive(sessionId)) {
     sendRelay(sessionId, { type: "detached", tabId, reason });
@@ -976,7 +1068,31 @@ async function stopSession(sessionId, { removeSession = true } = {}) {
       tabIds.map((tabId) => revokeTabAccess(sessionId, tabId, "task session stopped", { notifyRelay: false })),
     );
     releaseSessionTabs(tabOwners, sessionId);
+
+    const groupId = sessionGroups.get(sessionId);
+    const anchorId = sessionAnchors.get(sessionId);
+    if (Number.isInteger(groupId)) {
+      try {
+        const groupTabs = await chrome.tabs.query({ groupId });
+        const groupTabIds = groupTabs
+          .map((tab) => tab.id)
+          .filter((tabId) => Number.isInteger(tabId));
+        if (groupTabIds.length > 0) {
+          await chrome.tabs.ungroup(groupTabIds);
+        }
+      } catch {
+        // The browser may already have removed the group.
+      }
+    }
     sessionGroups.delete(sessionId);
+    sessionAnchors.delete(sessionId);
+    if (Number.isInteger(anchorId)) {
+      try {
+        await chrome.tabs.remove(anchorId);
+      } catch {
+        // The browser may already have removed the anchor.
+      }
+    }
     if (removeSession) {
       sessions.delete(sessionId);
       approvedSessions.delete(sessionId);
@@ -998,6 +1114,7 @@ async function stopAllSessions() {
   relaySockets.clear();
   readyRelaySessions.clear();
   sessionGroups.clear();
+  sessionAnchors.clear();
   tabOwners.clear();
   approvedSessions.clear();
 }
@@ -1325,33 +1442,51 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   void (async () => {
     if (typeof changeInfo.groupId === "number") {
-      const ownerSessionId = tabOwners.get(tabId);
-      const groupOwnerSessionId = [...sessionGroups.entries()].find(([, groupId]) => groupId === changeInfo.groupId)?.[0];
-      if (ownerSessionId) {
-        if (!creatingSessionGroups.has(ownerSessionId) && sessionGroups.get(ownerSessionId) !== changeInfo.groupId) {
-          if (!revokingTabs.has(tabId)) {
-            revokingTabs.add(tabId);
-            try {
-              if (groupOwnerSessionId && groupOwnerSessionId !== ownerSessionId) {
-                await chrome.tabs.ungroup([tabId]);
-              }
-              await revokeTabAccess(ownerSessionId, tabId, "tab left its task group");
-            } catch {
-              releaseTab(tabOwners, ownerSessionId, tabId);
-            } finally {
-              revokingTabs.delete(tabId);
-            }
+      const anchorSessionId = [...sessionAnchors.entries()].find(([, anchorId]) => anchorId === tabId)?.[0];
+      if (anchorSessionId) {
+        const groupId = sessionGroups.get(anchorSessionId);
+        if (
+          sessionIsActive(anchorSessionId) &&
+          Number.isInteger(groupId) &&
+          changeInfo.groupId !== groupId &&
+          !revokingTabs.has(tabId)
+        ) {
+          revokingTabs.add(tabId);
+          try {
+            await chrome.tabs.group({ tabIds: [tabId], groupId });
+          } finally {
+            revokingTabs.delete(tabId);
           }
         }
-      } else if (groupOwnerSessionId && !revokingTabs.has(tabId)) {
-        if (!sessionIsActive(groupOwnerSessionId)) {
-          await chrome.tabs.ungroup([tabId]).catch(() => {});
-        } else {
-          const claim = claimTab(tabOwners, groupOwnerSessionId, tabId);
-          if (!claim.ok) {
-            // Ownership is exclusive. Do not let a tab owned by another session
-            // cross-claim merely because it was dragged over this group.
+      } else {
+        const ownerSessionId = tabOwners.get(tabId);
+        const groupOwnerSessionId = [...sessionGroups.entries()].find(([, groupId]) => groupId === changeInfo.groupId)?.[0];
+        if (ownerSessionId) {
+          if (!creatingSessionGroups.has(ownerSessionId) && sessionGroups.get(ownerSessionId) !== changeInfo.groupId) {
+            if (!revokingTabs.has(tabId)) {
+              revokingTabs.add(tabId);
+              try {
+                if (groupOwnerSessionId && groupOwnerSessionId !== ownerSessionId) {
+                  await chrome.tabs.ungroup([tabId]);
+                }
+                await revokeTabAccess(ownerSessionId, tabId, "tab left its task group");
+              } catch {
+                releaseTab(tabOwners, ownerSessionId, tabId);
+              } finally {
+                revokingTabs.delete(tabId);
+              }
+            }
+          }
+        } else if (groupOwnerSessionId && !revokingTabs.has(tabId)) {
+          if (!sessionIsActive(groupOwnerSessionId)) {
             await chrome.tabs.ungroup([tabId]).catch(() => {});
+          } else {
+            const claim = claimTab(tabOwners, groupOwnerSessionId, tabId);
+            if (!claim.ok) {
+              // Ownership is exclusive. Do not let a tab owned by another session
+              // cross-claim merely because it was dragged over this group.
+              await chrome.tabs.ungroup([tabId]).catch(() => {});
+            }
           }
         }
       }
@@ -1365,6 +1500,15 @@ chrome.tabs.onCreated.addListener(() => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  const anchorSessionId = [...sessionAnchors.entries()].find(([, anchorId]) => anchorId === tabId)?.[0];
+  if (anchorSessionId) {
+    sessionAnchors.delete(anchorSessionId);
+    if (sessionIsActive(anchorSessionId)) {
+      void stopSession(anchorSessionId, { removeSession: true })
+        .then(() => postSessionRevocation(anchorSessionId, "task session tab was closed"))
+        .catch(() => {});
+    }
+  }
   const sessionId = tabOwners.get(tabId);
   attachedTabs.delete(tabId);
   if (sessionId) {
@@ -1379,14 +1523,16 @@ chrome.tabGroups.onRemoved.addListener((group) => {
   if (!sessionId) {
     return;
   }
-  sessionGroups.delete(sessionId);
-  void Promise.all(
-    sessionTabIds(tabOwners, sessionId).map((tabId) => revokeTabAccess(sessionId, tabId, "task group was removed")),
-  ).catch(() => {
-    postSessionRevocation(sessionId, "task group cleanup failed");
-  });
+  void stopSession(sessionId, { removeSession: true })
+    .then(() => postSessionRevocation(sessionId, "task session group was removed"))
+    .catch(() => {});
 });
 
-chrome.runtime.onStartup.addListener(() => void connectNative().catch(() => {}));
-chrome.runtime.onInstalled.addListener(() => void connectNative().catch(() => {}));
-void connectNative().catch(() => {});
+async function initializeExtension() {
+  await removeOrphanedSessionPages();
+  await connectNative();
+}
+
+chrome.runtime.onStartup.addListener(() => void initializeExtension().catch(() => {}));
+chrome.runtime.onInstalled.addListener(() => void initializeExtension().catch(() => {}));
+void initializeExtension().catch(() => {});
