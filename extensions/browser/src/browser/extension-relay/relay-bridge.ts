@@ -24,7 +24,7 @@ const BROWSER_TARGET_ID = "agent-tab-bridge-browser";
 /** Playwright requires every attached page target to identify its browser context. */
 const BROWSER_CONTEXT_ID = "agent-tab-bridge-context";
 
-/** Stable target identity for a shared Chrome tab, before or after attachment. */
+/** Stable target identity for a tab in an approved extension session snapshot. */
 function targetIdForTab(tabId: number): string {
   return `agent-tab-bridge-target-${tabId}`;
 }
@@ -145,7 +145,7 @@ type PendingExtensionCommand = {
 
 type TabState = {
   info: RelayTabInfo;
-  /** Set while chrome.debugger is attached: synthetic targetId + synthetic root sessionId. */
+  /** Set after the extension claims the tab and chrome.debugger attaches. */
   attached?: { targetId: string; sessionId: string };
   attaching?: Promise<{ targetId: string; sessionId: string }>;
 };
@@ -233,7 +233,7 @@ export class ExtensionRelayBridge {
     return this.extension?.identity ?? null;
   }
 
-  /** Tabs currently reported as shared by the extension. */
+  /** Tabs in the latest snapshot from the approved extension session. */
   sharedTabs(): RelayTabInfo[] {
     return [...this.tabs.values()].map((tab) => tab.info);
   }
@@ -353,7 +353,7 @@ export class ExtensionRelayBridge {
     for (const [tabId, waiters] of this.tabWaiters) {
       for (const waiter of waiters) {
         clearTimeout(waiter.timer);
-        waiter.reject(new Error(`tab ${tabId} is no longer shared`));
+        waiter.reject(new Error(`tab ${tabId} is no longer available to this approved session`));
       }
     }
     this.tabWaiters.clear();
@@ -447,9 +447,9 @@ export class ExtensionRelayBridge {
           }
           this.tabWaiters.delete(info.tabId);
         }
-        // Newly shared tab: expose it to auto-attach clients right away.
+        // An auto-attach client explicitly asked to attach new snapshot tabs.
         if ([...this.clients].some((client) => client.autoAttach)) {
-          void this.ensureTabAttached(info.tabId)
+          void this.claimAndAttachTab(info.tabId)
             .then(({ targetId, sessionId }) => {
               this.announceAttachedTab(info.tabId, targetId, sessionId, { onlyAutoAttach: true });
 
@@ -459,7 +459,7 @@ export class ExtensionRelayBridge {
       }
     }
   }
-  private waitForSharedTab(tabId: number): Promise<TabState> {
+  private waitForReportedTab(tabId: number): Promise<TabState> {
     const existing = this.tabs.get(tabId);
     if (existing) {
       return Promise.resolve(existing);
@@ -472,7 +472,7 @@ export class ExtensionRelayBridge {
         if (waiters?.size === 0) {
           this.tabWaiters.delete(tabId);
         }
-        reject(new Error(`extension did not report tab ${tabId} as shared`));
+        reject(new Error(`extension did not report tab ${tabId} in the approved session snapshot`));
       }, EXTENSION_COMMAND_TIMEOUT_MS);
       timer.unref?.();
       waiter = { resolve, reject, timer };
@@ -483,10 +483,10 @@ export class ExtensionRelayBridge {
   }
 
 
-  private async ensureTabAttached(tabId: number): Promise<{ targetId: string; sessionId: string }> {
+  private async claimAndAttachTab(tabId: number): Promise<{ targetId: string; sessionId: string }> {
     const tab = this.tabs.get(tabId);
     if (!tab) {
-      throw new Error(`tab ${tabId} is not shared with Agent Tabs`);
+      throw new Error(`tab ${tabId} is not available to this approved session`);
     }
     if (tab.attached) {
       return tab.attached;
@@ -495,6 +495,8 @@ export class ExtensionRelayBridge {
       return await tab.attaching;
     }
     const attaching = (async () => {
+      // Target discovery is metadata-only. The extension claims this selected
+      // snapshot tab into its session group before attaching chrome.debugger.
       await this.callExtension({ type: "attach", tabId });
       const targetId = targetIdForTab(tabId);
       const sessionId = `agent-tab-bridge-tab-${tabId}-${this.nextSessionOrdinal++}`;
@@ -574,7 +576,7 @@ export class ExtensionRelayBridge {
       }
     }
     // Playwright's page-scoped CDP sessions listen on their synthetic parent
-    // browser session, so detach those aliases there when the shared tab goes.
+    // browser session, so detach those aliases when the claimed tab goes.
     for (const [auxiliarySessionId, auxiliary] of this.auxiliaryTabSessions) {
       if (auxiliary.tabId !== tabId) {
         continue;
@@ -854,7 +856,7 @@ export class ExtensionRelayBridge {
         return;
       }
       case "Target.setDiscoverTargets": {
-        // Intentionally a no-op: shared targets are always bridge-synthesized.
+        // Intentionally a no-op: approved-session targets are always bridge-synthesized.
         this.respond(client, request, {});
         return;
       }
@@ -901,7 +903,7 @@ export class ExtensionRelayBridge {
         if (autoAttach) {
           const attachResults = await Promise.allSettled(
             [...this.tabs.keys()].map(async (tabId) => {
-              const { targetId, sessionId } = await this.ensureTabAttached(tabId);
+              const { targetId, sessionId } = await this.claimAndAttachTab(tabId);
               return { tabId, targetId, sessionId };
             }),
           );
@@ -933,7 +935,7 @@ export class ExtensionRelayBridge {
           this.respondError(client, request, "targetId is required", -32602);
           return;
         }
-        const attached = await this.ensureTabAttached(found.tabId);
+        const attached = await this.claimAndAttachTab(found.tabId);
         if (request.sessionId && this.browserSessions.get(request.sessionId) === client) {
           // Playwright creates a fresh page-scoped session for helpers such as
           // Target.getTargetInfo and DOM refs. Multiplex it onto the one real
@@ -1002,7 +1004,7 @@ export class ExtensionRelayBridge {
           this.respondError(client, request, "extension did not return a valid tabId for createTab");
           return;
         }
-        await this.waitForSharedTab(createdTabId);
+        await this.waitForReportedTab(createdTabId);
         this.respond(client, request, { targetId: targetIdForTab(createdTabId) });
         return;
       }
@@ -1067,7 +1069,7 @@ export class ExtensionRelayBridge {
     for (const [tabId, waiters] of this.tabWaiters) {
       for (const waiter of waiters) {
         clearTimeout(waiter.timer);
-        waiter.reject(new Error(`tab ${tabId} is no longer shared`));
+        waiter.reject(new Error(`tab ${tabId} is no longer available to this approved session`));
       }
     }
     this.tabWaiters.clear();

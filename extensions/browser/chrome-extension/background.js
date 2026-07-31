@@ -559,27 +559,26 @@ function sendRelay(sessionId, message) {
   }
 }
 
-async function sessionRelayTabs(sessionId) {
-  const tabs = [];
-  for (const tabId of sessionTabIds(tabOwners, sessionId)) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (await tabStillBelongsToSession(sessionId, tab)) {
-        tabs.push(toRelayTabInfo(tab));
-      }
-    } catch {
-      releaseTab(tabOwners, sessionId, tabId);
-    }
+async function sessionRelayTabs() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    return tabs.filter((tab) => Number.isInteger(tab.id)).map(toRelayTabInfo);
+  } catch {
+    return [];
   }
-  return tabs;
 }
 
 async function syncSessionTabs(sessionId) {
   if (!sessionIsActive(sessionId)) {
     return;
   }
-  sendRelay(sessionId, { type: "tabs", tabs: await sessionRelayTabs(sessionId) });
+  sendRelay(sessionId, { type: "tabs", tabs: await sessionRelayTabs() });
 }
+
+async function syncActiveRelaySessions() {
+  await Promise.all([...readyRelaySessions].map((sessionId) => syncSessionTabs(sessionId)));
+}
+
 
 async function sendRelayHello(sessionId) {
   const browserVersion = /(?:Brave|Chrome)\/[\d.]+/.exec(navigator.userAgent)?.[0] ?? "Chromium";
@@ -588,7 +587,7 @@ async function sendRelayHello(sessionId) {
     userAgent: navigator.userAgent,
     browserVersion,
     extensionVersion: chrome.runtime.getManifest().version,
-    tabs: await sessionRelayTabs(sessionId),
+    tabs: await sessionRelayTabs(),
   })) {
     throw new Error("The local relay closed before it accepted its hello.");
   }
@@ -839,7 +838,7 @@ async function ensureSessionGroup(sessionId, tab) {
   }
 }
 
-async function shareTab(sessionId, tabId) {
+async function claimAndGroupTab(sessionId, tabId) {
   if (!Number.isInteger(tabId)) {
     throw new Error("No tab was selected.");
   }
@@ -857,11 +856,15 @@ async function shareTab(sessionId, tabId) {
     if (tab.groupId !== groupId) {
       await chrome.tabs.group({ tabIds: [tabId], groupId });
     }
-    await syncSessionTabs(sessionId);
   } catch (error) {
     releaseTab(tabOwners, sessionId, tabId);
     throw error;
   }
+}
+
+async function shareTab(sessionId, tabId) {
+  await claimAndGroupTab(sessionId, tabId);
+  await syncSessionTabs(sessionId);
 }
 
 async function detachChromeDebugger(tabId) {
@@ -885,10 +888,14 @@ async function detachDebugger(tabId) {
 async function attachDebugger(sessionId, tabId) {
   const inFlight = attachingTabs.get(tabId);
   if (inFlight) {
-    return await inFlight;
+    if (inFlight.sessionId !== sessionId) {
+      throw new Error("This tab is already shared with another task session.");
+    }
+    return await inFlight.promise;
   }
 
   const attaching = (async () => {
+    await claimAndGroupTab(sessionId, tabId);
     await assertSessionTab(sessionId, tabId);
     const currentOwner = attachedTabs.get(tabId);
     if (currentOwner && currentOwner !== sessionId) {
@@ -915,11 +922,14 @@ async function attachDebugger(sessionId, tabId) {
     return { targetId: target?.id ?? `tab-${tabId}` };
   })();
 
-  attachingTabs.set(tabId, attaching);
+  const record = { sessionId, promise: attaching };
+  attachingTabs.set(tabId, record);
   try {
     return await attaching;
   } finally {
-    attachingTabs.delete(tabId);
+    if (attachingTabs.get(tabId) === record) {
+      attachingTabs.delete(tabId);
+    }
   }
 }
 
@@ -1313,55 +1323,45 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (typeof changeInfo.groupId !== "number") {
-    return;
-  }
-  const ownerSessionId = tabOwners.get(tabId);
-  const groupOwnerSessionId = [...sessionGroups.entries()].find(([, groupId]) => groupId === changeInfo.groupId)?.[0];
-  if (ownerSessionId) {
-    if (creatingSessionGroups.has(ownerSessionId)) {
-      return;
-    }
-    if (sessionGroups.get(ownerSessionId) !== changeInfo.groupId) {
-      if (revokingTabs.has(tabId)) {
-        return;
+  void (async () => {
+    if (typeof changeInfo.groupId === "number") {
+      const ownerSessionId = tabOwners.get(tabId);
+      const groupOwnerSessionId = [...sessionGroups.entries()].find(([, groupId]) => groupId === changeInfo.groupId)?.[0];
+      if (ownerSessionId) {
+        if (!creatingSessionGroups.has(ownerSessionId) && sessionGroups.get(ownerSessionId) !== changeInfo.groupId) {
+          if (!revokingTabs.has(tabId)) {
+            revokingTabs.add(tabId);
+            try {
+              if (groupOwnerSessionId && groupOwnerSessionId !== ownerSessionId) {
+                await chrome.tabs.ungroup([tabId]);
+              }
+              await revokeTabAccess(ownerSessionId, tabId, "tab left its task group");
+            } catch {
+              releaseTab(tabOwners, ownerSessionId, tabId);
+            } finally {
+              revokingTabs.delete(tabId);
+            }
+          }
+        }
+      } else if (groupOwnerSessionId && !revokingTabs.has(tabId)) {
+        if (!sessionIsActive(groupOwnerSessionId)) {
+          await chrome.tabs.ungroup([tabId]).catch(() => {});
+        } else {
+          const claim = claimTab(tabOwners, groupOwnerSessionId, tabId);
+          if (!claim.ok) {
+            // Ownership is exclusive. Do not let a tab owned by another session
+            // cross-claim merely because it was dragged over this group.
+            await chrome.tabs.ungroup([tabId]).catch(() => {});
+          }
+        }
       }
-      revokingTabs.add(tabId);
-      if (groupOwnerSessionId && groupOwnerSessionId !== ownerSessionId) {
-        void chrome.tabs.ungroup([tabId]).catch(() => {});
-      }
-      void revokeTabAccess(ownerSessionId, tabId, "tab left its task group")
-        .catch(() => {
-          releaseTab(tabOwners, ownerSessionId, tabId);
-        })
-        .finally(() => revokingTabs.delete(tabId));
     }
-  } else if (groupOwnerSessionId) {
-    if (revokingTabs.has(tabId)) {
-      return;
-    }
-    if (!sessionIsActive(groupOwnerSessionId)) {
-      void chrome.tabs.ungroup([tabId]).catch(() => {});
-      return;
-    }
-    const claim = claimTab(tabOwners, groupOwnerSessionId, tabId);
-    if (!claim.ok) {
-      // Ownership is exclusive. Do not let a tab owned by another session
-      // cross-claim merely because it was dragged over this group.
-      void chrome.tabs.ungroup([tabId]).catch(() => {});
-      return;
-    }
-    void syncSessionTabs(groupOwnerSessionId).catch(() => {
-      void revokeTabAccess(
-        groupOwnerSessionId,
-        tabId,
-        "tab sharing state could not be synchronized",
-        { notifyRelay: false },
-      ).catch(() => {
-        releaseTab(tabOwners, groupOwnerSessionId, tabId);
-      });
-    });
-  }
+    await syncActiveRelaySessions();
+  })().catch(() => {});
+});
+
+chrome.tabs.onCreated.addListener(() => {
+  void syncActiveRelaySessions().catch(() => {});
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -1369,11 +1369,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   attachedTabs.delete(tabId);
   if (sessionId) {
     releaseTab(tabOwners, sessionId, tabId);
-    void syncSessionTabs(sessionId).catch(() => {
-      postSessionRevocation(sessionId, "shared tab state could not be synchronized");
-    });
   }
+  void syncActiveRelaySessions().catch(() => {});
 });
+
 
 chrome.tabGroups.onRemoved.addListener((group) => {
   const sessionId = [...sessionGroups.entries()].find(([, groupId]) => groupId === group.id)?.[0];

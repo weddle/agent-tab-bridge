@@ -1,11 +1,11 @@
 /**
  * Wire protocol between the Agent Tab Bridge relay and its browser extension.
- * The extension stays a dumb transport: it attaches chrome.debugger, forwards
- * CDP traffic, and manages the shared tab group. CDP target semantics live in
- * the bridge.
+ * The extension reports the approved session's full tab snapshot, claims tabs
+ * into that session's visible group as the relay attaches them, and forwards
+ * chrome.debugger traffic. CDP target semantics live in the bridge.
  */
 
-/** Tab snapshot reported by the extension for tabs shared with the agent. */
+/** Metadata for a tab in the approved extension session snapshot; it may be unclaimed. */
 export type RelayTabInfo = {
   tabId: number;
   url: string;
@@ -23,7 +23,7 @@ type ExtensionHelloMessage = {
   tabs: RelayTabInfo[];
 };
 
-/** Full refresh of shared tabs; sent on any group membership or tab change. */
+/** Full refresh of the approved session snapshot; sent on tab or metadata changes. */
 type ExtensionTabsMessage = {
   type: "tabs";
   tabs: RelayTabInfo[];
@@ -80,15 +80,15 @@ export type ExtensionToRelayMessage =
 export type RelayCommandBody =
   /** Forward a CDP command into an attached tab (or one of its child sessions). */
   | { type: "cdp"; tabId: number; sessionId?: string; method: string; params?: unknown }
-  /** Attach chrome.debugger to a shared tab. Result: { targetId: string }. */
+  /** Claim a snapshot tab for this session, then attach chrome.debugger. Result: {}. */
   | { type: "attach"; tabId: number }
-  /** Detach chrome.debugger from a tab (tab left the group or client detached). */
+  /** Detach chrome.debugger from a claimed tab. */
   | { type: "detach"; tabId: number }
-  /** Open a new tab inside the shared tab group. Result: { tabId: number }. */
+  /** Open a new tab already claimed by this session. Result: { tabId: number }. */
   | { type: "createTab"; url: string; background?: boolean; focus?: boolean }
-  /** Close a shared tab. Result: {}. */
+  /** Close a tab claimed by this session. Result: {}. */
   | { type: "closeTab"; tabId: number }
-  /** Focus a shared tab (window + tab activation). Result: {}. */
+  /** Focus a tab claimed by this session (window + tab activation). Result: {}. */
   | { type: "activateTab"; tabId: number };
 
 /** Keepalive probe; the extension answers with pong. */
