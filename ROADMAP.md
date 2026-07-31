@@ -101,15 +101,7 @@ Remaining before calling Release 1 complete:
 
 **Outcome:** a harness on a home server can request a browser session with the same browser-local consent and revocation semantics as same-host use.
 
-Major contents:
-
-- An `atb hub` on the harness machine and an outbound connection from the browser companion. Neither the extension nor a CDP endpoint listens directly on the LAN.
-- One-time short-authentication-string enrollment using a reviewed PAKE such as [SPAKE2+](https://www.rfc-editor.org/rfc/rfc9383.html). The transcript binds both device public keys, identities, protocol version, and role; both machines verify key confirmation before storing trust.
-- Mutually authenticated, pinned, encrypted transport for the stable release, with explicit key rotation and revocation. Existing SSH identity and `known_hosts` may provide the first implementation behind `atb connect`, but SSH details are not exposed in routine UX.
-- Task-scoped session secrets; no reusable bearer token in a URL, log, configuration file, or notification.
-- The hub re-exposes each approved browser session only as a token-gated loopback endpoint for its local harness.
-- Browser popup state naming the connected server, requesting harness, task label, active capabilities, and kill switch.
-- No mDNS or discovery result acts as a trust anchor. Discovery may become a convenience only after authenticated enrollment exists.
+**Approved architecture:** the topology and trust model for this release are fixed in [ARCHITECTURE.md](ARCHITECTURE.md) (three-architect consensus, 2026-07-31), which supersedes the earlier sketch here. Key deltas from the original sketch: the hub is a zero-authority directory/router on the home server (not the harness machine); a lazy per-machine edge supervisor with thin Native Messaging shims replaces the per-browser monolith; profile authentication and enrollment terminate at the edge end-to-end through the hub; hop TLS runs under an end-to-end AEAD channel; SSH is not used as the first LAN transport.
 
 **Release boundary:** a previously enrolled home server requests a session; the browser user approves it once; Hermes receives a loopback `BROWSER_CDP_URL`; revoking the session or device closes every related channel immediately. Disabling LAN support leaves no LAN listener or reconnect loop.
 
