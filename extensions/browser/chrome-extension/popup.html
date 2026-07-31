@@ -4,154 +4,236 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Agent Tab Bridge</title>
+    <link rel="stylesheet" href="ui-tokens.css" />
     <style>
-      :root {
-        color-scheme: dark;
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      }
+      /* Layout only. Every color comes from ui-tokens.css. */
       body {
         box-sizing: border-box;
-        width: 360px;
-        max-height: 580px;
+        width: 380px;
+        max-height: 600px;
         overflow-y: auto;
         margin: 0;
-        padding: 14px;
-        background: #1c1c1e;
-        color: #f2f2f7;
-        font-size: 13px;
+        padding: var(--atb-space-3);
+        background: var(--atb-bg);
+        color: var(--atb-text);
+        font: 13px/1.45 var(--atb-font);
       }
       h1 {
-        display: flex;
-        align-items: center;
-        gap: 8px;
         margin: 0;
-        font-size: 16px;
+        font-size: 14px;
+        font-weight: 600;
       }
       h2 {
-        margin: 16px 0 7px;
-        font-size: 13px;
-        font-weight: 650;
-        color: #d1d1d6;
+        margin: 0;
+        color: var(--atb-text-muted);
+        font-size: 12px;
+        font-weight: 600;
       }
-      p { margin: 4px 0; line-height: 1.4; }
-      .muted { color: #98989f; font-size: 12px; }
-      .identity { margin: 3px 0 0 18px; color: #c7c7cc; font-size: 12px; }
+      p {
+        margin: 0;
+        overflow-wrap: anywhere;
+      }
+
+      .status {
+        display: flex;
+        align-items: center;
+        gap: var(--atb-space-2);
+        margin-top: var(--atb-space-1);
+      }
       .dot {
+        box-sizing: border-box;
         width: 10px;
         height: 10px;
         flex: 0 0 auto;
         border-radius: 50%;
-        background: #6b7280;
+        background: var(--atb-text-muted);
       }
-      .dot.connected { background: #34c759; }
-      .dot.connecting { background: #f59e0b; }
-      .dot.disconnected, .dot.error { background: #ff3b30; }
-      .status { margin-top: 4px; }
-      .error {
-        margin-top: 9px;
-        padding: 7px 8px;
-        border: 1px solid #8e3030;
-        border-radius: 6px;
-        background: #3a2020;
-        color: #ffb4ab;
+      .dot.connected { background: var(--atb-success); }
+      .dot.connecting { background: var(--atb-warning); }
+      .dot.disconnected { background: var(--atb-text-muted); }
+      /* Error is a hollow ring so it never reads as "just another color". */
+      .dot.error {
+        border: 2px solid var(--atb-danger);
+        background: transparent;
+      }
+      .identity {
+        margin-top: var(--atb-space-1);
+        color: var(--atb-text-muted);
         font-size: 12px;
       }
-      .card {
-        margin: 7px 0;
-        padding: 9px;
-        border: 1px solid #3a3a3c;
-        border-radius: 7px;
-        background: #2c2c2e;
+
+      .error {
+        margin-top: var(--atb-space-2);
+        padding: var(--atb-space-2);
+        border: 1px solid var(--atb-danger-border);
+        border-radius: var(--atb-radius-control);
+        background: var(--atb-error-surface);
+        color: var(--atb-error-text);
+        font-size: 12px;
       }
+
+      main {
+        display: flex;
+        flex-direction: column;
+        gap: var(--atb-space-4);
+        margin-top: var(--atb-space-3);
+      }
+      .guidance { line-height: 1.5; }
+      .section {
+        display: flex;
+        flex-direction: column;
+        gap: var(--atb-space-2);
+      }
+      .cards {
+        display: flex;
+        flex-direction: column;
+        gap: var(--atb-space-2);
+      }
+      .cards:empty { display: none; }
+
+      .card {
+        display: flex;
+        flex-direction: column;
+        gap: var(--atb-space-1);
+        padding: var(--atb-space-3);
+      }
+      /* Approval requests are the only high-salience surface. */
+      .card.pending { border-left: 3px solid var(--atb-warning); }
       .card-header {
         display: flex;
         justify-content: space-between;
-        gap: 10px;
         align-items: baseline;
+        gap: var(--atb-space-2);
       }
-      .task { font-weight: 650; overflow-wrap: anywhere; }
-      .label { color: #c7c7cc; overflow-wrap: anywhere; }
-      .meta { color: #98989f; font-size: 11px; line-height: 1.5; }
-      .caps { color: #d1d1d6; font-size: 11px; }
-      .tabs { margin: 7px 0 0; padding: 0; list-style: none; }
+      .task {
+        min-width: 0;
+        font-size: 13px;
+        font-weight: 600;
+        overflow-wrap: anywhere;
+      }
+      .remaining {
+        flex: 0 0 auto;
+        color: var(--atb-text-muted);
+        font-size: 12px;
+      }
+      .meta {
+        color: var(--atb-text-muted);
+        font-size: 12px;
+      }
+
+      .list-label {
+        margin-top: var(--atb-space-1);
+        color: var(--atb-text-muted);
+        font-size: 12px;
+      }
+      .tabs {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
       .tabs li {
         display: flex;
-        gap: 6px;
         align-items: baseline;
-        padding-top: 4px;
-        color: #c7c7cc;
-        font-size: 11px;
+        gap: var(--atb-space-1);
+        min-width: 0;
+        font-size: 12px;
       }
-      .tab-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .tab-id { color: #8e8e93; font-variant-numeric: tabular-nums; }
-      .actions { display: flex; gap: 6px; margin-top: 9px; }
-      button, select {
-        box-sizing: border-box;
-        min-height: 30px;
-        border: 1px solid #4a4a4c;
-        border-radius: 6px;
-        background: #3a3a3c;
-        color: #f2f2f7;
-        font: inherit;
+      .tab-id {
+        flex: 0 0 auto;
+        color: var(--atb-text-muted);
+        font-variant-numeric: tabular-nums;
       }
-      button {
-        flex: 1;
-        padding: 5px 8px;
+      .tab-sep {
+        flex: 0 0 auto;
+        color: var(--atb-text-muted);
+      }
+      .tab-title {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      details {
+        margin-top: var(--atb-space-1);
+        font-size: 12px;
+      }
+      summary {
+        padding: 2px 0;
+        color: var(--atb-text-muted);
         cursor: pointer;
       }
-      button.primary { border-color: #2463eb; background: #2463eb; }
-      button.danger { border-color: #923b38; background: #652b2b; }
-      button:focus-visible, select:focus-visible { outline: 2px solid #64a8ff; outline-offset: 2px; }
-      button:disabled, select:disabled { cursor: default; opacity: .5; }
-      select { width: 100%; padding: 5px 8px; }
-      .share-panel { margin-top: 10px; padding-top: 9px; border-top: 1px solid #3a3a3c; }
-      .share-label { display: block; margin-bottom: 5px; color: #c7c7cc; font-size: 12px; }
-      .empty { color: #98989f; font-size: 12px; }
-      .forget-companion {
-        margin: 12px 0 4px;
-        padding: 9px;
-        border: 1px solid #6a3937;
-        border-radius: 7px;
-        background: #342322;
+      details > p { margin-top: var(--atb-space-1); }
+
+      .actions {
+        display: flex;
+        gap: var(--atb-space-2);
+        margin-top: var(--atb-space-2);
       }
-      .forget-companion p { margin: 0 0 7px; }
+      .actions > .atb-btn { flex: 1 1 0; }
+
+      .device {
+        display: flex;
+        flex-direction: column;
+        gap: var(--atb-space-2);
+        margin-top: var(--atb-space-4);
+        padding-top: var(--atb-space-3);
+        border-top: 1px solid var(--atb-border);
+      }
+      .device .hint {
+        color: var(--atb-text-muted);
+        font-size: 12px;
+      }
+      /* Quiet outline, sized to its label — never a full-width filled block. */
+      #forgetCompanionButton { align-self: flex-start; }
+
       .hidden { display: none !important; }
     </style>
   </head>
   <body>
     <header>
-      <h1><span id="statusDot" class="dot" aria-hidden="true"></span><span>Agent Tab Bridge</span></h1>
-      <p id="connectionStatus" class="status muted" aria-live="polite">Checking companion…</p>
-      <p id="companionIdentity" class="identity"></p>
+      <h1>Agent Tab Bridge</h1>
+      <p class="status">
+        <span id="statusDot" class="dot connecting" aria-hidden="true"></span>
+        <span id="connectionStatus" aria-live="polite">Connecting to companion…</span>
+      </p>
+      <p id="companionIdentity" class="identity hidden"></p>
     </header>
-
-    <section class="forget-companion" aria-labelledby="forgetCompanionLabel">
-      <p id="forgetCompanionLabel"><strong>Forget this companion and revoke all its access.</strong></p>
-      <p id="forgetCompanionHint" class="muted">This immediately stops shared sessions, removes the pinned companion identity, and requires a new verification before access can be granted again.</p>
-      <button id="forgetCompanionButton" class="danger" type="button" aria-describedby="forgetCompanionHint">Forget companion &amp; revoke all access</button>
-    </section>
 
     <p id="error" class="error hidden" role="alert"></p>
 
     <main>
-      <section aria-labelledby="pendingHeading" id="pendingSection">
-        <h2 id="pendingHeading">Pending approvals</h2>
-        <div id="pendingSessions"></div>
+      <p id="firstRun" class="guidance hidden">
+        Start the Agent Tab Bridge companion and pair it with this browser. Approval requests will
+        appear here.
+      </p>
+
+      <section id="pendingSection" class="section hidden" aria-labelledby="pendingHeading">
+        <h2 id="pendingHeading">Approval requests (0)</h2>
+        <div id="pendingSessions" class="cards"></div>
       </section>
 
-      <section aria-labelledby="activeHeading" id="activeSection">
-        <h2 id="activeHeading">Active sessions</h2>
-        <div id="activeSessions"></div>
-        <div id="sharePanel" class="share-panel">
-          <label class="share-label" for="sessionChoice">Share the current tab with</label>
-          <select id="sessionChoice" aria-describedby="shareHint"></select>
-          <p id="shareHint" class="muted">Choose a session before sharing. A tab can belong to only one session.</p>
-          <div class="actions">
-            <button id="shareButton" class="primary" type="button">Share current tab</button>
-          </div>
-        </div>
+      <section id="activeSection" class="section hidden" aria-labelledby="activeHeading">
+        <h2 id="activeHeading">Active sessions (0)</h2>
+        <div id="activeSessions" class="cards"></div>
+        <p id="activeEmpty" class="meta">No active sessions.</p>
       </section>
     </main>
+
+    <footer class="device" aria-labelledby="deviceHeading">
+      <h2 id="deviceHeading">Device</h2>
+      <p id="deviceIdentity" class="meta">No companion paired.</p>
+      <p id="forgetCompanionHint" class="hint">
+        Stops all sessions and removes the stored companion identity. Pairing must be repeated
+        before access can be granted again.
+      </p>
+      <button id="forgetCompanionButton" class="atb-btn atb-btn--danger-quiet" type="button" disabled
+        aria-describedby="forgetCompanionHint">Forget companion…</button>
+      <p id="forgetAnnounce" class="atb-sr-only" aria-live="polite"></p>
+    </footer>
 
     <script src="popup.js" type="module"></script>
   </body>

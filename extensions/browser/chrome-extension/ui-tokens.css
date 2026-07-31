@@ -1,0 +1,114 @@
+/*
+ * Agent Tab Bridge shared visual tokens.
+ *
+ * Every hard-coded color value in the extension UI lives in the :root block
+ * below; popup.html and session.html consume it through custom properties
+ * only. Theme selection is automatic: `color-scheme: light dark` opts both
+ * pages into the platform light/dark palette and `light-dark()` resolves each
+ * token against it (Chrome 123+; the manifest minimum is 125).
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --atb-bg: light-dark(#ffffff, #202124);
+  --atb-card-bg: light-dark(#f8f9fa, #2d2e30);
+  --atb-text: light-dark(#1f1f1f, #e8eaed);
+  --atb-text-muted: light-dark(#5f6368, #9aa0a6);
+  --atb-border: light-dark(#dadce0, #3c4043);
+  --atb-accent-fill: light-dark(#0b57d0, #a8c7fa);
+  --atb-accent-on-fill: light-dark(#ffffff, #062e6f);
+  --atb-danger: light-dark(#d93025, #f28b82);
+  --atb-danger-surface: light-dark(#fce8e6, #3c2422);
+  --atb-danger-border: light-dark(#f2b8b5, #8c4a45);
+  /* Text drawn on top of --atb-danger; dark mode needs an ink, not white. */
+  --atb-danger-on-fill: light-dark(#ffffff, #202124);
+  --atb-warning: light-dark(#f9ab00, #fdd663);
+  --atb-success: light-dark(#188038, #81c995);
+  --atb-error-surface: light-dark(#fce8e6, #3c2422);
+  --atb-error-text: light-dark(#d93025, #f28b82);
+  --atb-focus-ring: light-dark(#0b57d0, #a8c7fa);
+  /* Chrome tab-group "blue", the color background.js assigns via TASK_GROUP_COLOR. */
+  --atb-group-blue: light-dark(#1a73e8, #8ab4f8);
+
+  --atb-font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --atb-radius-card: 8px;
+  --atb-radius-control: 6px;
+  --atb-space-1: 4px;
+  --atb-space-2: 8px;
+  --atb-space-3: 12px;
+  --atb-space-4: 16px;
+}
+
+/* Focus is never suppressed, on either page. */
+*:focus-visible {
+  outline: 2px solid var(--atb-focus-ring);
+  outline-offset: 2px;
+}
+
+.atb-muted {
+  color: var(--atb-text-muted);
+}
+
+.atb-card {
+  box-sizing: border-box;
+  border: 1px solid var(--atb-border);
+  border-radius: var(--atb-radius-card);
+  background: var(--atb-card-bg);
+}
+
+.atb-btn {
+  box-sizing: border-box;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--atb-radius-control);
+  background: transparent;
+  color: var(--atb-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+/* Disabled controls always carry a reason in `title`/aria-describedby. */
+.atb-btn:disabled {
+  cursor: default;
+  opacity: .5;
+}
+
+.atb-btn--primary {
+  border-color: var(--atb-accent-fill);
+  background: var(--atb-accent-fill);
+  color: var(--atb-accent-on-fill);
+}
+
+.atb-btn--secondary {
+  border-color: var(--atb-border);
+  background: transparent;
+  color: var(--atb-text);
+}
+
+/* The only danger-styled control in the UI is Forget companion. */
+.atb-btn--danger-quiet {
+  border-color: var(--atb-danger-border);
+  background: transparent;
+  color: var(--atb-danger);
+}
+
+/* Step 2 of the Forget two-step confirm; the only filled-danger control. */
+.atb-btn--danger-filled {
+  border-color: var(--atb-danger);
+  background: var(--atb-danger);
+  color: var(--atb-danger-on-fill);
+}
+
+.atb-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

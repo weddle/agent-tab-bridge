@@ -28,13 +28,7 @@ const TASK_GROUP_COLOR = "blue";
 const MAX_TASK_LABEL_LENGTH = 128;
 const CDP_POLICY_ERROR = "CDP method is not permitted by Agent Tab Bridge";
 const SESSION_PAGE_URL = chrome.runtime.getURL("session.html");
-const BADGE = {
-  disconnected: { text: "", color: "#000000" },
-  connecting: { text: "…", color: "#F59E0B" },
-  connected: { text: "ON", color: "#0F9D58" },
-  error: { text: "!", color: "#B91C1C" },
-};
-
+const TOOLBAR_TITLE = "Agent Tab Bridge";
 /** Session records supplied by the authenticated companion, keyed by task ID. */
 const sessions = new Map();
 /** One ephemeral relay socket per active task session. */
@@ -64,7 +58,6 @@ const stoppingSessions = new Map();
 /** Popup-approved records awaiting exactly one matching active transition. */
 const approvedSessions = new Map();
 
-
 let nativePort = null;
 let nativeState = "disconnected";
 let nativeGeneration = 0;
@@ -77,22 +70,66 @@ let trustedCompanion = null;
 const requestIdPrefix = randomNonce();
 let nextRequestId = 0;
 
-function setBadge(state) {
-  const badge = BADGE[state] ?? BADGE.disconnected;
-  void chrome.action.setBadgeText({ text: badge.text });
-  void chrome.action.setBadgeBackgroundColor({ color: badge.color });
+function formatToolbarCount(count, noun) {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+function toolbarBadgeCount(count) {
+  return count > 9 ? "9+" : String(count);
+}
+
+function toolbarSessionCounts() {
+  let pending = 0;
+  let active = 0;
+  for (const session of sessions.values()) {
+    if (session.state === "pending") {
+      pending += 1;
+    } else if (
+      session.state === "active" &&
+      relaySockets.has(session.id) &&
+      readyRelaySessions.has(session.id)
+    ) {
+      active += 1;
+    }
+  }
+  return { pending, active };
 }
 
 function refreshBadge() {
+  const { pending, active } = toolbarSessionCounts();
+  let text;
+  let color;
+  let title;
+
   if (nativeState === "disconnected") {
-    setBadge("disconnected");
+    text = "OFF";
+    color = "#5F6368";
+    title = `${TOOLBAR_TITLE} — companion off`;
   } else if (nativeState === "connecting") {
-    setBadge("connecting");
-  } else if (relaySockets.size > 0) {
-    setBadge("connected");
+    text = "…";
+    color = "#F9AB00";
+    title = `${TOOLBAR_TITLE} — connecting to companion`;
+  } else if (pending > 0) {
+    text = toolbarBadgeCount(pending);
+    color = "#F9AB00";
+    title = `${TOOLBAR_TITLE} — ${formatToolbarCount(pending, "approval")} waiting`;
+    if (active > 0) {
+      title += ` · ${formatToolbarCount(active, "session")} active`;
+    }
+  } else if (active > 0) {
+    text = toolbarBadgeCount(active);
+    color = "#188038";
+    title = `${TOOLBAR_TITLE} — ${formatToolbarCount(active, "session")} active`;
   } else {
-    setBadge("connected");
+    text = "";
+    title = `${TOOLBAR_TITLE} — connected, no active sessions`;
   }
+
+  void chrome.action.setBadgeText({ text });
+  if (color) {
+    void chrome.action.setBadgeBackgroundColor({ color });
+  }
+  void chrome.action.setTitle({ title });
 }
 
 function newRequestId() {
@@ -489,15 +526,19 @@ async function handleNativeMessage(message, port, generation) {
   switch (message.type) {
     case "snapshot":
       await handleNativeSnapshot(message);
+      refreshBadge();
       return;
     case "sessionPending":
       await handleSessionPending(message);
+      refreshBadge();
       return;
     case "sessionStarted":
       await handleSessionStarted(message);
+      refreshBadge();
       return;
     case "sessionStopped":
       await handleSessionStopped(message);
+      refreshBadge();
       return;
     default:
       return;
@@ -1103,6 +1144,7 @@ async function stopSession(sessionId, { removeSession = true } = {}) {
     await task;
   } finally {
     stoppingSessions.delete(sessionId);
+    refreshBadge();
   }
 }
 

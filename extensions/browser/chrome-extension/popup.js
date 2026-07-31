@@ -1,13 +1,36 @@
+/**
+ * Agent Tab Bridge popup.
+ *
+ * Background runtime contract is unchanged: getStatus, approveSession,
+ * revokeSession, shareTab, unshareTab, forgetCompanion.
+ *
+ * Rendering rule: the 2s poll reconciles session cards keyed by session id and
+ * only rebuilds a card whose rendered content actually changed. A card is left
+ * untouched while it holds keyboard focus or a text selection, or while one of
+ * its own mutations is in flight, so a render tick can never steal focus or
+ * re-enable a control the user just used.
+ */
+
 const statusDot = document.getElementById("statusDot");
 const connectionStatus = document.getElementById("connectionStatus");
 const companionIdentity = document.getElementById("companionIdentity");
-const pendingSessions = document.getElementById("pendingSessions");
-const activeSessions = document.getElementById("activeSessions");
-const sharePanel = document.getElementById("sharePanel");
-const sessionChoice = document.getElementById("sessionChoice");
-const shareButton = document.getElementById("shareButton");
-const forgetCompanionButton = document.getElementById("forgetCompanionButton");
 const errorLine = document.getElementById("error");
+const firstRun = document.getElementById("firstRun");
+const pendingSection = document.getElementById("pendingSection");
+const pendingHeading = document.getElementById("pendingHeading");
+const pendingList = document.getElementById("pendingSessions");
+const activeSection = document.getElementById("activeSection");
+const activeHeading = document.getElementById("activeHeading");
+const activeList = document.getElementById("activeSessions");
+const activeEmpty = document.getElementById("activeEmpty");
+const deviceIdentity = document.getElementById("deviceIdentity");
+const forgetButton = document.getElementById("forgetCompanionButton");
+const forgetAnnounce = document.getElementById("forgetAnnounce");
+
+const POLL_INTERVAL_MS = 2_000;
+const FORGET_CONFIRM_MS = 5_000;
+const DEVICE_KEY = "\u0000device";
+const UNIT = "\u0000";
 
 let state = {
   native: { state: "disconnected", companion: { id: null, name: null, trusted: false, pinned: false } },
@@ -17,13 +40,16 @@ let state = {
 };
 let currentTab = null;
 let refreshRevision = 0;
+let errorText = "";
+let forgetConfirmTimer = null;
 
-const CONNECTION_LABEL = {
-  connected: "Companion connected",
-  connecting: "Connecting to companion…",
-  disconnected: "Companion disconnected",
-  error: "Companion error; try again",
-};
+/** Keys with a mutation in flight; their controls are off-limits to renders. */
+const inFlight = new Set();
+/** Session ids whose Details disclosure the user opened. */
+const openDetails = new Set();
+/** Session id -> { node, remainingEl, signature } */
+const pendingCards = new Map();
+const activeCards = new Map();
 
 function makeElement(tag, className, text) {
   const element = document.createElement(tag);
@@ -32,14 +58,31 @@ function makeElement(tag, className, text) {
   return element;
 }
 
-function clear(element) {
-  element.replaceChildren();
+function makeButton(label, variant) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `atb-btn atb-btn--${variant}`;
+  button.textContent = label;
+  return button;
+}
+
+/** Never write text that is already there: aria-live must not re-announce. */
+function setText(element, text) {
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function setHidden(element, hidden) {
+  element.classList.toggle("hidden", hidden);
 }
 
 function abbreviate(value) {
   if (typeof value !== "string" || value.length === 0) return "Not available";
   if (value.length <= 16) return value;
   return `${value.slice(0, 8)}…${value.slice(-6)}`;
+}
+
+function plural(count, noun) {
+  return count === 1 ? noun : `${noun}s`;
 }
 
 function safeError(error) {
@@ -50,13 +93,19 @@ function safeError(error) {
 }
 
 function showError(error) {
-  errorLine.textContent = `Action failed: ${safeError(error)}`;
-  errorLine.classList.remove("hidden");
+  errorText = `Action failed: ${safeError(error)}`;
+  setText(errorLine, errorText);
+  setHidden(errorLine, false);
+  renderStatus();
 }
 
-function hideError() {
-  errorLine.textContent = "";
-  errorLine.classList.add("hidden");
+/** Contract §2.2: the error region is cleared by the next successful refresh. */
+function clearError() {
+  if (errorText === "") return;
+  errorText = "";
+  setText(errorLine, "");
+  setHidden(errorLine, true);
+  renderStatus();
 }
 
 function timestamp(value) {
@@ -96,115 +145,26 @@ function formatCapabilities(capabilities) {
   return capabilities.map((capability) => String(capability)).join(", ");
 }
 
-function controllerText(session) {
-  const label = typeof session?.controllerName === "string" && session.controllerName
-    ? session.controllerName
-    : "Unnamed controller";
-  const principal = typeof session?.controllerId === "string" && session.controllerId
-    ? ` · principal ${abbreviate(session.controllerId)}`
-    : "";
-  return { label, principal };
+function sessionKey(session) {
+  return typeof session?.id === "string" ? session.id : "";
 }
 
-function sessionCard(session, pending) {
-  const card = makeElement("article", "card");
-  const header = makeElement("div", "card-header");
-  const task = makeElement("div", "task", session?.taskLabel || "Unnamed task");
-  task.title = "Unverified task label";
-  header.append(task, makeElement("span", "meta", formatRemaining(session)));
-  card.append(header);
-
-  const controller = controllerText(session);
-  const label = makeElement("p", "label", `Unverified controller label: ${controller.label}`);
-  label.title = "Display label only; not an authenticated identity";
-  card.append(label);
-  if (controller.principal) {
-    card.append(makeElement("p", "meta", `Authenticated principal${controller.principal}`));
-  }
-  card.append(makeElement("p", "caps", `Requested capabilities: ${formatCapabilities(session?.capabilities)}`));
-  if (!pending) {
-    const health = typeof session?.health === "string" && session.health
-      ? session.health
-      : "active";
-    card.append(makeElement("p", "meta", `Session health: ${health}`));
-  }
-
-  const actions = makeElement("div", "actions");
-  if (pending) {
-    const approve = makeElement("button", "primary", "Approve");
-    approve.type = "button";
-    approve.addEventListener("click", () => void mutate("approveSession", session?.id, approve));
-    const decline = makeElement("button", "danger", "Decline");
-    decline.type = "button";
-    decline.addEventListener("click", () => void mutate("revokeSession", session?.id, decline));
-    actions.append(approve, decline);
-  } else {
-    const revoke = makeElement("button", "danger", "Revoke session");
-    revoke.type = "button";
-    revoke.addEventListener("click", () => void mutate("revokeSession", session?.id, revoke));
-    actions.append(revoke);
-    const tabs = state.sharedTabs.filter((tab) => tab?.sessionId === session?.id);
-    if (tabs.length > 0) {
-      const tabList = makeElement("ul", "tabs");
-      tabList.setAttribute("aria-label", "Shared tabs");
-      for (const tab of tabs) {
-        const item = makeElement("li");
-        item.append(
-          makeElement("span", "tab-id", `Tab ${String(tab?.tabId ?? "?")}`),
-          makeElement("span", "tab-title", tab?.title || "Untitled tab"),
-        );
-        tabList.append(item);
-      }
-      card.append(tabList);
-    } else {
-      card.append(makeElement("p", "meta", "No shared tabs"));
-    }
-  }
-  card.append(actions);
-  return card;
+function taskLabel(session) {
+  return session?.taskLabel || "Unnamed task";
 }
 
-function renderPending() {
-  clear(pendingSessions);
-  if (state.pendingSessions.length === 0) {
-    pendingSessions.append(makeElement("p", "empty", "No pending approvals."));
-    return;
-  }
-  for (const session of state.pendingSessions) pendingSessions.append(sessionCard(session, true));
+function controllerLabel(session) {
+  return session?.controllerName || "Unnamed controller";
 }
 
-function selectedSessionId() {
-  return sessionChoice.value || state.activeSessions[0]?.id || "";
+function healthText(session) {
+  if (typeof session?.health === "string" && session.health) return session.health;
+  if (typeof session?.state === "string" && session.state) return session.state;
+  return "active";
 }
 
-function renderActive() {
-  clear(activeSessions);
-  clear(sessionChoice);
-  if (state.activeSessions.length === 0) {
-    activeSessions.append(makeElement("p", "empty", "No active sessions."));
-    sharePanel.classList.add("hidden");
-    shareButton.disabled = true;
-    return;
-  }
-  sharePanel.classList.remove("hidden");
-  for (const session of state.activeSessions) {
-    activeSessions.append(sessionCard(session, false));
-    const option = makeElement("option", "", session?.taskLabel || "Unnamed task");
-    option.value = String(session?.id ?? "");
-    option.textContent = `${session?.taskLabel || "Unnamed task"} · ${controllerText(session).label}`;
-    sessionChoice.append(option);
-  }
-  if (state.activeSessions.length > 1) {
-    sessionChoice.removeAttribute("aria-label");
-  } else {
-    sessionChoice.setAttribute("aria-label", "Active session");
-  }
-  updateShareControl();
-}
-
-function selectedSession() {
-  const id = selectedSessionId();
-  return state.activeSessions.find((session) => String(session?.id) === String(id)) ?? null;
+function tabsForSession(id) {
+  return state.sharedTabs.filter((tab) => String(tab?.sessionId) === id);
 }
 
 function sharedTabForCurrent() {
@@ -212,40 +172,307 @@ function sharedTabForCurrent() {
   return state.sharedTabs.find((tab) => Number(tab?.tabId) === currentTab.id) ?? null;
 }
 
-function updateShareControl() {
-  const session = selectedSession();
-  const shared = sharedTabForCurrent();
-  const ownsCurrent = Boolean(session && shared && String(shared.sessionId) === String(session.id));
-  const ownedByOther = Boolean(shared && !ownsCurrent);
-  shareButton.textContent = ownsCurrent ? "Unshare current tab" : "Share current tab";
-  shareButton.classList.toggle("danger", ownsCurrent);
-  shareButton.classList.toggle("primary", !ownsCurrent);
-  shareButton.disabled = !session || !Number.isInteger(currentTab?.id) || ownedByOther;
-  if (ownedByOther) {
-    shareButton.title = "Select the session that owns this tab to unshare it";
-  } else {
-    shareButton.removeAttribute("title");
+/**
+ * Per-card share control state. This replaces the old global session picker
+ * and share panel entirely: ownership of the current tab decides the label,
+ * so a poll tick can no longer reset which session a share would target.
+ */
+function shareMode(session) {
+  const id = sessionKey(session);
+  if (!Number.isInteger(currentTab?.id)) {
+    return {
+      action: "shareTab",
+      label: "Share current tab",
+      variant: "primary",
+      disabled: true,
+      reason: "This page cannot be shared. Switch to a website tab and try again.",
+    };
   }
+  const shared = sharedTabForCurrent();
+  if (shared && String(shared.sessionId) === id) {
+    return {
+      action: "unshareTab",
+      label: "Unshare current tab",
+      variant: "secondary",
+      disabled: false,
+      reason: "",
+    };
+  }
+  if (shared) {
+    const owner = state.activeSessions.find((other) => sessionKey(other) === String(shared.sessionId));
+    const ownerLabel = owner ? taskLabel(owner) : "another session";
+    return {
+      action: "shareTab",
+      label: "Share current tab",
+      variant: "primary",
+      disabled: true,
+      reason: `This tab is shared with “${ownerLabel}” — unshare it from that session's card.`,
+    };
+  }
+  return {
+    action: "shareTab",
+    label: "Share current tab",
+    variant: "primary",
+    disabled: false,
+    reason: "",
+  };
+}
+
+/**
+ * Everything a card renders except the ticking time remaining, which is
+ * refreshed in place so the clock never forces a rebuild.
+ */
+function pendingSignature(session) {
+  return [
+    sessionKey(session),
+    taskLabel(session),
+    controllerLabel(session),
+    typeof session?.controllerId === "string" ? session.controllerId : "",
+    formatCapabilities(session?.capabilities),
+  ].join(UNIT);
+}
+
+function activeSignature(session) {
+  const id = sessionKey(session);
+  const share = shareMode(session);
+  const tabs = tabsForSession(id)
+    .map((tab) => `${String(tab?.tabId ?? "?")}:${tab?.title ?? ""}`)
+    .join(UNIT);
+  return [
+    id,
+    taskLabel(session),
+    controllerLabel(session),
+    typeof session?.controllerId === "string" ? session.controllerId : "",
+    formatCapabilities(session?.capabilities),
+    healthText(session),
+    tabs,
+    share.label,
+    share.variant,
+    share.disabled ? "1" : "0",
+    share.reason,
+  ].join(UNIT);
+}
+
+function buildPendingCard(session) {
+  const id = sessionKey(session);
+  const card = makeElement("article", "atb-card card pending");
+
+  const task = makeElement("div", "task", taskLabel(session));
+  task.title = "Unverified task label";
+  card.append(task);
+  card.append(makeElement("p", "meta", `Requested by ${controllerLabel(session)} (unverified)`));
+  if (typeof session?.controllerId === "string" && session.controllerId) {
+    card.append(makeElement("p", "meta", `Principal ${abbreviate(session.controllerId)}`));
+  }
+  card.append(makeElement("p", "meta", `Capabilities: ${formatCapabilities(session?.capabilities)}`));
+  const remainingEl = makeElement("p", "meta remaining", formatRemaining(session));
+  card.append(remainingEl);
+
+  const decline = makeButton("Decline", "secondary");
+  decline.addEventListener("click", () => void mutateSession("revokeSession", id, decline));
+  const approve = makeButton("Approve", "primary");
+  approve.addEventListener("click", () => void mutateSession("approveSession", id, approve));
+  const actions = makeElement("div", "actions");
+  actions.append(decline, approve);
+  card.append(actions);
+
+  return { node: card, remainingEl, signature: "" };
+}
+
+function buildActiveCard(session) {
+  const id = sessionKey(session);
+  const card = makeElement("article", "atb-card card");
+
+  const header = makeElement("div", "card-header");
+  const task = makeElement("div", "task", taskLabel(session));
+  task.title = "Unverified task label";
+  const remainingEl = makeElement("span", "remaining", formatRemaining(session));
+  header.append(task, remainingEl);
+  card.append(header);
+  card.append(makeElement("p", "meta", `Requested by ${controllerLabel(session)} (unverified)`));
+
+  card.append(makeElement("p", "list-label", "Tabs shared with this session"));
+  const tabs = tabsForSession(id);
+  if (tabs.length === 0) {
+    card.append(makeElement("p", "meta", "No shared tabs"));
+  } else {
+    const list = makeElement("ul", "tabs");
+    list.setAttribute("aria-label", "Tabs shared with this session");
+    for (const tab of tabs) {
+      const item = makeElement("li");
+      item.append(
+        makeElement("span", "tab-id", `Tab ${String(tab?.tabId ?? "?")}`),
+        makeElement("span", "tab-sep", "—"),
+        makeElement("span", "tab-title", tab?.title || "Untitled tab"),
+      );
+      list.append(item);
+    }
+    card.append(list);
+  }
+
+  const details = document.createElement("details");
+  details.open = openDetails.has(id);
+  details.addEventListener("toggle", () => {
+    if (details.open) openDetails.add(id);
+    else openDetails.delete(id);
+  });
+  details.append(
+    makeElement("summary", undefined, "Details"),
+    makeElement("p", "meta", `Principal ${abbreviate(session?.controllerId)}`),
+    makeElement("p", "meta", `Capabilities: ${formatCapabilities(session?.capabilities)}`),
+    makeElement("p", "meta", `Session health: ${healthText(session)}`),
+    makeElement("p", "meta", `Session id ${abbreviate(session?.id)}`),
+  );
+  card.append(details);
+
+  const share = shareMode(session);
+  const shareButton = makeButton(share.label, share.variant);
+  shareButton.disabled = share.disabled;
+  if (share.reason) shareButton.title = share.reason;
+  shareButton.addEventListener("click", () => void onShare(session, shareButton));
+  const end = makeButton("End session", "secondary");
+  end.addEventListener("click", () => void mutateSession("revokeSession", id, end));
+  const actions = makeElement("div", "actions");
+  actions.append(shareButton, end);
+  card.append(actions);
+
+  return { node: card, remainingEl, signature: "" };
+}
+
+/** True while the user is typing in, focused on, or selecting text inside node. */
+function holdsUserContext(node) {
+  const active = document.activeElement;
+  if (active && active !== document.body && node.contains(active)) return true;
+  const selection = document.getSelection();
+  if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+    if (node.contains(selection.getRangeAt(0).commonAncestorContainer)) return true;
+  }
+  return false;
+}
+
+function reconcile(container, records, sessions, signatureOf, build) {
+  const ordered = [];
+  const seen = new Set();
+  for (const session of sessions) {
+    const id = sessionKey(session);
+    if (id === "" || seen.has(id)) continue;
+    seen.add(id);
+    const signature = signatureOf(session);
+    let record = records.get(id);
+    if (record === undefined) {
+      record = build(session);
+      record.signature = signature;
+      records.set(id, record);
+    } else if (record.signature !== signature) {
+      // Leave the card alone while the user owns it; the next tick retries.
+      if (!inFlight.has(id) && !holdsUserContext(record.node)) {
+        const next = build(session);
+        next.signature = signature;
+        record.node.replaceWith(next.node);
+        records.set(id, next);
+        record = next;
+      }
+    }
+    setText(record.remainingEl, formatRemaining(session));
+    ordered.push(record.node);
+  }
+  for (const [id, record] of records) {
+    if (seen.has(id)) continue;
+    record.node.remove();
+    records.delete(id);
+  }
+  const children = container.childNodes;
+  const inOrder = children.length === ordered.length && ordered.every((node, index) => children[index] === node);
+  // Re-inserting nodes drops focus, so only reorder when the user is elsewhere.
+  if (inOrder) return;
+  if (holdsUserContext(container)) {
+    for (const node of ordered) {
+      if (!node.isConnected) container.append(node);
+    }
+    return;
+  }
+  container.replaceChildren(...ordered);
+}
+
+/** Header status line, most-important-wins. */
+function statusText(nativeStatus, pendingCount, activeCount) {
+  if (errorText !== "") return errorText;
+  if (pendingCount > 0) return `${pendingCount} ${plural(pendingCount, "approval")} waiting`;
+  if (activeCount > 0) return `${activeCount} ${plural(activeCount, "session")} active`;
+  if (nativeStatus === "connecting") return "Connecting to companion…";
+  if (nativeStatus === "connected") return "Companion connected";
+  return "Companion off";
+}
+
+function renderStatus() {
+  const nativeStatus = typeof state.native?.state === "string" ? state.native.state : "disconnected";
+  const pendingCount = state.pendingSessions.length;
+  const activeCount = state.activeSessions.length;
+  const dotState = errorText !== "" ? "error" : nativeStatus;
+  const dotClass = `dot ${dotState}`;
+  if (statusDot.className !== dotClass) statusDot.className = dotClass;
+  setText(connectionStatus, statusText(nativeStatus, pendingCount, activeCount));
+}
+
+function renderDevice(companion) {
+  const trusted = companion.trusted === true;
+  const pinned = companion.pinned === true;
+  const id = typeof companion.id === "string" && companion.id ? companion.id : "";
+  if (trusted && id) {
+    setText(
+      deviceIdentity,
+      `Verified companion ${abbreviate(id)}${companion.name ? ` · ${companion.name}` : ""}`,
+    );
+  } else if (pinned && id) {
+    setText(deviceIdentity, `Pinned companion (not connected) ${abbreviate(id)}`);
+  } else if (pinned) {
+    setText(deviceIdentity, "Stored companion identity is unreadable. Forget it to pair again.");
+  } else {
+    setText(deviceIdentity, "No companion paired.");
+  }
+
+  // Never move the Forget control under the user mid-confirm or mid-request.
+  if (forgetConfirmTimer !== null || inFlight.has(DEVICE_KEY)) return;
+  const canForget = trusted || pinned;
+  forgetButton.disabled = !canForget;
+  if (canForget) forgetButton.removeAttribute("title");
+  else forgetButton.title = "No companion is paired, so there is nothing to forget.";
 }
 
 function render() {
+  renderStatus();
+
   const native = state.native ?? {};
-  const status = typeof native.state === "string" ? native.state : "disconnected";
-  statusDot.className = `dot ${status}`;
-  connectionStatus.textContent = CONNECTION_LABEL[status] ?? "Companion status unavailable";
+  const nativeStatus = typeof native.state === "string" ? native.state : "disconnected";
   const companion = native.companion ?? {};
-  const canForget = companion.trusted === true || companion.pinned === true;
-  forgetCompanionButton.disabled = !canForget;
-  if (companion.id) {
-    const statusLabel = companion.trusted === true ? "Verified companion" : "Pinned companion (not connected)";
-    companionIdentity.textContent = `${statusLabel}: ${abbreviate(companion.id)}${companion.name ? ` · ${companion.name}` : ""}`;
-  } else if (companion.pinned === true) {
-    companionIdentity.textContent = "Stored companion identity needs removal.";
-  } else {
-    companionIdentity.textContent = "No companion is pinned.";
-  }
-  renderPending();
-  renderActive();
+  const pending = state.pendingSessions;
+  const active = state.activeSessions;
+
+  const identityKnown =
+    typeof companion.id === "string" && companion.id !== "" &&
+    (companion.trusted === true || companion.pinned === true);
+  if (identityKnown) setText(companionIdentity, abbreviate(companion.id));
+  setHidden(companionIdentity, !identityKnown);
+
+  const isFirstRun =
+    nativeStatus === "disconnected" &&
+    companion.trusted !== true &&
+    companion.pinned !== true &&
+    pending.length === 0 &&
+    active.length === 0;
+  setHidden(firstRun, !isFirstRun);
+
+  // Zero pending means no approval chrome at all, heading included.
+  setHidden(pendingSection, pending.length === 0);
+  setText(pendingHeading, `Approval requests (${pending.length})`);
+  reconcile(pendingList, pendingCards, pending, pendingSignature, buildPendingCard);
+
+  setHidden(activeSection, nativeStatus !== "connected" && active.length === 0);
+  setText(activeHeading, `Active sessions (${active.length})`);
+  reconcile(activeList, activeCards, active, activeSignature, buildActiveCard);
+  setHidden(activeEmpty, active.length > 0);
+
+  renderDevice(companion);
 }
 
 async function queryActiveTab() {
@@ -263,14 +490,16 @@ async function refresh() {
     const result = await chrome.runtime.sendMessage({ type: "getStatus" });
     if (revision !== refreshRevision) return;
     if (!result?.ok) throw new Error(result?.error ?? "Companion state is unavailable.");
+    const tab = await queryActiveTab();
+    if (revision !== refreshRevision) return;
     state = {
       native: result.native ?? {},
       pendingSessions: Array.isArray(result.pendingSessions) ? result.pendingSessions : [],
       activeSessions: Array.isArray(result.activeSessions) ? result.activeSessions : [],
       sharedTabs: Array.isArray(result.sharedTabs) ? result.sharedTabs : [],
     };
-    currentTab = await queryActiveTab();
-    if (revision !== refreshRevision) return;
+    currentTab = tab;
+    clearError();
     render();
   } catch (error) {
     if (revision !== refreshRevision) return;
@@ -278,68 +507,91 @@ async function refresh() {
   }
 }
 
-async function mutate(type, sessionId, button) {
+/**
+ * Runs one background mutation. The control stays disabled for the whole
+ * round trip and is only re-enabled here, never by a render tick. A failure
+ * skips the resync so the error survives to be read; the poll resyncs and
+ * clears it on its next successful pass.
+ */
+async function runMutation(key, control, message, fallbackError) {
+  clearError();
+  inFlight.add(key);
+  control.disabled = true;
+  let failure = null;
+  try {
+    const result = await chrome.runtime.sendMessage(message);
+    if (!result?.ok) throw new Error(result?.error ?? fallbackError);
+  } catch (error) {
+    failure = error;
+  } finally {
+    inFlight.delete(key);
+  }
+  if (failure !== null) {
+    control.disabled = false;
+    showError(failure);
+    return false;
+  }
+  await refresh();
+  return true;
+}
+
+async function mutateSession(type, sessionId, control) {
   if (typeof sessionId !== "string" || sessionId.length === 0) {
     showError(new Error("The session is no longer available. Refresh and try again."));
     return;
   }
-  hideError();
-  button.disabled = true;
-  try {
-    const result = await chrome.runtime.sendMessage({ type, sessionId });
-    if (!result?.ok) throw new Error(result?.error ?? "The companion rejected this action.");
-    await refresh();
-  } catch (error) {
-    showError(error);
-    button.disabled = false;
-  }
+  await runMutation(sessionId, control, { type, sessionId }, "The companion rejected this action.");
 }
 
-async function onShare() {
-  const session = selectedSession();
-  if (!session || !Number.isInteger(currentTab?.id)) {
-    showError(new Error("Select an active session and keep a browser tab active."));
-    return;
-  }
-  const shared = sharedTabForCurrent();
-  const ownsCurrent = shared && String(shared.sessionId) === String(session.id);
-  if (shared && !ownsCurrent) {
-    showError(new Error("This tab is already shared with another session. Select that session to unshare it first."));
-    return;
-  }
-  hideError();
-  shareButton.disabled = true;
-  const type = ownsCurrent ? "unshareTab" : "shareTab";
-  try {
-    const result = await chrome.runtime.sendMessage({ type, sessionId: session.id, tabId: currentTab.id });
-    if (!result?.ok) throw new Error(result?.error ?? "The companion rejected this tab action.");
-    await refresh();
-  } catch (error) {
-    showError(error);
-    shareButton.disabled = false;
-  }
+async function onShare(session, control) {
+  const id = sessionKey(session);
+  const mode = shareMode(session);
+  if (id === "" || mode.disabled || !Number.isInteger(currentTab?.id)) return;
+  await runMutation(
+    id,
+    control,
+    { type: mode.action, sessionId: id, tabId: currentTab.id },
+    "The companion rejected this tab action.",
+  );
 }
 
-async function onForgetCompanion() {
-  if (forgetCompanionButton.disabled) {
-    return;
-  }
-  hideError();
-  forgetCompanionButton.disabled = true;
-  try {
-    const result = await chrome.runtime.sendMessage({ type: "forgetCompanion" });
-    if (!result?.ok) throw new Error(result?.error ?? "The companion could not be forgotten.");
-    await refresh();
-  } catch (error) {
-    showError(error);
-    await refresh();
-  }
+function disarmForget() {
+  if (forgetConfirmTimer === null) return;
+  clearTimeout(forgetConfirmTimer);
+  forgetConfirmTimer = null;
+  forgetButton.classList.remove("atb-btn--danger-filled");
+  forgetButton.classList.add("atb-btn--danger-quiet");
+  setText(forgetButton, "Forget companion…");
+  setText(forgetAnnounce, "");
 }
 
+function armForget() {
+  forgetButton.classList.remove("atb-btn--danger-quiet");
+  forgetButton.classList.add("atb-btn--danger-filled");
+  setText(forgetButton, "Confirm: forget and revoke all access");
+  setText(
+    forgetAnnounce,
+    "Press the button again within 5 seconds to forget the companion and revoke all access.",
+  );
+  forgetConfirmTimer = setTimeout(disarmForget, FORGET_CONFIRM_MS);
+}
 
-sessionChoice.addEventListener("change", updateShareControl);
-shareButton.addEventListener("click", () => void onShare());
-forgetCompanionButton.addEventListener("click", () => void onForgetCompanion());
+forgetButton.addEventListener("click", () => {
+  if (forgetButton.disabled) return;
+  if (forgetConfirmTimer === null) {
+    armForget();
+    return;
+  }
+  disarmForget();
+  void runMutation(
+    DEVICE_KEY,
+    forgetButton,
+    { type: "forgetCompanion" },
+    "The companion could not be forgotten.",
+  );
+});
+
+forgetButton.addEventListener("blur", disarmForget);
 
 void refresh();
-setInterval(() => void refresh(), 2_000);
+setInterval(() => void refresh(), POLL_INTERVAL_MS);
