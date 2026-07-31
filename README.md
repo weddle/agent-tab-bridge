@@ -137,7 +137,16 @@ node dist/src/atb.js claim-tab --session research --tab 311
 
 The all-tabs inventory labels each tab's `ownership` as `unclaimed`, `currentSession`, or `otherSession` and its `claimability` as `claimable`, `approvalRequired`, `alreadyShared`, or `blocked`. It does not reveal another session's identity. `--scope session` returns only tabs already in the named session. `claim-tab` succeeds without another prompt only when the session's existing selected-tab, domain, or full-access grant authorizes that tab; otherwise request and approve an access upgrade first.
 
-Every upgrade is separately displayed and approved or declined in the popup. Access can expand from selected tabs to requested sites to full access, but never silently narrows or broadens. `atb` injects the ephemeral `BROWSER_CDP_URL` only into a launched child process; it is never printed, persisted, or copied by the user. Browser loss, session revocation, tab-group removal, or debugger detachment removes the corresponding authority.
+Every upgrade is separately displayed and approved or declined in the popup. Access can expand from selected tabs to requested sites to full access, but never silently narrows or broadens. `atb run` injects the ephemeral `BROWSER_CDP_URL` only into a launched child process. Browser loss, session revocation, tab-group removal, or debugger detachment removes the corresponding authority.
+
+A long-running harness that cannot be launched as a child of `atb run` (a persistent Hermes or omp process) can attach to a named session instead. Open and approve the session once, then request its live relay URL explicitly:
+
+```bash
+node dist/src/atb.js open --session research --label "Research task" --domain example.com
+node dist/src/atb.js url --session research
+```
+
+`atb url` prints the session's loopback `ws://127.0.0.1:...` endpoint exactly once per invocation for the operator to paste into the harness (Hermes `/browser connect` or `browser.cdp_url`; omp `browser.cdpUrl`). The URL is session-scoped and ephemeral: atb never writes it to disk, it stops working the moment the session is revoked or closed, and a new relay means a new URL. Do not persist it in configuration files or logs.
 
 Close a named session explicitly when the task is finished:
 

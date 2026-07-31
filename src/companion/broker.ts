@@ -9,7 +9,7 @@ import { isSessionAccessDelta, type SessionAccess, type SessionAccessDelta } fro
 import type { AccessUpgradeRecord } from "./native-protocol.js";
 
 export const BROKER_MAX_LINE_BYTES = 1024 * 1024;
-export type BrokerCommand = "status" | "listTabs" | "claimTab" | "openSession" | "requestAccess" | "revokeSession" | "closeSession";
+export type BrokerCommand = "status" | "listTabs" | "claimTab" | "openSession" | "sessionUrl" | "requestAccess" | "revokeSession" | "closeSession";
 export type BrokerCommandRequest = Readonly<{ id: string; command: BrokerCommand; taskLabel?: string; requestedCapabilities?: string[]; access?: SessionAccess; accessDelta?: SessionAccessDelta; ttlMs?: number; stableSessionKey?: string; sessionId?: string; scope?: "all" | "session"; tabId?: number; reason?: string }>;
 export type BrokerAuthOk = Readonly<{ type: "authOk" }>;
 export type BrokerResponse = Readonly<{ id: string; ok: true; result: unknown }> | Readonly<{ id: string; ok: false; error: { code: string; message: string } }>;
@@ -115,7 +115,7 @@ export class BrokerServer {
     });
   }
   private async command(socket: Socket, value: unknown, requestIds: Set<string>): Promise<void> {
-    if (!object(value) || !id(value.id) || (value.command !== "status" && value.command !== "listTabs" && value.command !== "claimTab" && value.command !== "openSession" && value.command !== "requestAccess" && value.command !== "revokeSession" && value.command !== "closeSession")) { socket.write('{"id":"","ok":false,"error":{"code":"invalidRequest","message":"invalid broker command"}}\n'); return; }
+    if (!object(value) || !id(value.id) || (value.command !== "status" && value.command !== "listTabs" && value.command !== "claimTab" && value.command !== "openSession" && value.command !== "sessionUrl" && value.command !== "requestAccess" && value.command !== "revokeSession" && value.command !== "closeSession")) { socket.write('{"id":"","ok":false,"error":{"code":"invalidRequest","message":"invalid broker command"}}\n'); return; }
     const request = value as BrokerCommandRequest;
     if (requestIds.has(request.id)) { socket.write(JSON.stringify({ id: request.id, ok: false, error: { code: "replayedRequest", message: "request ID was already used" } } satisfies BrokerResponse) + "\n"); return; }
     requestIds.add(request.id);
@@ -149,6 +149,14 @@ export class BrokerServer {
         this.bindSessionOwner(session.id, socket, request.stableSessionKey === undefined);
         const cdpUrl = this.options.sessions.cdpUrl(session.id);
         result = { session, ...(cdpUrl === undefined ? {} : { cdpUrl }) };
+      } else if (request.command === "sessionUrl") {
+        if (!this.options.isTrusted()) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
+        const controller = this.options.controller(); if (!controller) throw new TaskSessionError("invalidSession", "browser identity is unavailable");
+        if (!isStableSessionKey(request.stableSessionKey)) throw new TaskSessionError("invalidSession", "stableSessionKey is required");
+        const session = this.options.sessions.getNamed(controller.principalId, request.stableSessionKey);
+        const cdpUrl = this.options.sessions.cdpUrl(session.id);
+        if (cdpUrl === undefined) throw new TaskSessionError("invalidSession", "session relay is not ready");
+        result = { session, cdpUrl };
       } else if (request.command === "requestAccess") {
         if (!this.options.isTrusted()) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
         const controller = this.options.controller(); if (!controller) throw new TaskSessionError("invalidSession", "browser identity is unavailable");

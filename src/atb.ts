@@ -19,6 +19,8 @@ export type CliCommand =
   | { kind: "uninstall"; extensionManifest?: string; executable?: string; home?: string }
   | { kind: "status"; extensionManifest?: string; executable?: string; home?: string }
   | { kind: "run"; argv: string[]; label?: string; ttlMs?: number; stableSessionKey?: string; access: SessionAccess }
+  | { kind: "open"; label: string; ttlMs?: number; stableSessionKey: string; access: SessionAccess }
+  | { kind: "url"; stableSessionKey: string }
   | { kind: "tabs"; stableSessionKey?: string; scope: "all" | "session" }
   | { kind: "claimTab"; stableSessionKey: string; tabId: number }
   | { kind: "requestAccess"; stableSessionKey: string; delta: SessionAccessDelta }
@@ -102,6 +104,50 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     if (modes !== 1) throw new Error("request-access requires exactly one of --tab, --domain, or --full-access");
     const delta = normalizeSessionAccessDelta(fullAccess ? { kind: "full", tabIds: [], domains: [] } : domains.length ? { kind: "domains", tabIds: [], domains } : { kind: "tabs", tabIds, domains: [] });
     return { kind: "requestAccess", stableSessionKey, delta };
+  }
+  if (first === "open") {
+    let label: string | undefined;
+    let ttlMs: number | undefined;
+    let stableSessionKey: string | undefined;
+    const tabIds = [];
+    const domains = [];
+    let fullAccess = false;
+    for (let index = 0; index < rest.length; index += 1) {
+      const value = rest[index];
+      if (value === "--label") {
+        label = requiredOptionValue(value, rest[++index]);
+      } else if (value === "--ttl-ms") {
+        const raw = requiredOptionValue(value, rest[++index]);
+        if (!/^\d+$/.test(raw)) throw new Error("--ttl-ms requires a positive integer");
+        const parsed = Number(raw);
+        if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error("--ttl-ms requires a positive integer");
+        ttlMs = parsed;
+      } else if (value === "--session") {
+        if (stableSessionKey !== undefined) throw new Error("--session may be specified only once");
+        stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--tab") {
+        const raw = requiredOptionValue(value, rest[++index]);
+        if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error("--tab requires a non-negative integer tab ID");
+        tabIds.push(Number(raw));
+      } else if (value === "--domain") {
+        domains.push(normalizeDomain(requiredOptionValue(value, rest[++index])));
+      } else if (value === "--full-access") {
+        if (fullAccess) throw new Error("--full-access may be specified only once");
+        fullAccess = true;
+      } else {
+        throw new Error(`unknown open option: ${value}`);
+      }
+    }
+    if (stableSessionKey === undefined) throw new Error("open requires --session <stable-key>");
+    if (!label?.trim()) throw new Error("open requires a non-empty --label");
+    const accessModes = Number(tabIds.length > 0) + Number(domains.length > 0) + Number(fullAccess);
+    if (accessModes > 1) throw new Error("--tab, --domain, and --full-access are mutually exclusive");
+    const access = normalizeSessionAccess(fullAccess ? { level: "full", tabIds: [], domains: [] } : domains.length ? { level: "domains", tabIds: [], domains } : { level: "selectedTabs", tabIds, domains: [] });
+    return { kind: "open", label, stableSessionKey, access, ...(ttlMs === undefined ? {} : { ttlMs }) };
+  }
+  if (first === "url") {
+    if (rest.length !== 2 || rest[0] !== "--session") throw new Error("usage: atb url --session <stable-key>");
+    return { kind: "url", stableSessionKey: assertStableSessionKey(requiredOptionValue("--session", rest[1])) };
   }
   if (first === "tabs") {
     let stableSessionKey;
@@ -304,8 +350,75 @@ export async function closeAgentSession(stableSessionKey: string, deps: Pick<Run
   }
 }
 
+const LOOPBACK_RELAY_URL = /^ws:\/\/(127\.0\.0\.1|localhost):\d+\//;
+
+/** Open or reuse a named approved session without launching a child process. */
+export async function openAgentSession(options: { label: string; ttlMs?: number; stableSessionKey: string; access?: SessionAccess }, deps: Pick<RunDeps, "broker"> & { stdout?: NodeJS.WriteStream }): Promise<number> {
+  assertStableSessionKey(options.stableSessionKey);
+  if (!options.label.trim()) throw new Error("open requires a non-empty --label");
+  const ttlMs = options.ttlMs === undefined
+    ? undefined
+    : Math.max(1_000, Math.min(options.ttlMs, 24 * 60 * 60 * 1000));
+  let sessionId: string | undefined;
+  let removeEvent: (() => void) | undefined;
+  const activeBeforeSessionId = new Set<string>();
+  try {
+    const active = new Promise<void>((resolve, reject) => {
+      const onEvent = (event: BrokerEvent) => {
+        const name = eventName(event);
+        const id = eventSessionId(event);
+        if (sessionId && id && id !== sessionId) return;
+        if (!sessionId && id) {
+          if (name === "active") activeBeforeSessionId.add(id);
+          return;
+        }
+        if (name === "active") resolve();
+        else if (name === "revoked" || name === "hostclosing") reject(new Error("browser session was revoked"));
+      };
+      removeEvent = deps.broker.onEvent?.(onEvent) ?? undefined;
+    });
+    const result = await deps.broker.request("openSession", {
+      taskLabel: options.label.trim().slice(0, MAX_LABEL_LENGTH),
+      requestedCapabilities: ["cdp"],
+      access: normalizeSessionAccess(options.access),
+      stableSessionKey: options.stableSessionKey,
+      ...(ttlMs === undefined ? {} : { ttlMs }),
+    });
+    let immediate = false;
+    if (result && typeof result === "object") {
+      const record = result as Record<string, unknown>;
+      const session = record.session && typeof record.session === "object" ? record.session as Record<string, unknown> : record;
+      sessionId = typeof session.id === "string" ? session.id : typeof session.sessionId === "string" ? session.sessionId : undefined;
+      immediate = typeof record.cdpUrl === "string" || session.state === "active" || (sessionId !== undefined && activeBeforeSessionId.has(sessionId));
+    }
+    if (!sessionId) throw new Error("broker did not return a session id");
+    if (!immediate) await active;
+    removeEvent?.(); removeEvent = undefined;
+    (deps.stdout ?? process.stdout).write(`session ${options.stableSessionKey} active\n`);
+    return 0;
+  } finally {
+    removeEvent?.();
+    await deps.broker.close?.();
+  }
+}
+
+/** Print the live relay URL for a named approved session. The URL is ephemeral and never persisted by atb. */
+export async function printAgentSessionUrl(stableSessionKey: string, deps: Pick<RunDeps, "broker"> & { stdout?: NodeJS.WriteStream }): Promise<number> {
+  assertStableSessionKey(stableSessionKey);
+  try {
+    const result = await deps.broker.request("sessionUrl", { stableSessionKey });
+    const record = result && typeof result === "object" ? result as Record<string, unknown> : null;
+    const cdpUrl = typeof record?.cdpUrl === "string" ? record.cdpUrl : undefined;
+    if (!cdpUrl || !LOOPBACK_RELAY_URL.test(cdpUrl)) throw new Error("broker did not return a loopback session URL");
+    (deps.stdout ?? process.stdout).write(`${cdpUrl}\n`);
+    return 0;
+  } finally {
+    await deps.broker.close?.();
+  }
+}
+
 async function runChildWithUrl(argv: readonly string[], cdpUrl: string, deps: RunDeps, sessionId?: string): Promise<number> {
-  if (!/^ws:\/\/(127\.0\.0\.1|localhost):\d+\//.test(cdpUrl)) throw new Error("broker returned an invalid CDP URL");
+  if (!LOOPBACK_RELAY_URL.test(cdpUrl)) throw new Error("broker returned an invalid CDP URL");
   const child = (deps.spawn ?? nodeSpawn)(argv[0], argv.slice(1), { env: { ...(deps.processEnv ?? process.env), BROWSER_CDP_URL: cdpUrl }, stdio: "inherit" });
   const source = deps.signalSource ?? process;
   const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
@@ -336,6 +449,14 @@ export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {})
   if (command.kind === "run") {
     const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
     return runAgentCommand(command.argv, { ...deps, broker } as RunDeps, { label: command.label, ttlMs: command.ttlMs, stableSessionKey: command.stableSessionKey, access: command.access });
+  }
+  if (command.kind === "open") {
+    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    return openAgentSession({ label: command.label, stableSessionKey: command.stableSessionKey, access: command.access, ...(command.ttlMs === undefined ? {} : { ttlMs: command.ttlMs }) }, { broker, ...(deps.stdout === undefined ? {} : { stdout: deps.stdout }) });
+  }
+  if (command.kind === "url") {
+    const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });
+    return printAgentSessionUrl(command.stableSessionKey, { broker, ...(deps.stdout === undefined ? {} : { stdout: deps.stdout }) });
   }
   if (command.kind === "requestAccess") {
     const broker = deps.broker ?? await createCompanionBrokerClient({ directory: deps.stateDirectory });

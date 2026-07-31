@@ -72,6 +72,64 @@ describe("atb CLI session boundary", () => {
     expect(() => parseCliArgs(["run", "--pairing", "secret"])).toThrow();
   });
 
+  it("parses open and url session commands", () => {
+    expect(parseCliArgs(["open", "--session", "research", "--label", "Research task", "--domain", "*.Example.com"])).toEqual({
+      kind: "open",
+      stableSessionKey: "research",
+      label: "Research task",
+      access: { level: "domains", tabIds: [], domains: ["example.com"] },
+    });
+    expect(parseCliArgs(["url", "--session", "research"])).toEqual({ kind: "url", stableSessionKey: "research" });
+    expect(() => parseCliArgs(["open", "--label", "Research task"])).toThrow(/requires --session/);
+    expect(() => parseCliArgs(["open", "--session", "research"])).toThrow(/non-empty --label/);
+    expect(() => parseCliArgs(["open", "--session", "research", "--label", "x", "--tab", "1", "--full-access"])).toThrow(/mutually exclusive/);
+    expect(() => parseCliArgs(["url"])).toThrow(/usage: atb url/);
+    expect(() => parseCliArgs(["url", "--session", "not/a-key"])).toThrow(/session key/);
+  });
+
+  it("opens a named session without a child and prints its URL only on request", async () => {
+    const events = new Set<(event: { event: string; sessionId?: string; cdpUrl?: string }) => void>();
+    const requests: Array<{ command: string; params: Record<string, unknown> }> = [];
+    let opened = false;
+    const broker: BrokerClient = {
+      onEvent(listener) {
+        events.add(listener as never);
+        return () => events.delete(listener as never);
+      },
+      request: async (command: string, params: Record<string, unknown>) => {
+        requests.push({ command, params });
+        if (command === "openSession") {
+          opened = true;
+          queueMicrotask(() => { for (const listener of events) listener({ event: "active", sessionId: "session-1", cdpUrl: "ws://127.0.0.1:18797/cdp?token=t" }); });
+          return { session: { id: "session-1", state: "pending" } };
+        }
+        if (command === "sessionUrl") {
+          if (!opened) throw new Error("active named session was not found");
+          return { session: { id: "session-1", state: "active" }, cdpUrl: "ws://127.0.0.1:18797/cdp?token=t" };
+        }
+        throw new Error(`unexpected command ${command}`);
+      },
+      close: async () => undefined,
+    };
+    const out: string[] = [];
+    const stdout = { write: (text: string) => { out.push(text); return true; } } as unknown as NodeJS.WriteStream;
+    await expect(main(["open", "--session", "research", "--label", "Research task"], { broker, stdout })).resolves.toBe(0);
+    expect(out).toEqual(["session research active\n"]);
+    await expect(main(["url", "--session", "research"], { broker, stdout })).resolves.toBe(0);
+    expect(out.at(-1)).toBe("ws://127.0.0.1:18797/cdp?token=t\n");
+    expect(requests.map(({ command }) => command)).toEqual(["openSession", "sessionUrl"]);
+    expect(requests[0].params).toMatchObject({ stableSessionKey: "research", taskLabel: "Research task", requestedCapabilities: ["cdp"] });
+  });
+
+  it("refuses to print a non-loopback session URL", async () => {
+    const broker: BrokerClient = {
+      onEvent: () => () => undefined,
+      request: async () => ({ session: { id: "session-1", state: "active" }, cdpUrl: "ws://192.168.4.1:18797/cdp?token=t" }),
+      close: async () => undefined,
+    };
+    await expect(main(["url", "--session", "research"], { broker })).rejects.toThrow(/loopback session URL/);
+  });
+
   it("injects only the child environment after active readiness and does not write protocol to stdout", async () => {
     const events = new Set<(event: { event: string; sessionId: string; cdpUrl: string }) => void>();
     const requests: Array<{ command: string; params: Record<string, unknown> }> = [];

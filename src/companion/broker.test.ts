@@ -53,6 +53,9 @@ describe("BrokerServer socket ownership", () => {
       const first = createBrokerClient({ socketPath: broker.socketPath, token });
       const opened = await first.request("openSession", { taskLabel: "Research", requestedCapabilities: ["cdp"], stableSessionKey: "research" }) as { session: { id: string } };
       await first.close();
+      const url = createBrokerClient({ socketPath: broker.socketPath, token });
+      await expect(url.request("sessionUrl", { stableSessionKey: "research" })).rejects.toThrow(/not found|not ready/);
+      await url.close();
       await sessions.approve(opened.session.id);
       sessions.relayReady(opened.session.id);
 
@@ -89,6 +92,10 @@ describe("BrokerServer socket ownership", () => {
       ]);
       expect(claims).toEqual([{ sessionId: opened.session.id, tabId: 42 }]);
       await inventoryClient.close();
+      const urlClient = createBrokerClient({ socketPath: broker.socketPath, token });
+      await expect(urlClient.request("sessionUrl", { stableSessionKey: "research" })).resolves.toMatchObject({ cdpUrl: "ws://127.0.0.1/cdp?token=token", session: { id: opened.session.id, state: "active" } });
+      await expect(urlClient.request("sessionUrl", { stableSessionKey: "other-key" })).rejects.toThrow(/not found/);
+      await urlClient.close();
 
       const conflicting = createBrokerClient({ socketPath: broker.socketPath, token });
       await expect(conflicting.request("openSession", { taskLabel: "Different task", requestedCapabilities: ["cdp"], stableSessionKey: "research" })).rejects.toThrow(/different session authority/);

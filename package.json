@@ -22,7 +22,7 @@
   "scripts": {
     "build": "tsc --project tsconfig.json && chmod 755 dist/src/atb.js",
     "prepack": "npm run build",
-    "test": "vitest run src/**/*.test.ts extensions/browser/chrome-extension/modules/native-identity.test.ts extensions/browser/chrome-extension/modules/session-core.test.ts extensions/browser/chrome-extension/modules/relay-core.test.ts extensions/browser/src/browser/extension-relay/relay-protocol.test.ts extensions/browser/src/browser/extension-relay/relay-bridge.test.ts extensions/browser/src/browser/extension-relay/relay-server.test.ts",
+    "test": "vitest run src extensions/browser/chrome-extension/modules extensions/browser/src/browser/extension-relay",
     "start": "node dist/src/atb.js"
   },
   "dependencies": {
