@@ -1,8 +1,8 @@
 # Agent Tab Bridge
 
-A general-purpose Brave/Chrome extension and local relay that lets an agent co-browse only the tabs you explicitly share—without starting your everyday browser with a remote-debugging port and without leaving a persistent CDP service running.
+Agent Tab Bridge is an experimental Brave/Chrome extension and local companion that gives an agent CDP access to explicitly shared tabs in an existing browser profile—without a persistent remote-debugging port.
 
-The first target is **Brave**, because that is the browser used for development and MVP validation. Chrome compatibility is intended but will be claimed only after it is tested.
+Brave is the primary development target. This repository is a source-only work in progress, not a packaged release.
 
 ## Why
 
@@ -17,46 +17,81 @@ Launching a browser with `--remote-debugging-port` exposes a broad automation su
 
 The immediate motivation was finding a narrow, user-consented way to expose an existing Brave session to [Hermes](https://github.com/NousResearch/hermes-agent) through its `BROWSER_CDP_URL` interface. The bridge itself is intentionally agent-agnostic: any compatible CDP client can use the authenticated loopback endpoint.
 
-## Shape
+## How it fits together
 
-- `extensions/browser/chrome-extension/`: MV3 extension and shared-tab consent UI.
-- `extensions/browser/src/browser/extension-relay/`: loopback HTTP/WebSocket relay and CDP routing.
-- A task launcher supplies an authenticated URL such as:
+```mermaid
+flowchart LR
+  A[Agent process] <-->|ephemeral authenticated CDP\n127.0.0.1 only| C[atb companion]
+  C <-->|authenticated Native Messaging| E[MV3 extension]
+  E <-->|chrome.debugger| G[session-owned tab group]
+  U((Browser user)) -->|pair · approve · revoke| E
+```
 
-  ```text
-  ws://127.0.0.1:<ephemeral-port>/cdp?token=<ephemeral-token>
-  ```
+The companion is installed as a Chromium Native Messaging host. The extension and companion authenticate and pin each other's device identity. For each approved task, the companion starts a token-protected loopback relay and injects its short-lived `BROWSER_CDP_URL` only into the launched child process.
 
-The capability URL is short-lived. It must not be committed, stored in persistent agent configuration, logged, or sent in notifications.
+The extension remains the authority for browser access. It owns the visible consent UI, tab groups, target filtering, and immediate revocation. Agent Tab Bridge does not import the browser profile's cookie store or expose a reusable browser-wide debugging endpoint; after a tab is shared, its page content and page-accessible state are available through CDP.
 
-## Status
+## Project status
 
-Release 1's trusted-local workflow is implemented. The companion is installed once, the extension and companion authenticate and pin each other, each `atb run` request requires an explicit browser-local approval, and the approval grants one visibly distinct access level: selected tabs, requested sites (including their subdomains), or full website access. Only tabs adopted into that task's visible group appear over CDP. No user copies a token or port.
+> [!WARNING]
+> This is an early, source-only prototype. The CLI, Native Messaging protocol, and installation layout may change without migration support. Use a disposable browser profile until you have reviewed the code and consent model.
 
-The focused contract suite and disposable browser rendering cover companion authentication, task and incremental-access approval, access-level enforcement, authenticated CDP target containment, launcher-scoped revocation, browser disconnect, and one-click device trust removal.
+Working today:
 
-See [`ROADMAP.md`](ROADMAP.md) for the later trusted-LAN, bookmarks/history, managed-action, and Guardian Auto releases.
+- Trusted same-machine operation with an authenticated Native Messaging companion and an ephemeral relay bound only to `127.0.0.1`.
+- Browser-local approval for selected tabs, approved domains, or full website access; full access still requires tabs to enter the session's visible group.
+- Named sessions, separately approved access upgrades, session-aware tab inventory, ownership conflict detection, and explicit revocation.
+- Live end-to-end acceptance in Brave, plus automated protocol, relay, authorization, and extension-UI coverage.
 
-## Build and install
+Not yet provided:
 
-Requires Node.js 22 or newer.
+- A packaged, signed, notarized, npm, or browser-store release.
+- A stable public CLI/protocol or migration support for stored identities.
+- An external security audit or a claim that the prototype is safe for unattended use.
+- Full acceptance on regular Google Chrome; current Chrome coverage uses Chrome-for-Testing.
+- Session recovery across companion/browser restarts, trusted-LAN operation, bookmarks/history access, managed actions, or Guardian Auto.
+
+See [`ROADMAP.md`](ROADMAP.md) for implemented boundaries, remaining hardening, and later capability work.
+
+## Developer build and install
+
+Requires Node.js 22 or newer. Installation currently points the browser's Native Messaging manifest at this checkout, so moving the repository requires reinstalling the companion.
 
 ```bash
-npm install
+npm ci
 npm run build
 npm test
 node dist/src/atb.js install
 node dist/src/atb.js status
 ```
 
-Then load `extensions/browser/chrome-extension/` as an unpacked extension:
+Load the extension from this checkout:
 
 1. Open `brave://extensions` or `chrome://extensions`.
 2. Enable **Developer mode** and choose **Load unpacked**.
 3. Select `extensions/browser/chrome-extension/`.
-4. Open the extension popup and confirm that the companion is connected and its abbreviated verified identity is visible.
+4. Open the Agent Tab Bridge popup and choose **Connect companion**.
+5. Confirm that **Companion connected** and an abbreviated verified identity appear.
 
 The manifest's committed public key gives the unpacked extension a stable ID. The installer derives the allowed Native Messaging origin from that manifest rather than accepting an extension ID from the command line.
+
+To remove the browser registration later:
+
+```bash
+node dist/src/atb.js uninstall
+```
+
+## Consent model
+
+Agent Tab Bridge separates device trust, session scope, and actual tab control:
+
+| Layer | What it grants | What it does not grant |
+|---|---|---|
+| Paired companion | Authenticated Native Messaging and enumeration of eligible HTTP/HTTPS tab IDs, titles, URLs, and ownership state | Page content or CDP control |
+| Approved task session | Permission to claim selected tab IDs, matching domains, or any website under an elevated full-access grant | Control of tabs not in that session's group |
+| Session-owned tab group | CDP discovery and control for those grouped tabs through that session's relay | Access to ungrouped tabs or tabs owned by another session |
+
+This distinction is deliberate: tab metadata is visible to the trusted local companion so an agent can identify what to request, but page access begins only after the tab is both permitted by the session grant and visibly adopted into its group. A tab can belong to at most one session.
 
 ## Run a task
 
@@ -64,6 +99,12 @@ Launch the agent as a child of `atb run`. With no access option, the session sta
 
 ```bash
 node dist/src/atb.js run --label "Research task" -- hermes
+```
+
+List the eligible tabs visible to the paired local companion, then use a tab ID in a session request:
+
+```bash
+node dist/src/atb.js tabs
 ```
 
 Request exactly one initial access level when the task starts:
@@ -84,7 +125,6 @@ Named sessions remain active after their child command exits. A later command ma
 node dist/src/atb.js request-access --session research --tab 311
 node dist/src/atb.js request-access --session research --domain docs.example.org
 node dist/src/atb.js request-access --session research --full-access
-node dist/src/atb.js close --session research
 ```
 
 Inspect browser tabs in the context of a named session:
@@ -99,10 +139,10 @@ The all-tabs inventory labels each tab's `ownership` as `unclaimed`, `currentSes
 
 Every upgrade is separately displayed and approved or declined in the popup. Access can expand from selected tabs to requested sites to full access, but never silently narrows or broadens. `atb` injects the ephemeral `BROWSER_CDP_URL` only into a launched child process; it is never printed, persisted, or copied by the user. Browser loss, session revocation, tab-group removal, or debugger detachment removes the corresponding authority.
 
-To remove the Native Messaging registration:
+Close a named session explicitly when the task is finished:
 
 ```bash
-node dist/src/atb.js uninstall
+node dist/src/atb.js close --session research
 ```
 
 The popup's **Forget companion & revoke all access** control separately removes device trust and stops every local task session.

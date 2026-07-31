@@ -2,11 +2,9 @@
 
 This roadmap describes capability boundaries, not dates or semver promises. It starts from the working Brave MVP and ends with a browser bridge that is usable locally or across a trusted home LAN, serves Hermes and generic agent harnesses, exposes explicitly approved browser context such as bookmarks and history, and can optionally place a guardian model in front of managed actions.
 
-When product choices conflict, prefer the ChatGPT/Codex model: explicit capability escalation, task-scoped authority, domain approvals, persistent rules that remain visible and revocable, and a separate agent-policy layer above browser transport. Claude is useful corroboration, but not the tie-breaker.
-
 ## Current baseline
 
-The current trusted-local release provides:
+The current trusted-local prototype provides:
 
 - persistent authenticated extension/companion identity with no copied pairing capability;
 - first-class task sessions and an ephemeral authenticated relay bound to `127.0.0.1`;
@@ -20,6 +18,8 @@ The current trusted-local release provides:
 - focused contract coverage plus disposable-profile browser rendering in Brave and Chrome-for-Testing.
 
 Bookmarks and browsing history are not exposed.
+
+This baseline is usable from a source checkout but is not a finished release. Packaging, storage hardening, restart recovery, regular-Chrome acceptance, broader adversarial review, and an external security audit remain open.
 
 ## North-star architecture
 
@@ -71,23 +71,28 @@ This was the repository's original regression baseline. Later releases must not 
 
 ### Release 1 — Trusted local product
 
-**Outcome:** installation once; thereafter one command and one browser-local approval, with no copied capability strings.
+**Outcome:** install once; thereafter one command and one browser-local approval, with no copied capability strings.
 
-**Status:** implemented and smoke-tested with disposable Brave and Chrome-for-Testing profiles.
+**Status:** in progress. The core trusted-local path works in Brave, but distribution and hardening are incomplete.
 
+Implemented in the prototype:
 
-Major contents:
+- One `atb` process serving as Native Messaging host, relay, broker, and CLI.
+- Persistent authenticated extension/companion identity and browser-local task approval.
+- First-class task sessions with bounded display labels, selected-tab/site/full access, TTL, ownership isolation, and independent revocation.
+- One visibly named, access-color-coded tab group per session.
+- `atb run -- <agent command>` with an ephemeral child-only `BROWSER_CDP_URL`.
+- Reusable named sessions, separately approved monotonic access upgrades, tab inventory, and explicit tab claiming.
+- Popup views for pending approvals, active sessions, shared tabs, controller identity, connection health, and tab/session/device revocation.
+- CDP target and method policies that deny profile-scoped operations, out-of-session targets, and site-scope violations.
 
-- One installable `atb` companion binary serving as Native Messaging host, relay, and CLI.
-- Installer registration for both Brave and Chrome; signed/notarized packaging when distribution begins.
-- Persistent extension/companion device identity, with private material in the OS keychain or an equivalently protected store.
-- Authenticated controller principals: the same-host launcher key or an enrolled hub key, with optional hub-issued harness subkeys. Persistent rules bind to that principal; controller names and task labels remain unverified display text.
-- First-class task sessions: controller principal, bounded client-declared task label, requested capabilities, selected-tab/site/full access, TTL, and independent revocation.
-- One visibly named and access-color-coded tab group per active session. Initially selected tabs and agent-created tabs enter that group; dragging a tab out revokes access. A tab has at most one controller.
-- `atb run -- <agent command>` injects the ephemeral `BROWSER_CDP_URL` only into the child process. Unnamed sessions revoke on child exit; reusable named sessions remain explicitly revocable and support separately approved monotonic access upgrades.
-- Popup views for pending access upgrades, active sessions, shared tabs, controller identity, connection health, and one-click tab/session/device revocation.
-- An explicit CDP method and target policy that denies profile-scoped operations, out-of-session tabs, and navigation or tab creation outside the approved site scope.
-- Brave and Chrome compatibility demonstrated before both are claimed.
+Remaining before calling Release 1 complete:
+
+- Packaged installation, code signing/notarization, release artifacts, and an update path.
+- Documented and reviewed private-key storage appropriate for general distribution.
+- Full end-to-end acceptance in regular Google Chrome, not only Chrome-for-Testing coverage.
+- Recovery and cleanup validation across MV3 suspension, extension update, native-host crash, browser restart, and checkout relocation.
+- Broader adversarial testing, usability work, and an external security review.
 
 **Release boundary:** on a fresh machine, install the extension and companion once. Later tasks require no token or port handling, leave no persistent CDP listener, and die cleanly with the launcher or browser session.
 
@@ -238,9 +243,9 @@ Sharing a tab never grants bookmarks or history. Those APIs are mediated by expl
 
 Target containment is enforceable for raw CDP; action intent is not. Guardian Auto therefore requires a managed session that never receives a `/cdp` capability. This avoids presenting CDP-method inspection as a meaningful intent boundary.
 
-### ChatGPT/Codex parity is the product tie-breaker
+### Explicit capability escalation
 
-Adopt its domain approval vocabulary, separate history grants, visible persistent rule management, task-scoped capability escalation, and distinction between browser transport and agent policy. Do not copy its broad permission set unless a roadmap capability requires it.
+New authority is requested at the narrowest useful scope, displayed in browser-local UI, and independently revocable. Persistent device trust, task approval, site scope, profile-data access, and any later action policy remain separate gates; none silently implies the next.
 
 ## Deliberate non-goals
 
