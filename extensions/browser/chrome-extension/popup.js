@@ -1,7 +1,7 @@
 /**
  * Agent Tab Bridge popup.
  *
- * Background runtime contract is unchanged: getStatus, approveSession,
+ * Background runtime contract: getStatus, connectCompanion, approveSession,
  * revokeSession, shareTab, unshareTab, forgetCompanion.
  *
  * Rendering rule: the 2s poll reconciles session cards keyed by session id and
@@ -16,6 +16,7 @@ const connectionStatus = document.getElementById("connectionStatus");
 const companionIdentity = document.getElementById("companionIdentity");
 const errorLine = document.getElementById("error");
 const firstRun = document.getElementById("firstRun");
+const connectButton = document.getElementById("connectCompanionButton");
 const pendingSection = document.getElementById("pendingSection");
 const pendingHeading = document.getElementById("pendingHeading");
 const pendingList = document.getElementById("pendingSessions");
@@ -42,6 +43,7 @@ let currentTab = null;
 let refreshRevision = 0;
 let errorText = "";
 let forgetConfirmTimer = null;
+const CONNECT_KEY = "\u0000connect";
 
 /** Keys with a mutation in flight; their controls are off-limits to renders. */
 const inFlight = new Set();
@@ -461,6 +463,9 @@ function render() {
     pending.length === 0 &&
     active.length === 0;
   setHidden(firstRun, !isFirstRun);
+  if (!inFlight.has(CONNECT_KEY)) {
+    connectButton.disabled = nativeStatus === "connecting";
+  }
 
   // Zero pending means no approval chrome at all, heading included.
   setHidden(pendingSection, pending.length === 0);
@@ -575,6 +580,16 @@ function armForget() {
   );
   forgetConfirmTimer = setTimeout(disarmForget, FORGET_CONFIRM_MS);
 }
+
+connectButton.addEventListener("click", () => {
+  if (connectButton.disabled) return;
+  void runMutation(
+    CONNECT_KEY,
+    connectButton,
+    { type: "connectCompanion" },
+    "The companion could not be connected.",
+  );
+});
 
 forgetButton.addEventListener("click", () => {
   if (forgetButton.disabled) return;

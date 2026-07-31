@@ -1390,6 +1390,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       case "getStatus":
         sendResponse(await statusDto());
         return;
+      case "connectCompanion":
+        nativeReconnectAllowed = true;
+        if (!nativePort) {
+          await connectNative();
+        }
+        sendResponse({ ok: true });
+        return;
       case "forgetCompanion":
         await forgetCompanion();
         sendResponse({ ok: true });

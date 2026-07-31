@@ -78,7 +78,13 @@
         gap: var(--atb-space-4);
         margin-top: var(--atb-space-3);
       }
-      .guidance { line-height: 1.5; }
+      .guidance {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: var(--atb-space-2);
+        line-height: 1.5;
+      }
       .section {
         display: flex;
         flex-direction: column;
@@ -206,10 +212,14 @@
     <p id="error" class="error hidden" role="alert"></p>
 
     <main>
-      <p id="firstRun" class="guidance hidden">
-        Start the Agent Tab Bridge companion and pair it with this browser. Approval requests will
-        appear here.
-      </p>
+      <section id="firstRun" class="guidance hidden" aria-labelledby="firstRunHeading">
+        <h2 id="firstRunHeading">Pair this browser</h2>
+        <p>Connect the Agent Tab Bridge companion to pair this browser. Approval requests will
+          appear here.</p>
+        <button id="connectCompanionButton" class="atb-btn atb-btn--primary" type="button">
+          Connect companion
+        </button>
+      </section>
 
       <section id="pendingSection" class="section hidden" aria-labelledby="pendingHeading">
         <h2 id="pendingHeading">Approval requests (0)</h2>
