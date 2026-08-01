@@ -94,15 +94,16 @@ export class EdgeHubPairingClient {
   async pushPresence(socket: TLSSocket): Promise<void> {
     const state = await this.store.load(); if (!state) return;
     const companion = await (this.options.stateStore ?? new CompanionStateStore(this.options)).load();
+    const identity = await (this.options.identityStore ?? new IdentityStore("companion", this.options)).loadOrCreate();
     const enabled = new Set(state.enabledEndpointIds);
-    const endpoints = companion.endpoints.filter((endpoint) => enabled.has(endpoint.identity.endpointId)).map((endpoint) => ({ machineId: companion.machine.identity.machineId, endpointId: endpoint.identity.endpointId, alias: endpoint.identity.label, fingerprint: endpoint.identity.endpointId, enabled: true, record: { extensionId: endpoint.identity.extensionId, label: endpoint.identity.label } }));
+    const endpoints = companion.endpoints.filter((endpoint) => enabled.has(endpoint.identity.endpointId)).map((endpoint) => ({ machineId: companion.machine.identity.machineId, endpointId: endpoint.identity.endpointId, alias: endpoint.identity.label, fingerprint: endpoint.identity.endpointId, enabled: true, record: { extensionId: endpoint.identity.extensionId, label: endpoint.identity.label, publicKeySpki: endpoint.identity.publicKeySpki, machinePublicKeySpki: identity.publicKeySpki } }));
     const response = await control(socket, new HubFrameDecoder(this.options.maxFrameBytes), { type: "presence", machineId: companion.machine.identity.machineId, endpoints });
     if (response.type !== "presenceAck") throw new Error("hub did not acknowledge presence");
   }
-  async connectPresence(): Promise<TLSSocket | undefined> {
+  async connectPresence(addressValue?: string): Promise<TLSSocket | undefined> {
     const state = await this.store.load(); if (!state) return undefined;
     const identity = await (this.options.identityStore ?? new IdentityStore("companion", this.options)).loadOrCreate();
-    const address = parseHubAddress(state.address);
+    const address = parseHubAddress(addressValue ?? state.address);
     const tls = clientTlsOptions(state.pairing, identity, state.hubCertificatePem);
     const socket = await connectSocket({ ...tls, host: address.host, port: address.port, ...(isIP(address.host) === 0 ? { servername: address.host } : {}) });
     this.presenceSocket = socket;
@@ -115,8 +116,8 @@ export class EdgeHubPairingClient {
     if (!socket) return;
     socket.write(encodeHubFrame(Buffer.from(JSON.stringify({ type: "enrollmentStatement", statement }), "utf8"), this.options.maxFrameBytes));
   }
-  async connectRoutes(onRequest: HubRouteHandler): Promise<HubRouteConnection | undefined> {
-    const socket = await this.connectPresence();
+  async connectRoutes(onRequest: HubRouteHandler, addressValue?: string): Promise<HubRouteConnection | undefined> {
+    const socket = await this.connectPresence(addressValue);
     if (!socket) return undefined;
     this.routes?.close();
     const routes = new HubRouteConnection(socket, onRequest, this.options.maxFrameBytes);
@@ -125,4 +126,11 @@ export class EdgeHubPairingClient {
     return routes;
   }
   async unpair(): Promise<void> { this.routes?.close(); this.routes = undefined; this.presenceSocket?.destroy(); this.presenceSocket = undefined; await this.store.forget(); }
+  async directory(addressValue?: string): Promise<ReadonlyArray<{ machineId: string; endpointId: string; alias?: string; fingerprint?: string; enabled: boolean; record: unknown }>> {
+    const socket = this.presenceSocket ?? await this.connectPresence(addressValue);
+    if (!socket) return [];
+    const response = await control(socket, new HubFrameDecoder(this.options.maxFrameBytes), { type: "directoryRequest" });
+    if (response.type !== "directoryResponse" || !Array.isArray(response.endpoints)) throw new Error("hub did not return an endpoint directory");
+    return response.endpoints as ReadonlyArray<{ machineId: string; endpointId: string; alias?: string; fingerprint?: string; enabled: boolean; record: unknown }>;
+  }
 }

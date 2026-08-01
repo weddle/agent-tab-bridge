@@ -125,3 +125,22 @@ export function renderSessionState(value) {
     ? { state: "connecting", text: "reconnecting" }
     : { state: "connected", text: "active" };
 }
+
+export function isRemoteSession(session) {
+  return session?.route?.kind === "routed";
+}
+
+export function renderRouteMarker(session) {
+  return isRemoteSession(session) ? " ⟐" : "";
+}
+
+export function renderViaHubIdentity(session) {
+  if (!isRemoteSession(session)) return null;
+  const fingerprint = session?.route?.hubId ?? session?.hubFingerprint;
+  const identity = verifiedIdentityDetails("Home hub", fingerprint);
+  return {
+    text: `VIA via home hub · ${identity.text}`,
+    fullValue: identity.fullValue,
+    ariaLabel: `VIA via home hub · ${identity.ariaLabel}`,
+  };
+}

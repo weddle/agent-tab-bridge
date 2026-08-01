@@ -9,6 +9,8 @@ import {
   renderPairingFailure,
   renderSessionState,
   renderRememberedGrantChip,
+  renderRouteMarker,
+  renderViaHubIdentity,
   renderStandingGrantScope,
   renderVerifiedIdentity,
   verifiedIdentityDetails,
@@ -45,6 +47,14 @@ describe("reconnecting and hub vocabulary", () => {
     expect(renderPairingFailure("wrong-code")).toContain("fresh code");
     expect(renderPairingFailure("key-mismatch")).toContain("refused");
     expect(renderPairingFailure("duplicate-identity")).toContain("already enrolled");
+  });
+  it("renders a remote via-hub identity and route marker without local-route vocabulary", () => {
+    const session = { route: { kind: "routed", hubId: "sha256/hub-key" } };
+    expect(renderViaHubIdentity(session)).toMatchObject({
+      text: "VIA via home hub · Home hub · verified key sha256/hub-key",
+    });
+    expect(renderRouteMarker(session)).toBe(" ⟐");
+    expect(renderRouteMarker({ route: { kind: "local" } })).toBe("");
   });
 });
 

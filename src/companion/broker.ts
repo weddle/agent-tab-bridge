@@ -134,6 +134,15 @@ export class BrokerServer {
     const copy = structuredClone(context);
     return { type: "routedContext", context: copy, proof: routeProof(this.routedContextSecret, copy) };
   }
+  authorizeRoutedRelay(sessionId: string, cdpUrl: string, address: RoutedBrokerAddress): boolean {
+    const session = this.options.sessions.get(sessionId);
+    return !!session
+      && session.state === "active"
+      && session.controllerPrincipalId === address.principalId
+      && session.route.kind === "routed"
+      && session.route.endpointId === address.endpointId
+      && this.options.sessions.cdpUrl(sessionId) === cdpUrl;
+  }
   async enrollProfile(profileName: string, publicKeySpki: string): Promise<Readonly<{ enrollmentId: string; code: string; expiresAt: number }>> {
     if (!this.options.isTrusted()) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
     if (!this.options.enrollProfile) throw new TaskSessionError("invalidSession", "profile enrollment is unavailable");

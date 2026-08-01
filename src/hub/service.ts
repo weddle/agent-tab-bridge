@@ -243,6 +243,10 @@ export class HubService {
       }
       throw new Error("unpaired hub connection sent an invalid control frame");
     }
+    if (type === "directoryRequest") {
+      this.sendControl(client, { type: "directoryResponse", endpoints: await this.directory(client.machineId) });
+      return;
+    }
     if (type === "presence" && message.machineId === client.machineId && Array.isArray(message.endpoints)) {
       const incoming = new Set(message.endpoints.flatMap((endpoint) => endpoint && typeof endpoint === "object" && typeof (endpoint as Record<string, unknown>).endpointId === "string" ? [(endpoint as Record<string, unknown>).endpointId as string] : []));
       await this.stateStore.update((state) => ({ ...state, endpoints: state.endpoints.filter((endpoint) => endpoint.machineId !== client.machineId || incoming.has(endpoint.endpointId)) }));

@@ -8,12 +8,15 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { startAgentTabRelay } from "../../extensions/browser/src/browser/extension-relay/relay-server.js";
 import { BrokerServer } from "./broker.js";
-import { IdentityStore, createBrokerSecret } from "./identity.js";
+import { IdentityStore, createBrokerSecret, fingerprintSpki } from "./identity.js";
 import { runNativeEndpoint } from "./native-host.js";
 import { createEnrollmentStatement } from "./enrollment-statement.js";
 import { applicationSupportDirectory, atomicWritePrivateJson, readPrivateJson, CompanionStateStore, type ApplicationSupportOptions, type PinnedExtensionIdentity } from "./state.js";
 import { EdgeHubPairingClient } from "./pairing/edge.js";
 import type { HubRouteConnection, HubRouteStream } from "./pairing/routes.js";
+import { acceptChannel } from "./channel/index.js";
+import { routedChannelContext } from "./channel/context.js";
+import { SecureChannelTransportAdapter, connectTransports } from "./transport-adapter.js";
 import type { RoutedBrokerAddress } from "../hub/routing.js";
 import type { NativeEndpointRecovery } from "./endpoint-recovery.js";
 import type { TaskSessionRelay } from "./task-sessions.js";
@@ -341,38 +344,119 @@ export class EdgeSupervisor {
   }
 
   /** Terminates a routed profile-auth stream and begins only explicit remote enrollments at its selected edge. */
-  private routeHubBroker(stream: HubRouteStream, address: RoutedBrokerAddress): void {
+  private async routeHubBroker(stream: HubRouteStream, address: RoutedBrokerAddress): Promise<void> {
+    const hubState = await this.hubPairing.store.load();
+    if (!hubState?.enabledEndpointIds.includes(address.endpointId)) {
+      stream.send(Buffer.from(JSON.stringify({ type: "error", error: { code: "endpointHubDisabled", message: "endpoint is not enabled for this hub" } }), "utf8"));
+      stream.close();
+      return;
+    }
     const runtime = this.endpoints.get(address.endpointId);
     const hubId = this.hubId;
     if (!hubId || address.machineId !== this.machineId || !runtime || runtime.endpoint.endpointId !== address.endpointId) { stream.close(); return; }
     let upstream: Socket | undefined;
+    let relayPort: number | undefined;
     let first = true;
-    const close = () => { stream.close(); upstream?.destroy(); };
+    let channelMode = false;
+    let channelPurpose: "broker" | "enroll" | "relay" | undefined;
+    let accepted: ReturnType<typeof acceptChannel> | undefined;
+    let secure: SecureChannelTransportAdapter | undefined;
+    let channelOptions: Promise<Parameters<typeof acceptChannel>[0]> | undefined;
+    const close = () => { stream.close(); upstream?.destroy(); secure?.destroy(); };
     stream.onPayload((payload) => {
-      if (first) {
-        first = false;
-        try {
-          const request = JSON.parse(payload.toString("utf8")) as Record<string, unknown>;
-          if (request.type === "remoteEnroll" && Object.keys(request).length === 3 && typeof request.profileName === "string" && typeof request.publicKeySpki === "string") {
-            void runtime.broker.enrollProfile(request.profileName, request.publicKeySpki).then((enrollment) => {
-              stream.send(Buffer.from(JSON.stringify({ type: "remoteEnrollResult", ok: true, enrollment }), "utf8"));
-              stream.close();
-            }, (error: unknown) => {
-              stream.send(Buffer.from(JSON.stringify({ type: "remoteEnrollResult", ok: false, error: error instanceof Error ? error.message : "enrollment failed" }), "utf8"));
-              stream.close();
-            });
+      void (async () => {
+        if (first) {
+          first = false;
+          let request: Record<string, unknown> | undefined;
+          try { request = JSON.parse(payload.toString("utf8")) as Record<string, unknown>; } catch {}
+          if (request?.type === "channelHello" && Object.keys(request).length === 4 && typeof request.profileName === "string" && typeof request.publicKeySpki === "string" && request.value && typeof request.value === "object") {
+            let peerFingerprint: string;
+            try { peerFingerprint = fingerprintSpki(request.publicKeySpki); } catch { close(); return; }
+            const peerPublicKeySpki = request.publicKeySpki;
+            const state = await this.stateStore.load();
+            const enrolled = state.machine.enrollments.find((profile) => profile.principalId === address.principalId);
+            if (enrolled && enrolled.publicKeySpki !== peerPublicKeySpki) { close(); return; }
+            channelPurpose = enrolled ? "broker" : "enroll";
+            channelMode = true;
+            channelOptions = (async () => {
+              const identity = await this.identityStore.loadOrCreate();
+              return { identity, peerPublicKeySpki, sessionId: address.stableSessionKey, context: routedChannelContext(address, stream.routeId, stream.streamId) };
+            })();
+          } else if (request?.type === "relayTransport" && Object.keys(request).length === 5 && Number.isSafeInteger(request.port) && Number(request.port) >= 1 && Number(request.port) <= 65_535 && typeof request.profileName === "string" && typeof request.sessionId === "string" && typeof request.cdpUrl === "string") {
+            let cdp: URL;
+            try { cdp = new URL(request.cdpUrl); } catch { close(); return; }
+            if (cdp.protocol !== "ws:" || (cdp.hostname !== "127.0.0.1" && cdp.hostname !== "localhost") || Number(cdp.port) !== Number(request.port) || !runtime.broker.authorizeRoutedRelay(request.sessionId, request.cdpUrl, address)) { close(); return; }
+            channelMode = true;
+            channelPurpose = "relay";
+            relayPort = Number(request.port);
+            const profileName = request.profileName;
+            channelOptions = (async () => {
+              const state = await this.stateStore.load();
+              const enrolled = state.machine.enrollments.find((profile) => profile.name === profileName);
+              if (!enrolled) throw new Error("connector profile is not enrolled at this edge");
+              const identity = await this.identityStore.loadOrCreate();
+              return { identity, peerPublicKeySpki: enrolled.publicKeySpki, sessionId: address.stableSessionKey, context: routedChannelContext(address, stream.routeId, stream.streamId) };
+            })();
+            return;
+          } else {
+            upstream = createConnection(runtime.endpoint.socketPath);
+            upstream.once("error", close);
+            upstream.once("close", () => stream.close());
+            upstream.on("data", (chunk: Buffer) => { try { stream.send(chunk); } catch { close(); } });
+            stream.onClose(close);
+            upstream.write(`${JSON.stringify(runtime.broker.authorizeRoutedContext({ hubId, routeId: stream.routeId, streamId: stream.streamId, address }))}\n`);
+          }
+        }
+        if (channelMode) {
+          if (!accepted) {
+            let message: Record<string, unknown>;
+            const options = await channelOptions;
+            if (!options) { close(); return; }
+            try { message = JSON.parse(payload.toString("utf8")) as Record<string, unknown>; } catch { close(); return; }
+            if (message.type !== "channelHello" || !message.value || typeof message.value !== "object") { close(); return; }
+            try {
+              accepted = acceptChannel(options, message.value as never);
+              stream.send(Buffer.from(JSON.stringify({ type: "channelAccept", value: accepted.accept }), "utf8"));
+            } catch { close(); }
             return;
           }
-        } catch { /* A broker protocol line need not be a standalone JSON enrollment request. */ }
-        upstream = createConnection(runtime.endpoint.socketPath);
-        upstream.once("error", close);
-        upstream.once("close", () => stream.close());
-        upstream.on("data", (chunk: Buffer) => { try { stream.send(chunk); } catch { close(); } });
-        stream.onClose(close);
-        upstream.write(`${JSON.stringify(runtime.broker.authorizeRoutedContext({ hubId, routeId: stream.routeId, streamId: stream.streamId, address }))}\n`);
-      }
-      if (!upstream || upstream.destroyed) { close(); return; }
-      upstream.write(payload, (error) => { if (error) close(); });
+          if (!secure) {
+            let message: Record<string, unknown>;
+            try { message = JSON.parse(payload.toString("utf8")) as Record<string, unknown>; } catch { close(); return; }
+            if (message.type !== "channelConfirm" || !message.value || typeof message.value !== "object") { close(); return; }
+            try {
+              const channel = accepted.complete(message.value as never);
+              secure = new SecureChannelTransportAdapter(channel, (frame) => { stream.send(frame); });
+              secure.once("error", close);
+              if (channelPurpose === "enroll") {
+                secure.on("data", (chunk: Buffer) => {
+                  let enrollment: Record<string, unknown>;
+                  try { enrollment = JSON.parse(chunk.toString("utf8")) as Record<string, unknown>; } catch { close(); return; }
+                  if (enrollment.type !== "remoteEnroll" || typeof enrollment.profileName !== "string" || typeof enrollment.publicKeySpki !== "string") { close(); return; }
+                  void runtime.broker.enrollProfile(enrollment.profileName, enrollment.publicKeySpki).then((result) => {
+                    secure?.write(JSON.stringify({ type: "remoteEnrollResult", ok: true, enrollment: result }));
+                    secure?.end();
+                  }, (error: unknown) => {
+                    secure?.write(JSON.stringify({ type: "remoteEnrollResult", ok: false, error: error instanceof Error ? error.message : "enrollment failed" }));
+                    secure?.end();
+                  });
+                });
+              } else {
+                upstream = channelPurpose === "relay" ? createConnection({ host: "127.0.0.1", port: relayPort! }) : createConnection(runtime.endpoint.socketPath);
+                upstream.once("error", close);
+                upstream.once("close", close);
+                if (channelPurpose === "broker") upstream.write(`${JSON.stringify(runtime.broker.authorizeRoutedContext({ hubId, routeId: stream.routeId, streamId: stream.streamId, address }))}\n`);
+                connectTransports(secure, upstream);
+              }
+            } catch { close(); }
+            return;
+          }
+          secure.receive(payload);
+          return;
+        }
+        if (!upstream || upstream.destroyed) { close(); return; }
+        upstream.write(payload, (error) => { if (error) close(); });
+      })().catch(close);
     });
   }
   private async publishEnrollment(record: Readonly<{ endpointId: string; profileName: string; principalId: string; publicKeySpki: string; enrolledAt: number }>): Promise<void> {

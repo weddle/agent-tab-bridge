@@ -18,6 +18,7 @@ import { readLiveEndpoints, selectLiveEndpoint } from "./companion/endpoint-regi
 
 import { HubService, formatHubStatus } from "./hub/service.js";
 import { EdgeHubPairingClient } from "./companion/pairing/edge.js";
+import { HarnessConnector } from "./companion/connector.js";
 export type CliCommand =
   | { kind: "install"; extensionManifest?: string; executable?: string; home?: string }
   | { kind: "uninstall"; extensionManifest?: string; executable?: string; home?: string }
@@ -35,6 +36,7 @@ export type CliCommand =
   | { kind: "profileList" }
   | { kind: "pair"; address: string; code: string; hubFingerprint: string }
   | { kind: "unpair" }
+  | { kind: "connect"; hub?: string; browser: string; profile: string; stableSessionKey: string; label?: string }
   | { kind: "hub"; action: "start" | "pair" | "status" | "stop" | "forget"; port?: number; host?: string; machine?: string }
   | { kind: "nativeHost" };
 
@@ -306,6 +308,34 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   if (first === "unpair") {
     if (rest.length !== 0) throw new Error("usage: atb unpair");
     return { kind: "unpair" };
+  }
+  if (first === "connect") {
+    let hub: string | undefined;
+    let browser: string | undefined;
+    let profile: string | undefined;
+    let stableSessionKey: string | undefined;
+    let label: string | undefined;
+    for (let index = 0; index < rest.length; index += 1) {
+      const value = rest[index];
+      if (value === "--hub") {
+        onlyOnce(hub, value);
+        hub = requiredOptionValue(value, rest[++index]);
+      } else if (value === "--browser") {
+        onlyOnce(browser, value);
+        browser = requiredOptionValue(value, rest[++index]);
+      } else if (value === "--profile") {
+        onlyOnce(profile, value);
+        profile = assertProfileOption(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--session") {
+        onlyOnce(stableSessionKey, value);
+        stableSessionKey = assertStableSessionKey(requiredOptionValue(value, rest[++index]));
+      } else if (value === "--label") {
+        onlyOnce(label, value);
+        label = requiredOptionValue(value, rest[++index]);
+      } else throw new Error(`unknown connect option: ${value}`);
+    }
+    if (!browser || !profile || !stableSessionKey) throw new Error("usage: atb connect [--hub <address:port>] --browser <label|fingerprint> --profile <name> --session <name> [--label <text>]");
+    return { kind: "connect", ...(hub === undefined ? {} : { hub }), browser, profile, stableSessionKey, ...(label === undefined ? {} : { label }) };
   }
   if (first === "hub") {
     const [action, ...options] = rest;
@@ -653,6 +683,34 @@ export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {})
   if (command.kind === "browsers") {
     const stdout = deps.stdout ?? process.stdout;
     for (const endpoint of await readLiveEndpoints(directoryOption)) stdout.write(`${endpoint.label}\t${endpoint.endpointId}\tpresent\n`);
+    return 0;
+  }
+  if (command.kind === "connect") {
+    const profile = await loadProfile(command.profile, directoryOption);
+    const pairing = deps.hubPairing ?? new EdgeHubPairingClient(directoryOption);
+    const endpoints = await pairing.directory(command.hub);
+    const matches = endpoints.filter((endpoint) => endpoint.endpointId === command.browser || endpoint.fingerprint === command.browser || endpoint.alias === command.browser || (endpoint.record && typeof endpoint.record === "object" && (endpoint.record as Record<string, unknown>).label === command.browser));
+    if (matches.length !== 1) {
+      const available = endpoints.map((endpoint) => `${endpoint.alias ?? endpoint.endpointId} (${endpoint.endpointId})`).join(", ") || "none";
+      throw new Error(`refused: browser ${command.browser} is not a unique enabled remote endpoint (available: ${available})`);
+    }
+    const endpoint = matches[0]!;
+    const state = await pairing.store.load();
+    if (!state) throw new Error("refused: connector is not paired with a hub");
+    const routes = await pairing.connectRoutes(() => {}, command.hub);
+    if (!routes) throw new Error("refused: hub is unavailable");
+    const endpointRecord = endpoint.record && typeof endpoint.record === "object" ? endpoint.record as Record<string, unknown> : {};
+    const targetPublicKeySpki = typeof endpointRecord.machinePublicKeySpki === "string" ? endpointRecord.machinePublicKeySpki : typeof endpointRecord.publicKeySpki === "string" ? endpointRecord.publicKeySpki : undefined;
+    if (!targetPublicKeySpki) throw new Error("refused: selected endpoint has no pinned edge key");
+    const connector = await new HarnessConnector({
+      routes,
+      hubId: state.pairing.pinnedPeerKey.principalId,
+      address: { machineId: endpoint.machineId, endpointId: endpoint.endpointId, principalId: profile.principalId, stableSessionKey: command.stableSessionKey },
+      profile: { name: profile.name, principalId: profile.principalId, publicKeySpki: profile.publicKeySpki, privateKeyPkcs8: profile.privateKeyPkcs8 },
+      targetPublicKeySpki,
+    }).start();
+    (deps.stdout ?? process.stdout).write(`BROWSER_CDP_URL=${connector.cdpUrl}\n`);
+    process.stderr.write(`verified endpoint ${endpoint.alias ?? endpoint.endpointId} via hub ${state.pairing.pinnedPeerKey.principalId}${command.label ? ` (${command.label})` : ""}\n`);
     return 0;
   }
   if (command.kind === "profileCreate") {

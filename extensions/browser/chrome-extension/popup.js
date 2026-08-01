@@ -14,6 +14,7 @@
 import {
   FULL_ACCESS_CONSEQUENCE,
   isRememberableAccess,
+  isRemoteSession,
   renderAccessScope,
   renderClaimedString,
   renderRememberedGrantChip,
@@ -21,6 +22,7 @@ import {
   renderScopeChips,
   renderHubConnectionStatus,
   renderSessionState,
+  renderViaHubIdentity,
   renderStandingGrantScope,
   verifiedIdentityDetails,
 } from "./modules/ui-vocabulary.js";
@@ -221,7 +223,8 @@ function profileFor(session) {
 
 function verifiedSessionIdentity(session) {
   const profile = profileFor(session);
-  return verifiedIdentityDetails(profile?.name || "Local controller", session?.controllerId);
+  const label = isRemoteSession(session) ? controllerLabel(session) : profile?.name || "Local controller";
+  return verifiedIdentityDetails(label, session?.controllerId);
 }
 
 function appendVerifiedIdentity(card, session) {
@@ -230,9 +233,21 @@ function appendVerifiedIdentity(card, session) {
   line.title = identity.fullValue;
   line.setAttribute("aria-label", identity.ariaLabel);
   card.append(line);
+  const via = renderViaHubIdentity(session);
+  if (via) {
+    const viaLine = makeElement("p", "meta verified-identity", via.text);
+    viaLine.title = via.fullValue;
+    viaLine.setAttribute("aria-label", via.ariaLabel);
+    card.append(viaLine);
+  }
 }
 
-function appendClaimedContext(card, task, controller) {
+function appendClaimedContext(card, task, controller, session) {
+  if (isRemoteSession(session)) {
+    card.append(makeElement("p", "meta", `SAID ${renderClaimedString(task)}`));
+    if (session?.machineLabel) card.append(makeElement("p", "meta", `from ${renderClaimedString(session.machineLabel)}`));
+    return;
+  }
   card.append(makeElement("p", "meta", `SAID ${renderClaimedString(task)} — requested by ${renderClaimedString(controller)}`));
 }
 
@@ -389,6 +404,8 @@ function pendingSignature(session) {
     typeof session?.controllerId === "string" ? session.controllerId : "",
     formatCapabilities(session?.capabilities),
     JSON.stringify(session?.access ?? null),
+    JSON.stringify(session?.route ?? null),
+    session?.machineLabel ?? "",
     state.enrolledProfiles.some((profile) => profile?.principalId === session?.controllerId) ? "enrolled" : "",
   ].join(UNIT);
 }
@@ -407,6 +424,8 @@ function activeSignature(session) {
     typeof session?.controllerId === "string" ? session.controllerId : "",
     formatCapabilities(session?.capabilities),
     JSON.stringify(session?.access ?? null),
+    JSON.stringify(session?.route ?? null),
+    session?.machineLabel ?? "",
     healthText(session),
     session?.state ?? "",
     tabs,
@@ -429,7 +448,7 @@ function buildPendingCard(session) {
   task.title = "Unverified task label";
   card.append(task);
   appendVerifiedIdentity(card, session);
-  appendClaimedContext(card, taskLabel(session), controllerLabel(session));
+  appendClaimedContext(card, taskLabel(session), controllerLabel(session), session);
   appendScope(card, session?.access);
   card.append(makeElement("p", "access-summary", formatAccess(session)));
   selectedTabDetails(card, session?.access);
@@ -474,7 +493,7 @@ function buildActiveCard(session) {
   card.append(header);
   appendVerifiedIdentity(card, session);
   appendSessionStatus(card, session);
-  appendClaimedContext(card, taskLabel(session), controllerLabel(session));
+  appendClaimedContext(card, taskLabel(session), controllerLabel(session), session);
   appendScope(card, session?.access);
   card.append(makeElement("p", "access-summary", formatAccess(session)));
   if (level === "full") card.append(makeElement("p", "full-access-consequence", FULL_ACCESS_CONSEQUENCE));
@@ -546,6 +565,8 @@ function accessSignature(request) {
     JSON.stringify(request?.delta ?? null),
     JSON.stringify(request?.currentAccess ?? null),
     JSON.stringify(request?.requestedAccess ?? null),
+    JSON.stringify(request?.route ?? null),
+    request?.machineLabel ?? "",
   ].join(UNIT);
 }
 
@@ -554,16 +575,8 @@ function buildAccessCard(request) {
   const level = request?.requestedAccess?.level ?? "selectedTabs";
   const card = makeElement("article", `atb-card card pending access-${level}`);
   card.append(makeElement("div", "task", renderClaimedString(request?.taskLabel || "Unnamed task")));
-  const profile = state.enrolledProfiles.find((candidate) => candidate?.principalId === request?.controllerId);
-  const identity = verifiedIdentityDetails(
-    profile?.name || "Local controller",
-    request?.controllerId || request?.controllerFingerprint || "unavailable",
-  );
-  const identityLine = makeElement("p", "meta verified-identity", identity.text);
-  identityLine.title = identity.fullValue;
-  identityLine.setAttribute("aria-label", identity.ariaLabel);
-  card.append(identityLine);
-  card.append(makeElement("p", "meta", `SAID ${renderClaimedString(request?.taskLabel || "Unnamed task")} — requested by ${renderClaimedString(request?.controllerName || "Unnamed controller")}`));
+  appendVerifiedIdentity(card, request);
+  appendClaimedContext(card, request?.taskLabel || "Unnamed task", request?.controllerName || "Unnamed controller", request);
   const current = { access: request?.currentAccess };
   const requested = { access: request?.requestedAccess };
   appendScope(card, request?.requestedAccess);

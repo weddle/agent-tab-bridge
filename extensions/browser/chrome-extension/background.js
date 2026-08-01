@@ -25,7 +25,7 @@ import {
   verifyNativeChallenge,
   toBase64Url,
 } from "./modules/native-identity.js";
-import { renderClaimedString } from "./modules/ui-vocabulary.js";
+import { renderClaimedString, renderRouteMarker } from "./modules/ui-vocabulary.js";
 const NATIVE_HOST_NAME = "com.agenttabbridge.companion";
 const TASK_GROUP_COLOR = "blue";
 const MAX_TASK_LABEL_LENGTH = 128;
@@ -98,8 +98,9 @@ function toolbarBadgeCount(count) {
 }
 
 function toolbarSessionCounts() {
-  let pending = accessRequests.size + enrollmentRequests.size;
+  let pending = 0;
   let active = 0;
+  let remote = false;
   for (const session of sessions.values()) {
     if (session.state === "pending") {
       pending += 1;
@@ -109,13 +110,14 @@ function toolbarSessionCounts() {
       readyRelaySessions.has(session.id)
     ) {
       active += 1;
+      remote ||= session.route?.kind === "routed";
     }
   }
-  return { pending, active };
+  return { pending, active, remote };
 }
 
 function refreshBadge() {
-  const { pending, active } = toolbarSessionCounts();
+  const { pending, active, remote } = toolbarSessionCounts();
   let text;
   let color;
   let title;
@@ -132,9 +134,7 @@ function refreshBadge() {
     text = toolbarBadgeCount(pending);
     color = "#F9AB00";
     title = `${TOOLBAR_TITLE} — ${formatToolbarCount(pending, "approval")} waiting`;
-    if (active > 0) {
-      title += ` · ${formatToolbarCount(active, "session")} active`;
-    }
+    if (active > 0) title += ` · ${formatToolbarCount(active, "session")} active`;
   } else if (active > 0) {
     text = toolbarBadgeCount(active);
     color = "#188038";
@@ -143,11 +143,10 @@ function refreshBadge() {
     text = "";
     title = `${TOOLBAR_TITLE} — connected, no active sessions`;
   }
+  if (remote && active > 0) title += " · includes remote session";
 
   void chrome.action.setBadgeText({ text });
-  if (color) {
-    void chrome.action.setBadgeBackgroundColor({ color });
-  }
+  if (color) void chrome.action.setBadgeBackgroundColor({ color });
   void chrome.action.setTitle({ title });
 }
 
@@ -432,9 +431,9 @@ function sessionCanAdoptTab(session, tab) {
 
 function taskGroupTitle(session) {
   const label = session.taskLabel || "Task";
-  return `Agent Tab Bridge · ${renderClaimedString(label)}`;
+  const routeMarker = renderRouteMarker(session);
+  return `Agent Tab Bridge · ${renderClaimedString(label)}${routeMarker}`;
 }
-
 function sessionPageUrl(session) {
   const url = new URL(SESSION_PAGE_URL);
   url.searchParams.set("sessionId", session.id);
@@ -1900,7 +1899,10 @@ async function statusDto() {
         delta: { ...request.delta, tabIds: [...request.delta.tabIds], domains: [...request.delta.domains] },
         requestedAccess: { ...request.requestedAccess, tabIds: [...request.requestedAccess.tabIds], domains: [...request.requestedAccess.domains] },
         taskLabel: session?.taskLabel ?? "Unnamed task",
+        controllerId: session?.controllerId ?? "",
         controllerName: session?.controllerName ?? "Unnamed controller",
+        machineLabel: session?.machineLabel,
+        route: session?.route,
         currentAccess: session ? { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] } : null,
       };
     }),

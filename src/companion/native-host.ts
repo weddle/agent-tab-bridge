@@ -318,7 +318,6 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
           const manager = sessionManager();
           const session = manager.get(message.sessionId);
           if (!session || session.state !== "pending" || session.controllerPrincipalId !== message.controllerPrincipalId || session.displayControllerName !== message.displayControllerName || session.taskLabel !== message.taskLabel || session.expiresAt !== message.expiresAt || session.requestedCapabilities.join(",") !== message.requestedCapabilities.join(",") || !sameSessionAccess(session.access, message.access) || !sameRouteProvenance(session.route, message.route)) return;
-          if (session.route.kind === "routed") { await manager.revoke(session.id, "remoteApprovalUnavailable"); return; }
           const approved = await manager.approve(session.id);
           await send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionStarted", session: { ...approved.session, requestedCapabilities: [...approved.session.requestedCapabilities], access: { ...approved.session.access, tabIds: [...approved.session.access.tabIds], domains: [...approved.session.access.domains] }, route: { ...approved.session.route, accessCeiling: { ...approved.session.route.accessCeiling, tabIds: [...approved.session.route.accessCeiling.tabIds], domains: [...approved.session.route.accessCeiling.domains] } } }, relayUrl: approved.pairingUrl });
           return;

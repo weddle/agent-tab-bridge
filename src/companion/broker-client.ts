@@ -1,13 +1,16 @@
-import net from "node:net";
-import type { Duplex } from "node:stream";
-import { defaultBrokerSocketPath, type BrokerRouteContext } from "./broker.js";
-import { signTranscript, verifyTranscript } from "./identity.js";
-import { canonicalAuthV2Transcript, createAuthV2EphemeralPublicKey, createAuthV2Nonce, isAuthV2Transcript, type AuthV2RequestedAuthority } from "./auth-v2.js";
-import { loadProfile } from "./profiles.js";
-import { normalizeSessionAccess, type SessionAccess } from "./session-access.js";
-import { CompanionStateStore } from "./state.js";
-import type { HubRouteStream } from "./pairing/routes.js";
-import type { BrokerEvent } from "../atb.js";
+ import net from "node:net";
+ import type { Duplex } from "node:stream";
+ import { defaultBrokerSocketPath, type BrokerRouteContext } from "./broker.js";
+ import { signTranscript, verifyTranscript } from "./identity.js";
+ import { canonicalAuthV2Transcript, createAuthV2EphemeralPublicKey, createAuthV2Nonce, isAuthV2Transcript, type AuthV2RequestedAuthority } from "./auth-v2.js";
+ import { loadProfile } from "./profiles.js";
+ import { normalizeSessionAccess, type SessionAccess } from "./session-access.js";
+ import { CompanionStateStore } from "./state.js";
+ import type { HubRouteStream } from "./pairing/routes.js";
+ import type { BrokerEvent } from "../atb.js";
+ import { initiateChannel } from "./channel/index.js";
+ import { routedChannelContext } from "./channel/context.js";
+ import { SecureChannelTransportAdapter } from "./transport-adapter.js";
 
 export async function createCompanionBrokerClient(options: { directory?: string; profile?: string; socketPath?: string } = {}) {
   const socketPath = options.socketPath ?? defaultBrokerSocketPath({ directory: options.directory });
@@ -141,8 +144,33 @@ export function createBrokerClient(options: BrokerClientOptions) {
     },
   };
 }
+export async function createSecureRoutedTransport(options: Readonly<{ stream: HubRouteStream; profile: NonNullable<BrokerClientOptions["profile"]>; route: NonNullable<BrokerClientOptions["route"]>; targetPublicKeySpki: string }>): Promise<SecureChannelTransportAdapter> {
+  const identity = { version: 1 as const, kind: "controller" as const, principalId: options.profile.principalId, publicKeySpki: options.profile.publicKeySpki, privateKeyPkcs8: options.profile.privateKeyPkcs8, createdAt: Date.now() };
+  const initiated = initiateChannel({ identity, peerPublicKeySpki: options.targetPublicKeySpki, sessionId: options.route.address.stableSessionKey, context: routedChannelContext(options.route.address, options.stream.routeId, options.stream.streamId) });
+  const { promise, resolve, reject } = Promise.withResolvers<SecureChannelTransportAdapter>();
+  let done = false;
+  const off = options.stream.onPayload((payload) => {
+    if (done) return;
+    let message: Record<string, unknown>;
+    try { message = JSON.parse(payload.toString("utf8")) as Record<string, unknown>; } catch { return; }
+    if (message.type !== "channelAccept" || !message.value || typeof message.value !== "object") return;
+    done = true; off();
+    try {
+      const completed = initiated.complete(message.value as never);
+      options.stream.send(Buffer.from(JSON.stringify({ type: "channelConfirm", value: completed.confirm }), "utf8"));
+      const secure = new SecureChannelTransportAdapter(completed.channel, (frame) => { options.stream.send(frame); });
+      options.stream.onPayload((frame) => secure.receive(frame));
+      resolve(secure);
+    } catch (error) { options.stream.close(); reject(error instanceof Error ? error : new Error(String(error))); }
+  });
+  options.stream.onClose(() => { if (!done) { done = true; off(); reject(new Error("secure routed broker channel closed during handshake")); } });
+  options.stream.send(Buffer.from(JSON.stringify({ type: "channelHello", profileName: options.profile.name, publicKeySpki: options.profile.publicKeySpki, value: initiated.hello }), "utf8"));
+  return await promise;
+}
 
-/** Profile-authenticated broker client carried inside one hub-routed opaque stream. */
-export function createRoutedBrokerClient(options: Readonly<{ stream: HubRouteStream; profile: NonNullable<BrokerClientOptions["profile"]>; route: NonNullable<BrokerClientOptions["route"]> }>) {
-  return createBrokerClient({ socketPath: "hub-routed", profile: options.profile, route: options.route, socketFactory: () => options.stream.transport });
+export async function createRoutedBrokerClient(options: Readonly<{ stream: HubRouteStream; profile: NonNullable<BrokerClientOptions["profile"]>; route: NonNullable<BrokerClientOptions["route"]>; targetPublicKeySpki: string }>) {
+  const transport = await createSecureRoutedTransport(options);
+  const client = createBrokerClient({ socketPath: "hub-routed", profile: options.profile, route: options.route, socketFactory: () => transport });
+  queueMicrotask(() => transport.emit("connect"));
+  return client;
 }

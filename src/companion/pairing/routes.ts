@@ -12,10 +12,11 @@ export class HubRouteStream {
   private readonly closeListeners = new Set<() => void>();
   private closed = false;
   constructor(private readonly connection: HubRouteConnection, readonly address: RoutedBrokerAddress, readonly routeId: string, readonly streamId: string, private readonly direction: "request" | "response") { }
-  send(payload: Uint8Array): void {
+  send(payload: Uint8Array): boolean {
     if (this.closed) throw new Error("routed stream is closed");
-    this.connection.send(this.direction, this.routeId, this.streamId, this.address, payload);
+    return this.connection.send(this.direction, this.routeId, this.streamId, this.address, payload);
   }
+  get connectionSocket(): TLSSocket { return this.connection.connectionSocket; }
   onPayload(listener: (payload: Buffer) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   onClose(listener: () => void): () => void { this.closeListeners.add(listener); return () => this.closeListeners.delete(listener); }
   get transport(): Duplex { return new RoutedBrokerTransport(this); }
@@ -49,10 +50,10 @@ export class HubRouteConnection {
     const stream = new HubRouteStream(this, structuredClone(address), randomUUID(), randomUUID(), "request");
     this.streams.set(stream.routeId, stream); return stream;
   }
-  send(direction: "request" | "response" | "close", routeId: string, streamId: string, address: RoutedBrokerAddress, payload: Uint8Array): void {
+  send(direction: "request" | "response" | "close", routeId: string, streamId: string, address: RoutedBrokerAddress, payload: Uint8Array): boolean {
     if (this.closed) throw new Error("hub route connection is closed");
     const frame = encodeHubOpaqueRoute({ type: "opaqueRoute", direction, routeId, streamId, address, payload: encodeOpaqueRoutePayload(payload) });
-    this.socket.write(encodeHubFrame(frame, this.decoder.maxFrameBytes));
+    return this.socket.write(encodeHubFrame(frame, this.decoder.maxFrameBytes));
   }
   closeStream(stream: HubRouteStream): void {
     if (!this.closed) this.send("close", stream.routeId, stream.streamId, stream.address, Buffer.from([0]));
