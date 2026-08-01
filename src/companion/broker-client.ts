@@ -147,14 +147,16 @@ export function createBrokerClient(options: BrokerClientOptions) {
 export async function createSecureRoutedTransport(options: Readonly<{ stream: HubRouteStream; profile: NonNullable<BrokerClientOptions["profile"]>; route: NonNullable<BrokerClientOptions["route"]>; targetPublicKeySpki: string }>): Promise<SecureChannelTransportAdapter> {
   const identity = { version: 1 as const, kind: "controller" as const, principalId: options.profile.principalId, publicKeySpki: options.profile.publicKeySpki, privateKeyPkcs8: options.profile.privateKeyPkcs8, createdAt: Date.now() };
   const initiated = initiateChannel({ identity, peerPublicKeySpki: options.targetPublicKeySpki, sessionId: options.route.address.stableSessionKey, context: routedChannelContext(options.route.address, options.stream.routeId, options.stream.streamId) });
-  const { promise, resolve, reject } = Promise.withResolvers<SecureChannelTransportAdapter>();
   let done = false;
+  const { promise, resolve, reject } = Promise.withResolvers<SecureChannelTransportAdapter>();
+  const timer = setTimeout(() => { if (!done) { done = true; off(); options.stream.close(); reject(new Error("secure routed channel handshake timed out")); } }, 15_000);
+  timer.unref?.();
   const off = options.stream.onPayload((payload) => {
     if (done) return;
     let message: Record<string, unknown>;
     try { message = JSON.parse(payload.toString("utf8")) as Record<string, unknown>; } catch { return; }
     if (message.type !== "channelAccept" || !message.value || typeof message.value !== "object") return;
-    done = true; off();
+    done = true; clearTimeout(timer); off();
     try {
       const completed = initiated.complete(message.value as never);
       options.stream.send(Buffer.from(JSON.stringify({ type: "channelConfirm", value: completed.confirm }), "utf8"));
@@ -163,7 +165,7 @@ export async function createSecureRoutedTransport(options: Readonly<{ stream: Hu
       resolve(secure);
     } catch (error) { options.stream.close(); reject(error instanceof Error ? error : new Error(String(error))); }
   });
-  options.stream.onClose(() => { if (!done) { done = true; off(); reject(new Error("secure routed broker channel closed during handshake")); } });
+  options.stream.onClose(() => { if (!done) { done = true; clearTimeout(timer); off(); reject(new Error("secure routed broker channel closed during handshake")); } });
   options.stream.send(Buffer.from(JSON.stringify({ type: "channelHello", profileName: options.profile.name, publicKeySpki: options.profile.publicKeySpki, value: initiated.hello }), "utf8"));
   return await promise;
 }

@@ -161,6 +161,8 @@ export class EdgeSupervisor {
   private hubSocket?: TLSSocket;
   private hubRoutes?: HubRouteConnection;
   private hubId?: string;
+  private hubReconnectTimer?: NodeJS.Timeout;
+  private hubReconnectInFlight = false;
   private started = false;
   private closing: Promise<void> | undefined;
   private registryTail = Promise.resolve();
@@ -196,17 +198,14 @@ export class EdgeSupervisor {
     this.started = true;
     await this.writeRegistry();
     emit(this.options.onEvent, { type: "started", machineId: this.machineId });
-    try {
-      const pairing = await this.hubPairing.store.load();
-      this.hubId = pairing?.pairing.pinnedPeerKey.principalId;
-      const routes = await this.hubPairing.connectRoutes((stream, address) => this.routeHubBroker(stream, address));
-      if (routes) {
-        this.hubRoutes = routes;
-        this.hubSocket = routes.connectionSocket;
-        emit(this.options.onEvent, { type: "hubConnected" });
-        this.hubSocket.once("close", () => { this.hubSocket = undefined; this.hubRoutes = undefined; emit(this.options.onEvent, { type: "hubDisconnected" }); });
-      }
-    } catch { emit(this.options.onEvent, { type: "hubDisconnected" }); }
+    const pairing = await this.hubPairing.store.load();
+    this.hubId = pairing?.pairing.pinnedPeerKey.principalId;
+    if (this.hubId) {
+      await this.connectHub().catch(() => {
+        emit(this.options.onEvent, { type: "hubDisconnected" });
+        this.scheduleHubReconnect();
+      });
+    }
     return this;
   }
 
@@ -230,6 +229,8 @@ export class EdgeSupervisor {
 
   private async stop(): Promise<void> {
     emit(this.options.onEvent, { type: "stopping" });
+    clearTimeout(this.hubReconnectTimer);
+    this.hubReconnectTimer = undefined;
     this.hubRoutes?.close();
     this.hubRoutes = undefined;
     this.hubSocket?.destroy();
@@ -344,13 +345,41 @@ export class EdgeSupervisor {
   }
 
   /** Terminates a routed profile-auth stream and begins only explicit remote enrollments at its selected edge. */
-  private async routeHubBroker(stream: HubRouteStream, address: RoutedBrokerAddress): Promise<void> {
-    const hubState = await this.hubPairing.store.load();
-    if (!hubState?.enabledEndpointIds.includes(address.endpointId)) {
-      stream.send(Buffer.from(JSON.stringify({ type: "error", error: { code: "endpointHubDisabled", message: "endpoint is not enabled for this hub" } }), "utf8"));
-      stream.close();
-      return;
-    }
+  private async connectHub(): Promise<void> {
+    if (this.closing || !this.hubId || this.hubSocket) return;
+    const routes = await this.hubPairing.connectRoutes((stream, address) => this.routeHubBroker(stream, address));
+    if (!routes) throw new Error("hub pairing state is unavailable");
+    this.hubRoutes = routes;
+    const socket = routes.connectionSocket;
+    this.hubSocket = socket;
+    socket.once("close", () => { void this.handleHubDisconnected(socket); });
+    emit(this.options.onEvent, { type: "hubConnected" });
+  }
+
+  private async handleHubDisconnected(socket: TLSSocket): Promise<void> {
+    if (this.hubSocket !== socket && this.hubRoutes?.connectionSocket !== socket) return;
+    this.hubSocket = undefined;
+    this.hubRoutes = undefined;
+    await Promise.all([...this.endpoints.values(), ...this.suspendedEndpoints.values()].map(async ({ broker }) => await broker.revokeRoutedSessions()));
+    emit(this.options.onEvent, { type: "hubDisconnected" });
+    this.scheduleHubReconnect();
+  }
+
+  private scheduleHubReconnect(): void {
+    if (this.closing || !this.hubId || this.hubReconnectTimer || this.hubReconnectInFlight) return;
+    this.hubReconnectTimer = setTimeout(() => {
+      this.hubReconnectTimer = undefined;
+      this.hubReconnectInFlight = true;
+      void this.connectHub().then(() => undefined, () => undefined).finally(() => {
+        this.hubReconnectInFlight = false;
+        if (!this.hubSocket) this.scheduleHubReconnect();
+      });
+    }, 1_000);
+    this.hubReconnectTimer.unref?.();
+  }
+
+  private routeHubBroker(stream: HubRouteStream, address: RoutedBrokerAddress): void {
+    const hubEnablement = this.hubPairing.store.load();
     const runtime = this.endpoints.get(address.endpointId);
     const hubId = this.hubId;
     if (!hubId || address.machineId !== this.machineId || !runtime || runtime.endpoint.endpointId !== address.endpointId) { stream.close(); return; }
@@ -365,6 +394,14 @@ export class EdgeSupervisor {
     const close = () => { stream.close(); upstream?.destroy(); secure?.destroy(); };
     stream.onPayload((payload) => {
       void (async () => {
+        try {
+          const hubState = await hubEnablement;
+          if (!hubState?.enabledEndpointIds.includes(address.endpointId)) {
+            stream.send(Buffer.from(JSON.stringify({ type: "error", error: { code: "endpointHubDisabled", message: "endpoint is not enabled for this hub" } }), "utf8"));
+            close();
+            return;
+          }
+        } catch { close(); return; }
         if (first) {
           first = false;
           let request: Record<string, unknown> | undefined;

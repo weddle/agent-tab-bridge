@@ -156,6 +156,10 @@ export class BrokerServer {
     for (const socket of this.connections) { socket.end('{"event":"hostClosing"}\n'); socket.destroy(); }
     this.clients.clear(); this.connections.clear(); this.sessionOwners.clear(); this.pendingEvents.clear(); await new Promise<void>((resolve) => this.server.close(() => resolve())); await rm(this.socketPath, { force: true });
   }
+  /** Closes only hub-routed sessions; local sessions remain available during hub loss. */
+  async revokeRoutedSessions(reason = "hubConnectionLost"): Promise<void> {
+    await Promise.allSettled(this.options.sessions.snapshot().filter((session) => session.route.kind === "routed").map(async (session) => await this.options.sessions.revoke(session.id, reason)));
+  }
   private bindSessionOwner(sessionId: string, socket: Socket, revokeOnDisconnect: boolean): void {
     const owners = this.sessionOwners.get(sessionId) ?? { sockets: new Set<Socket>(), revokeOnDisconnect };
     owners.sockets.add(socket);

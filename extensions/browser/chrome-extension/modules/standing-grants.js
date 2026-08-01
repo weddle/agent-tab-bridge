@@ -10,7 +10,7 @@ function validId(value) {
 }
 
 function validRoute(value) {
-  return !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 8 && ["kind", "endpointId", "controllerPrincipalId", "routePolicy", "accessCeiling", "hubId", "routeId", "streamId"].every((field) => Object.hasOwn(value, field)) && validId(value.endpointId) && validId(value.controllerPrincipalId) && validAccess(value.accessCeiling) && ((value.kind === "local" && value.routePolicy === "localOnly" && value.hubId === null && value.routeId === null && value.streamId === null) || (value.kind === "routed" && value.routePolicy === "routed"));
+  return !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 8 && ["kind", "endpointId", "controllerPrincipalId", "routePolicy", "accessCeiling", "hubId", "routeId", "streamId"].every((field) => Object.hasOwn(value, field)) && validId(value.endpointId) && validId(value.controllerPrincipalId) && validAccess(value.accessCeiling) && ((value.kind === "local" && value.routePolicy === "localOnly" && value.hubId === null && value.routeId === null && value.streamId === null) || (value.kind === "routed" && value.routePolicy === "routed" && validId(value.hubId)));
 }
 
 function legacyGrant(value) {
@@ -36,6 +36,10 @@ export function localStandingGrantFor(grants, controllerId, route) {
   if (!route || route.kind !== "local" || route.routePolicy !== "localOnly") return null;
   return grants.find((grant) => grant.controllerId === controllerId && grant.route.kind === "local" && grant.route.routePolicy === "localOnly" && grant.route.endpointId === route.endpointId && grant.route.controllerPrincipalId === route.controllerPrincipalId) ?? null;
 }
+export function routedStandingGrantFor(grants, controllerId, route) {
+  if (!route || route.kind !== "routed" || route.routePolicy !== "routed" || !validId(route.hubId)) return null;
+  return grants.find((grant) => grant.controllerId === controllerId && grant.route.kind === "routed" && grant.route.routePolicy === "routed" && grant.route.controllerPrincipalId === route.controllerPrincipalId && grant.route.hubId === route.hubId) ?? null;
+}
 
 export function accessWithinStandingGrant(access, grant) {
   if (!grant || !access || access.level === "full") return false;
@@ -44,10 +48,11 @@ export function accessWithinStandingGrant(access, grant) {
 }
 
 export function rememberStandingGrant(grants, session) {
-  if (!session?.route || session.route.kind !== "local" || session.route.routePolicy !== "localOnly" || session.access?.level === "full") return grants;
-  const existing = localStandingGrantFor(grants, session.controllerId, session.route);
+  const route = session?.route;
+  if (!route || (route.kind !== "local" && route.kind !== "routed") || session.access?.level === "full" || (route.kind === "routed" && !validId(route.hubId))) return grants;
+  const existing = route.kind === "routed" ? routedStandingGrantFor(grants, session.controllerId, route) : localStandingGrantFor(grants, session.controllerId, route);
   const priorDomains = existing?.route.accessCeiling.level === "domains" ? existing.route.accessCeiling.domains : [];
   const domains = session.access.level === "domains" ? [...new Set([...priorDomains, ...session.access.domains])].sort() : priorDomains;
   const level = session.access.level === "domains" || existing?.route.accessCeiling.level === "domains" ? "domains" : "selectedTabs";
-  return [...grants.filter((grant) => grant.controllerId !== session.controllerId || grant.route.endpointId !== session.route.endpointId), { version: 2, controllerId: session.controllerId, controllerName: session.controllerName, route: { ...session.route, accessCeiling: { level, tabIds: [], domains } }, createdAt: existing?.createdAt ?? Date.now() }];
+  return [...grants.filter((grant) => grant.controllerId !== session.controllerId || (route.kind === "routed" ? grant.route.kind !== "routed" || grant.route.hubId !== route.hubId : grant.route.endpointId !== route.endpointId)), { version: 2, controllerId: session.controllerId, controllerName: session.controllerName, route: { ...route, accessCeiling: { level, tabIds: [], domains } }, createdAt: existing?.createdAt ?? Date.now() }];
 }

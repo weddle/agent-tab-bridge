@@ -276,4 +276,20 @@ describe("BrokerServer socket ownership", () => {
       await broker.close();
     }
   });
+  it("revokes routed sessions on hub loss while leaving local sessions active", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "atb-broker-")); directories.push(directory);
+    const closed: string[] = [];
+    const sessions = new TaskSessionManager({ startRelay: async () => ({ pairingUrl: "ws://127.0.0.1/extension#token", cdpUrl: "ws://127.0.0.1/cdp?token=token", close: async () => { closed.push("relay"); } }) });
+    const broker = await startBrokerServer({ socketPath: join(directory, "broker.sock"), token: "a".repeat(32), sessions, isTrusted: () => true, controller: () => null });
+    try {
+      const routed = sessions.open({ controllerPrincipalId: "sha256/controller", controllerName: "Remote", taskLabel: "remote", capabilities: ["cdp"], route: { kind: "routed", endpointId: "sha256/endpoint", controllerPrincipalId: "sha256/controller", routePolicy: "routed", accessCeiling: { level: "selectedTabs", tabIds: [], domains: [] }, hubId: "sha256/hub", routeId: "route", streamId: "stream" } });
+      const local = sessions.open({ controllerPrincipalId: "sha256/local", controllerName: "Local", taskLabel: "local", capabilities: ["cdp"] });
+      await sessions.approve(routed.id); sessions.relayReady(routed.id);
+      await sessions.approve(local.id); sessions.relayReady(local.id);
+      await broker.revokeRoutedSessions();
+      expect(sessions.get(routed.id)?.state).toBe("revoked");
+      expect(sessions.get(local.id)?.state).toBe("active");
+      expect(closed).toEqual(["relay"]);
+    } finally { await broker.close(); }
+  });
 });

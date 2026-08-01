@@ -13,7 +13,7 @@ import {
   sessionOwnsTab,
   sessionTabIds,
 } from "./modules/session-core.js";
-import { accessWithinStandingGrant, isStandingGrant, localStandingGrantFor, migrateStandingGrants, rememberStandingGrant } from "./modules/standing-grants.js";
+import { accessWithinStandingGrant, isStandingGrant, localStandingGrantFor, migrateStandingGrants, rememberStandingGrant, routedStandingGrantFor } from "./modules/standing-grants.js";
 import {
   NATIVE_PROTOCOL_VERSION as PROTOCOL_VERSION,
   fingerprintSpki,
@@ -673,12 +673,14 @@ function approveSessionNow(session, rememberedGrant = false) {
   }
 }
 
-/** Auto-approve only a local pending session covered by a local-only standing grant. */
+/** Auto-approve a pending session only when its remembered route and scope are covered. */
 async function maybeAutoApprove(session) {
   await standingGrantsReady;
-  if (!session || session.state !== "pending" || approvedSessions.has(session.id) || session.route?.kind !== "local" || session.route.routePolicy !== "localOnly") return;
+  const route = session?.route;
+  if (!session || session.state !== "pending" || approvedSessions.has(session.id) || !route || (route.kind !== "local" && route.kind !== "routed") || (route.kind === "local" && route.routePolicy !== "localOnly") || (route.kind === "routed" && (route.routePolicy !== "routed" || typeof route.hubId !== "string"))) return;
   if (!enrolledPrincipal(session.controllerId)) return;
-  if (!accessWithinStandingGrant(session.access, localStandingGrantFor(standingGrants, session.controllerId, session.route))) return;
+  const grant = route.kind === "routed" ? routedStandingGrantFor(standingGrants, session.controllerId, route) : localStandingGrantFor(standingGrants, session.controllerId, route);
+  if (!accessWithinStandingGrant(session.access, grant)) return;
   try {
     session.rememberedGrant = true;
     approveSessionNow(session, true);
