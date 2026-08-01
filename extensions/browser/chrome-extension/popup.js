@@ -644,7 +644,8 @@ function renderProfilesAndGrants() {
   grantsList.replaceChildren(...grants.map((grant) => {
     const item = makeElement("li");
     const scope = grant.level === "domains" ? `sites: ${grant.domains.join(", ") || "none"}` : "selected tabs only";
-    item.append(makeElement("span", "tab-title", `${grant.controllerName} · auto-approve up to ${scope}`));
+    const route = grant.route?.routePolicy === "localOnly" ? " · local only" : "";
+    item.append(makeElement("span", "tab-title", `${grant.controllerName} · auto-approve up to ${scope}${route}`));
     const forget = makeButton("Forget", "secondary");
     if (inFlight.has(`grant:${grant.controllerId}`)) forget.disabled = true;
     forget.addEventListener("click", () => void runMutation(`grant:${grant.controllerId}`, forget, { type: "revokeGrant", controllerId: grant.controllerId }, "The standing grant could not be removed."));

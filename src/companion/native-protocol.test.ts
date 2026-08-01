@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { assertNativeMessage, MAX_TTL_MS, NATIVE_PROTOCOL_VERSION, validateNativeMessage, validateSessionRecord, type SessionRecord } from "./native-protocol.js";
+import { assertNativeMessage, canonicalSessionRecord, MAX_TTL_MS, NATIVE_PROTOCOL_VERSION, validateNativeMessage, validateSessionRecord, type SessionRecord } from "./native-protocol.js";
 
-const session = (overrides: Partial<SessionRecord> = {}): SessionRecord => ({ id: "task-1", controllerPrincipalId: "sha256/controller", displayControllerName: "CLI", taskLabel: "research", requestedCapabilities: ["cdp"], access: { level: "selectedTabs", tabIds: [], domains: [] }, createdAt: 10, expiresAt: 10 + 60_000, state: "pending", ...overrides });
+const route = { kind: "local", endpointId: "sha256/endpoint", controllerPrincipalId: "sha256/controller", routePolicy: "localOnly", accessCeiling: { level: "selectedTabs", tabIds: [], domains: [] }, hubId: null, routeId: null, streamId: null } as const;
+const session = (overrides: Partial<SessionRecord> = {}): SessionRecord => ({ id: "task-1", controllerPrincipalId: "sha256/controller", displayControllerName: "CLI", taskLabel: "research", requestedCapabilities: ["cdp"], access: { level: "selectedTabs", tabIds: [], domains: [] }, createdAt: 10, expiresAt: 10 + 60_000, state: "pending", route, ...overrides });
 
 describe("native protocol validation", () => {
   it("accepts versioned records and rejects oversized or malformed records", () => {
@@ -11,6 +12,8 @@ describe("native protocol validation", () => {
     expect(validateSessionRecord(session({ expiresAt: 10 + MAX_TTL_MS + 1 }))).toBe(false);
     expect(validateSessionRecord(session({ requestedCapabilities: ["cdp", "cdp"] as ["cdp", "cdp"] }))).toBe(false);
     expect(validateSessionRecord({ ...session(), unexpected: true })).toBe(false);
+    expect(Buffer.compare(canonicalSessionRecord(session()), canonicalSessionRecord({ ...session(), route: { ...route } }))).toBe(0);
+    expect(Buffer.compare(canonicalSessionRecord(session()), canonicalSessionRecord({ ...session(), route: { ...route, endpointId: "sha256/other" } }))).not.toBe(0);
   });
   it("requires version, role, and complete handshake transcript fields", () => {
     const hello = { version: NATIVE_PROTOCOL_VERSION, type: "hello", role: "extension", extensionId: "ext", extensionPublicKey: "aGVsbG8", extensionNonce: "bm9uY2U" } as const;
@@ -23,7 +26,7 @@ describe("native protocol validation", () => {
     expect(validateNativeMessage({ ...challenge, signature: undefined })).toBe(false);
     expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "revokeDevice", requestId: "forget-1" })).toBe(true);
     expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "revokeDevice", requestId: "" })).toBe(false);
-    const approval = { version: NATIVE_PROTOCOL_VERSION, type: "approveSession", requestId: "approve-1", sessionId: "task-1", controllerPrincipalId: "sha256/controller", displayControllerName: "CLI", taskLabel: "research", requestedCapabilities: ["cdp"], expiresAt: null, access: { level: "domains", tabIds: [], domains: ["example.com"] } } as const;
+    const approval = { version: NATIVE_PROTOCOL_VERSION, type: "approveSession", requestId: "approve-1", sessionId: "task-1", controllerPrincipalId: "sha256/controller", displayControllerName: "CLI", taskLabel: "research", requestedCapabilities: ["cdp"], expiresAt: null, access: { level: "domains", tabIds: [], domains: ["example.com"] }, route: { ...route, accessCeiling: { level: "domains", tabIds: [], domains: ["example.com"] } } } as const;
     expect(validateNativeMessage(approval)).toBe(true);
     expect(validateNativeMessage({ ...approval, access: { level: "domains", tabIds: [], domains: ["https://example.com/path"] } })).toBe(false);
     expect(validateNativeMessage({ ...approval, unexpected: true })).toBe(false);

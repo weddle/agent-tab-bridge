@@ -8,6 +8,7 @@ import { NATIVE_PROTOCOL_VERSION, type AccessUpgradeRecord, type ExtensionToHost
 import { CompanionStateStore } from "./state.js";
 import { TaskSessionError, TaskSessionManager, type TaskSessionRelay } from "./task-sessions.js";
 import { sameSessionAccess, type SessionAccessDelta } from "./session-access.js";
+import { localRouteProvenance, sameRouteProvenance } from "./endpoint-contracts.js";
 
 export const NATIVE_HOST_NAME = "com.agenttabbridge.companion";
 export type NativeHostOptions = { input?: Readable; output?: Writable; stateStore?: CompanionStateStore; identityStore?: IdentityStore; startRelay?: () => Promise<TaskSessionRelay> };
@@ -19,8 +20,8 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
   const stateStore = options.stateStore ?? new CompanionStateStore();
   const identityStore = options.identityStore ?? new IdentityStore("companion");
   const companion = await identityStore.loadOrCreate();
-  const state = await stateStore.update(async (current) => ({ ...current, companionPrincipalId: companion.principalId, brokerSecret: current.brokerSecret || createBrokerSecret() }));
-  const controllerPrincipalId = deriveControllerPrincipalId(state.brokerSecret);
+  const state = await stateStore.initializeMachine(companion.principalId, createBrokerSecret());
+  const controllerPrincipalId = deriveControllerPrincipalId(state.machine.brokerSecret);
   let trusted: { extensionId: string; fingerprint: string; principalId: string; displayName: string } | null = null;
   let broker: BrokerServer | null = null;
   let ending = false;
@@ -109,8 +110,11 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
     await send({ version: NATIVE_PROTOCOL_VERSION, type: "enrollPending", enrollmentId, profileName, profileFingerprint: fingerprint, expiresAt });
     return { enrollmentId, code, expiresAt };
   };
-  const sessions = new TaskSessionManager({ startRelay: options.startRelay ?? startAgentTabRelay, onEvent: (event) => {
-    const session = { ...event.session, requestedCapabilities: [...event.session.requestedCapabilities], access: { ...event.session.access, tabIds: [...event.session.access.tabIds], domains: [...event.session.access.domains] } };
+  const sessions = new TaskSessionManager({ startRelay: options.startRelay ?? startAgentTabRelay, routeFor: (principalId, access) => {
+    if (!trusted) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
+    return localRouteProvenance(trusted.fingerprint, principalId, access);
+  }, onEvent: (event) => {
+    const session = { ...event.session, requestedCapabilities: [...event.session.requestedCapabilities], access: { ...event.session.access, tabIds: [...event.session.access.tabIds], domains: [...event.session.access.domains] }, route: { ...event.session.route, accessCeiling: { ...event.session.route.accessCeiling, tabIds: [...event.session.route.accessCeiling.tabIds], domains: [...event.session.route.accessCeiling.domains] } } };
     if (event.type === "pending") { broker?.publish({ event: "pending", sessionId: session.id, session }); void send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionPending", session }).catch(() => {}); }
     else if (event.type === "active") broker?.publish({ event: "active", sessionId: session.id, session, cdpUrl: event.cdpUrl });
     else {
@@ -125,11 +129,11 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
       void send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionStopped", session, reason: event.reason }).catch(() => {});
     }
   } });
-  broker = await startBrokerServer({ token: state.brokerSecret, sessions, isTrusted: () => trusted !== null, controller: () => trusted ? { principalId: controllerPrincipalId, displayName: "Local controller" } : null, profile: async (name) => {
+  broker = await startBrokerServer({ token: state.machine.brokerSecret, sessions, isTrusted: () => trusted !== null, controller: () => trusted ? { principalId: controllerPrincipalId, displayName: "Local controller" } : null, profile: async (name) => {
     const current = await stateStore.load();
-    const record = (current.enrolledProfiles ?? []).find((profile) => profile.name === name);
+    const record = current.machine.enrollments.find((profile) => profile.name === name);
     return record ? { principalId: record.principalId, displayName: record.name, publicKeySpki: record.publicKeySpki } : null;
-  }, enrollProfile, status: () => ({ companionPrincipalId: companion.principalId, controllerPrincipalId }), listTabs, claimTab, requestAccess });
+  }, authContext: () => trusted ? { machineId: companion.principalId, machinePublicKeySpki: companion.publicKeySpki, machinePrivateKeyPkcs8: companion.privateKeyPkcs8, endpointId: trusted.fingerprint } : null, enrollProfile, status: () => ({ companionPrincipalId: companion.principalId, controllerPrincipalId }), listTabs, claimTab, requestAccess });
   const handshake = new HostIdentityHandshake(identityStore, stateStore);
   const decoder = new NativeMessageDecoder();
   const requestIds = new Set<string>();
@@ -148,9 +152,9 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
     try { await sessions.revokeAll("hostClosing"); } finally { try { await broker?.close(); } catch {} }
   };
   const snapshot = async () => {
-    const all = sessions.snapshot().map((session) => ({ ...session, requestedCapabilities: [...session.requestedCapabilities], access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] } }));
+    const all = sessions.snapshot().map((session) => ({ ...session, requestedCapabilities: [...session.requestedCapabilities], access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] }, route: { ...session.route, accessCeiling: { ...session.route.accessCeiling, tabIds: [...session.route.accessCeiling.tabIds], domains: [...session.route.accessCeiling.domains] } } }));
     const current = await stateStore.load();
-    const enrolledProfiles = (current.enrolledProfiles ?? []).map(({ name, principalId, enrolledAt }) => ({ name, principalId, enrolledAt }));
+    const enrolledProfiles = current.machine.enrollments.map(({ name, principalId, enrolledAt }) => ({ name, principalId, enrolledAt }));
     await send({ version: NATIVE_PROTOCOL_VERSION, type: "snapshot", pending: all.filter(({ state }) => state === "pending"), active: all.filter(({ state }) => state === "active"), sharedTabs: [], pendingAccess: [...pendingAccess.values()], enrolledProfiles });
   };
   await new Promise<void>((resolve) => {
@@ -190,7 +194,7 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
           return;
         }
         if (message.type === "revokeDevice") { const current = trusted; await sessions.revokeAll("deviceRevoked"); await stateStore.unpinExtension(current.extensionId, current.fingerprint); trusted = null; await outputTail; finishHost(); return; }
-        if (message.type === "approveSession") { const session = sessions.get(message.sessionId); if (!session || session.state !== "pending" || session.controllerPrincipalId !== message.controllerPrincipalId || session.displayControllerName !== message.displayControllerName || session.taskLabel !== message.taskLabel || session.expiresAt !== message.expiresAt || session.requestedCapabilities.join(",") !== message.requestedCapabilities.join(",") || !sameSessionAccess(session.access, message.access)) return; const approved = await sessions.approve(session.id); await send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionStarted", session: { ...approved.session, requestedCapabilities: [...approved.session.requestedCapabilities], access: { ...approved.session.access, tabIds: [...approved.session.access.tabIds], domains: [...approved.session.access.domains] } }, relayUrl: approved.pairingUrl, ...(message.requestId ? { requestId: message.requestId } : {}) }); return; }
+        if (message.type === "approveSession") { const session = sessions.get(message.sessionId); if (!session || session.state !== "pending" || session.controllerPrincipalId !== message.controllerPrincipalId || session.displayControllerName !== message.displayControllerName || session.taskLabel !== message.taskLabel || session.expiresAt !== message.expiresAt || session.requestedCapabilities.join(",") !== message.requestedCapabilities.join(",") || !sameSessionAccess(session.access, message.access) || !sameRouteProvenance(session.route, message.route)) return; const approved = await sessions.approve(session.id); await send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionStarted", session: { ...approved.session, requestedCapabilities: [...approved.session.requestedCapabilities], access: { ...approved.session.access, tabIds: [...approved.session.access.tabIds], domains: [...approved.session.access.domains] }, route: { ...approved.session.route, accessCeiling: { ...approved.session.route.accessCeiling, tabIds: [...approved.session.route.accessCeiling.tabIds], domains: [...approved.session.route.accessCeiling.domains] } } }, relayUrl: approved.pairingUrl }); return; }
         if (message.type === "approveAccess") {
           const request = pendingAccess.get(message.accessRequestId);
           if (!request || request.sessionId !== message.sessionId || !sameSessionAccess(request.requestedAccess, message.requestedAccess)) return;
@@ -233,16 +237,16 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
           }
           clearTimeout(pending.timer);
           pendingEnrollments.delete(message.enrollmentId);
-          await stateStore.update((current) => ({ ...current, enrolledProfiles: [...(current.enrolledProfiles ?? []).filter((profile) => profile.name !== pending.profileName), { name: pending.profileName, principalId: pending.fingerprint, publicKeySpki: pending.publicKeySpki, enrolledAt: Date.now() }] }));
+          await stateStore.update((current) => ({ ...current, machine: { ...current.machine, enrollments: [...current.machine.enrollments.filter((profile) => profile.name !== pending.profileName), { name: pending.profileName, principalId: pending.fingerprint, publicKeySpki: pending.publicKeySpki, enrolledAt: Date.now() }] } }));
           broker?.publish({ event: "profileEnrolled", enrollmentId: message.enrollmentId, profileName: pending.profileName });
           await send({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: message.requestId, enrollmentId: message.enrollmentId, ok: true, profileName: pending.profileName });
           return;
         }
         if (message.type === "revokeProfile") {
           const current = await stateStore.load();
-          const record = (current.enrolledProfiles ?? []).find((profile) => profile.name === message.profileName);
+          const record = current.machine.enrollments.find((profile) => profile.name === message.profileName);
           if (record) {
-            await stateStore.update((state) => ({ ...state, enrolledProfiles: (state.enrolledProfiles ?? []).filter((profile) => profile.name !== message.profileName) }));
+            await stateStore.update((state) => ({ ...state, machine: { ...state.machine, enrollments: state.machine.enrollments.filter((profile) => profile.name !== message.profileName) } }));
             await Promise.allSettled(sessions.snapshot().filter((session) => session.controllerPrincipalId === record.principalId && session.state !== "revoked").map(async (session) => await sessions.revoke(session.id, "profileRevoked")));
           }
           await snapshot();

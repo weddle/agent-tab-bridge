@@ -72,3 +72,16 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## @cipherman/pake-js
+
+- Upstream: https://github.com/alicommit-malp/pake-js
+- Package source: https://registry.npmjs.org/@cipherman/pake-js/-/pake-js-0.1.1.tgz
+- Version: `0.1.1`
+- License: MIT
+- Copyright: Copyright (c) 2026 Ali Alp
+
+`src/companion/pairing/vendor/pake-js-0.1.1.ts` is a vendored, unmodified
+distribution build of the package's SPAKE2+ implementation, apart from its
+provenance header and TypeScript filename. The upstream MIT license is retained
+at `src/companion/pairing/vendor/LICENSE`.

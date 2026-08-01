@@ -1,6 +1,6 @@
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { createHandshakeNonce, fingerprintSpki, generateIdentity, signTranscript, verifyTranscript } from "./identity.js";
+import { fingerprintSpki, generateIdentity, signTranscript, verifyTranscript } from "./identity.js";
 import { applicationSupportDirectory, atomicWritePrivateJson, readPrivateJson, type ApplicationSupportOptions } from "./state.js";
 
 const PROFILE_RECORD_VERSION = 1 as const;
@@ -103,11 +103,3 @@ export async function listProfiles(options: ApplicationSupportOptions = {}): Pro
   return profiles;
 }
 
-/** Canonical bytes signed by a profile to answer a broker auth challenge. */
-export function profileAuthTranscript(nonce: string, profileName: string): Uint8Array {
-  return Buffer.from(`atb-broker-profile-auth\u0000${nonce}\u0000${profileName}`, "utf8");
-}
-
-export function createProfileAuthNonce(): string {
-  return createHandshakeNonce();
-}

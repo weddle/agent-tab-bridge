@@ -7,10 +7,38 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createBrokerClient } from "./broker-client.js";
 import { startBrokerServer } from "./broker.js";
 import { createProfile } from "./profiles.js";
-import { generateIdentity } from "./identity.js";
+import { generateIdentity, signTranscript } from "./identity.js";
+import { canonicalAuthV2Transcript, createAuthV2EphemeralPublicKey, createAuthV2Nonce, type AuthV2RequestedAuthority, type AuthV2Transcript } from "./auth-v2.js";
 import { TaskSessionManager } from "./task-sessions.js";
 
 const directories: string[] = [];
+const defaultAuthority: AuthV2RequestedAuthority = { scope: { level: "selectedTabs", tabIds: [], domains: [] }, ttlMs: 5_000, stableSessionKey: "research" };
+async function rawProfileAuth(socketPath: string, profile: { name: string; principalId: string; publicKeySpki: string; privateKeyPkcs8: string }, proofFor: (transcript: AuthV2Transcript) => { transcript: AuthV2Transcript; signature: string } = (transcript) => ({ transcript, signature: signTranscript(profile.privateKeyPkcs8, canonicalAuthV2Transcript(transcript)) })): Promise<{ ok: boolean; proof?: { transcript: AuthV2Transcript; signature: string } }> {
+  const socket = createConnection(socketPath);
+  const hello = { type: "authHello", profile: profile.name, controllerNonce: createAuthV2Nonce(), controllerEphemeralPublicKey: createAuthV2EphemeralPublicKey(), authority: defaultAuthority };
+  const { promise, resolve, reject } = Promise.withResolvers<{ ok: boolean; proof?: { transcript: AuthV2Transcript; signature: string } }>();
+  let buffer = "";
+  let proof: { transcript: AuthV2Transcript; signature: string } | undefined;
+  socket.once("error", reject);
+  socket.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    for (;;) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      const message = JSON.parse(buffer.slice(0, newline)) as Record<string, unknown>;
+      buffer = buffer.slice(newline + 1);
+      if (message.type === "authChallenge") {
+        proof = proofFor(message.transcript as AuthV2Transcript);
+        socket.write(`${JSON.stringify({ type: "authProof", ...proof })}\n`);
+      } else if (message.type === "authOk" || message.type === "error") {
+        socket.end();
+        resolve(message.type === "authOk" ? { ok: true, proof } : { ok: false });
+      }
+    }
+  });
+  socket.once("connect", () => socket.write(`${JSON.stringify(hello)}\n`));
+  return await promise;
+}
 afterEach(async () => { await Promise.all(directories.splice(0).map(async (directory) => await rm(directory, { recursive: true, force: true }))); });
 
 describe("BrokerServer socket ownership", () => {
@@ -143,6 +171,8 @@ describe("BrokerServer socket ownership", () => {
   it("authenticates profile clients by challenge-response and scopes sessions to the profile principal", async () => {
     const directory = await mkdtemp(join(tmpdir(), "atb-broker-")); directories.push(directory);
     const profile = await createProfile("hermes-research", { directory });
+    const machine = generateIdentity("companion");
+    const endpoint = generateIdentity("controller");
     const enrolled = new Map([[profile.name, { principalId: profile.principalId, displayName: profile.name, publicKeySpki: profile.publicKeySpki }]]);
     const sessions = new TaskSessionManager({
       idFactory: () => "profile-session",
@@ -156,9 +186,10 @@ describe("BrokerServer socket ownership", () => {
       isTrusted: () => true,
       controller: () => ({ principalId: "controller-token", displayName: "CLI" }),
       profile: (name) => enrolled.get(name) ?? null,
+      authContext: () => ({ machineId: machine.principalId, machinePublicKeySpki: machine.publicKeySpki, machinePrivateKeyPkcs8: machine.privateKeyPkcs8, endpointId: endpoint.principalId }),
     });
     try {
-      const client = createBrokerClient({ socketPath: broker.socketPath, profile: { name: profile.name, privateKeyPkcs8: profile.privateKeyPkcs8 } });
+      const client = createBrokerClient({ socketPath: broker.socketPath, profile: { name: profile.name, principalId: profile.principalId, publicKeySpki: profile.publicKeySpki, privateKeyPkcs8: profile.privateKeyPkcs8 } });
       const opened = await client.request("openSession", { taskLabel: "Research", requestedCapabilities: ["cdp"], stableSessionKey: "research" }) as { session: { id: string; controllerPrincipalId: string; displayControllerName: string } };
       expect(opened.session.controllerPrincipalId).toBe(profile.principalId);
       expect(opened.session.displayControllerName).toBe(profile.name);
@@ -172,14 +203,44 @@ describe("BrokerServer socket ownership", () => {
       await expect(tokenClient.request("sessionUrl", { stableSessionKey: "research" })).rejects.toThrow(/not found/);
       await tokenClient.close();
 
-      const unknown = createBrokerClient({ socketPath: broker.socketPath, profile: { name: "unknown", privateKeyPkcs8: profile.privateKeyPkcs8 } });
+      const unknown = createBrokerClient({ socketPath: broker.socketPath, profile: { name: "unknown", principalId: profile.principalId, publicKeySpki: profile.publicKeySpki, privateKeyPkcs8: profile.privateKeyPkcs8 } });
       await expect(unknown.request("status")).rejects.toThrow(/authentication failed/);
       await unknown.close().catch(() => undefined);
 
       const impostor = generateIdentity("controller");
-      const wrongKey = createBrokerClient({ socketPath: broker.socketPath, profile: { name: profile.name, privateKeyPkcs8: impostor.privateKeyPkcs8 } });
+      const wrongKey = createBrokerClient({ socketPath: broker.socketPath, profile: { name: profile.name, principalId: impostor.principalId, publicKeySpki: impostor.publicKeySpki, privateKeyPkcs8: impostor.privateKeyPkcs8 } });
       await expect(wrongKey.request("status")).rejects.toThrow(/authentication failed/);
       await wrongKey.close().catch(() => undefined);
+    } finally {
+      await broker.close();
+    }
+  });
+  it("rejects replayed and field-substituted v2 profile transcripts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "atb-broker-")); directories.push(directory);
+    const profile = await createProfile("profile", { directory });
+    const machine = generateIdentity("companion");
+    const endpoint = generateIdentity("controller");
+    const alternateEndpoint = generateIdentity("controller");
+    const alternateProfile = generateIdentity("controller");
+    const sessions = new TaskSessionManager({ startRelay: async () => ({ pairingUrl: "ws://127.0.0.1/extension#token", cdpUrl: "ws://127.0.0.1/cdp?token=token", close: async () => undefined }) });
+    const broker = await startBrokerServer({ socketPath: join(directory, "broker.sock"), token: "a".repeat(32), sessions, isTrusted: () => true, controller: () => null, profile: (name) => name === profile.name ? { principalId: profile.principalId, displayName: profile.name, publicKeySpki: profile.publicKeySpki } : null, authContext: () => ({ machineId: machine.principalId, machinePublicKeySpki: machine.publicKeySpki, machinePrivateKeyPkcs8: machine.privateKeyPkcs8, endpointId: endpoint.principalId }) });
+    try {
+      const accepted = await rawProfileAuth(broker.socketPath, profile);
+      expect(accepted.ok).toBe(true);
+      expect(accepted.proof).toBeDefined();
+      expect((await rawProfileAuth(broker.socketPath, profile, () => accepted.proof!)).ok).toBe(false);
+      expect((await rawProfileAuth(broker.socketPath, profile, (transcript) => {
+        const substituted = { ...transcript, endpointId: alternateEndpoint.principalId };
+        return { transcript: substituted, signature: signTranscript(profile.privateKeyPkcs8, canonicalAuthV2Transcript(substituted)) };
+      })).ok).toBe(false);
+      expect((await rawProfileAuth(broker.socketPath, profile, (transcript) => {
+        const substituted = { ...transcript, authority: { ...transcript.authority, scope: { level: "domains" as const, tabIds: [], domains: ["example.com"] } } };
+        return { transcript: substituted, signature: signTranscript(profile.privateKeyPkcs8, canonicalAuthV2Transcript(substituted)) };
+      })).ok).toBe(false);
+      expect((await rawProfileAuth(broker.socketPath, profile, (transcript) => {
+        const substituted = { ...transcript, controller: { principalId: alternateProfile.principalId, publicKeySpki: alternateProfile.publicKeySpki, role: "controller" as const } };
+        return { transcript: substituted, signature: signTranscript(alternateProfile.privateKeyPkcs8, canonicalAuthV2Transcript(substituted)) };
+      })).ok).toBe(false);
     } finally {
       await broker.close();
     }

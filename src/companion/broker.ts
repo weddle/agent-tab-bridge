@@ -1,13 +1,14 @@
-import { timingSafeEqual } from "node:crypto";
-import { verifyTranscript } from "./identity.js";
-import { createProfileAuthNonce, profileAuthTranscript, PROFILE_NAME_PATTERN } from "./profiles.js";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { signTranscript, verifyTranscript } from "./identity.js";
+import { AUTH_V2_MAX_CLOCK_SKEW_MS, canonicalAuthV2Transcript, createAuthV2EphemeralPublicKey, createAuthV2Nonce, isAuthV2RequestedAuthority, isAuthV2Transcript, type AuthV2RequestedAuthority, type AuthV2Transcript } from "./auth-v2.js";
+import { PROFILE_NAME_PATTERN } from "./profiles.js";
 import { chmod, lstat, rm } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { applicationSupportDirectory, type ApplicationSupportOptions } from "./state.js";
 import { TaskSessionError, type TaskSession, type TaskSessionManager } from "./task-sessions.js";
 import { isStableSessionKey } from "./stable-session-key.js";
-import { isSessionAccessDelta, type SessionAccess, type SessionAccessDelta } from "./session-access.js";
+import { isSessionAccess, isSessionAccessDelta, normalizeSessionAccess, type SessionAccess, type SessionAccessDelta } from "./session-access.js";
 import type { AccessUpgradeRecord } from "./native-protocol.js";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -18,11 +19,22 @@ export type BrokerAuthOk = Readonly<{ type: "authOk" }>;
 export type BrokerResponse = Readonly<{ id: string; ok: true; result: unknown }> | Readonly<{ id: string; ok: false; error: { code: string; message: string } }>;
 export type BrokerEvent = Readonly<{ event: "pending" | "active" | "revoked" | "accessPending" | "accessUpdated" | "accessDeclined" | "hostClosing" | "profileEnrolled" | "enrollDeclined"; sessionId?: string; session?: TaskSession; accessRequest?: AccessUpgradeRecord; accessRequestId?: string; cdpUrl?: string; reason?: string; enrollmentId?: string; profileName?: string }>;
 export type BrokerProfileResolver = (name: string) => Promise<Readonly<{ principalId: string; displayName: string; publicKeySpki: string }> | null> | Readonly<{ principalId: string; displayName: string; publicKeySpki: string }> | null;
-export type BrokerServerOptions = Readonly<{ socketPath?: string; token: string; sessions: TaskSessionManager; isTrusted: () => boolean; controller: () => Readonly<{ principalId: string; displayName: string }> | null; profile?: BrokerProfileResolver; enrollProfile?: (profileName: string, publicKeySpki: string) => Promise<Readonly<{ enrollmentId: string; code: string; expiresAt: number }>>; status?: () => Record<string, unknown>; listTabs?: (sessionId: string | undefined, scope: "all" | "session") => Promise<unknown>; claimTab?: (sessionId: string, tabId: number) => Promise<unknown>; requestAccess?: (controllerPrincipalId: string, stableSessionKey: string, delta: SessionAccessDelta) => Promise<AccessUpgradeRecord> | AccessUpgradeRecord }>;
+export type BrokerAuthContext = () => Readonly<{ machineId: string; machinePublicKeySpki: string; machinePrivateKeyPkcs8: string; endpointId: string }> | null;
+export type BrokerServerOptions = Readonly<{ socketPath?: string; token: string; sessions: TaskSessionManager; isTrusted: () => boolean; controller: () => Readonly<{ principalId: string; displayName: string }> | null; profile?: BrokerProfileResolver; authContext?: BrokerAuthContext; enrollProfile?: (profileName: string, publicKeySpki: string) => Promise<Readonly<{ enrollmentId: string; code: string; expiresAt: number }>>; status?: () => Record<string, unknown>; listTabs?: (sessionId: string | undefined, scope: "all" | "session") => Promise<unknown>; claimTab?: (sessionId: string, tabId: number) => Promise<unknown>; requestAccess?: (controllerPrincipalId: string, stableSessionKey: string, delta: SessionAccessDelta) => Promise<AccessUpgradeRecord> | AccessUpgradeRecord }>;
 export function defaultBrokerSocketPath(paths: ApplicationSupportOptions = {}): string { return join(applicationSupportDirectory(paths), "broker.sock"); }
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const id = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 128 && /^[A-Za-z0-9._:-]+$/.test(value);
 function matches(expected: string, actual: unknown): boolean { if (typeof actual !== "string") return false; const a = Buffer.from(expected), b = Buffer.from(actual), p = Buffer.alloc(a.length); b.copy(p, 0, 0, Math.min(a.length, b.length)); return a.length === b.length && timingSafeEqual(a, p); }
+function requestedAuthority(command: BrokerCommand, request: BrokerCommandRequest): AuthV2RequestedAuthority {
+  let scope: SessionAccess | null = null;
+  if (command === "openSession") {
+    try { scope = normalizeSessionAccess(request.access); } catch { /* command validation reports malformed access */ }
+  }
+  return { scope, ttlMs: command === "openSession" && Number.isSafeInteger(request.ttlMs) && request.ttlMs! > 0 ? request.ttlMs! : null, stableSessionKey: typeof request.stableSessionKey === "string" ? request.stableSessionKey : null };
+}
+function sameAuthority(left: AuthV2RequestedAuthority, right: AuthV2RequestedAuthority): boolean {
+  return left.ttlMs === right.ttlMs && left.stableSessionKey === right.stableSessionKey && JSON.stringify(left.scope) === JSON.stringify(right.scope);
+}
 function code(error: unknown): string { return error instanceof TaskSessionError ? error.code : "invalidRequest"; }
 function message(error: unknown): string { return error instanceof Error ? error.message : "invalid broker request"; }
 const SOCKET_CLOSE_GRACE_MS = 1_000;
@@ -78,6 +90,8 @@ export class BrokerServer {
   private readonly clients = new Set<Socket>();
   private readonly principals = new Map<Socket, Readonly<{ principalId: string; displayName: string }>>();
   private readonly sessionOwners = new Map<string, { sockets: Set<Socket>; revokeOnDisconnect: boolean }>();
+  private readonly profileAuthorities = new Map<Socket, AuthV2RequestedAuthority>();
+  private readonly usedAuthTranscripts = new Map<string, number>();
   private readonly pendingEvents = new Map<string, BrokerEvent[]>();
 
   private readonly connections = new Set<Socket>();
@@ -118,13 +132,14 @@ export class BrokerServer {
   private accept(socket: Socket): void {
     if (this.closed) { socket.destroy(); return; }
     this.connections.add(socket); let input = Buffer.alloc(0), authenticated = false; const requestIds = new Set<string>();
-    let challenge: { nonce: string; name: string; publicKeySpki: string; principalId: string; displayName: string } | null = null;
+    let challenge: { transcript: AuthV2Transcript; profile: Readonly<{ principalId: string; displayName: string; publicKeySpki: string }> } | null = null;
     let authBusy = false;
     const unauthorized = () => { socket.end('{"type":"error","error":{"code":"unauthorized","message":"authentication failed"}}\n'); };
     socket.on("error", () => {}); socket.on("close", () => {
       this.clients.delete(socket);
       this.connections.delete(socket);
       this.principals.delete(socket);
+      this.profileAuthorities.delete(socket);
       const revokeOnDisconnect: string[] = [];
       for (const [sessionId, owners] of this.sessionOwners) {
         if (!owners.sockets.delete(socket)) continue;
@@ -147,24 +162,51 @@ export class BrokerServer {
           if (object(value) && value.type === "auth" && matches(this.options.token, value.token)) {
             authenticated = true; this.clients.add(socket); socket.write('{"type":"authOk"}\n'); continue;
           }
-          if (object(value) && value.type === "authHello" && typeof value.profile === "string" && PROFILE_NAME_PATTERN.test(value.profile) && this.options.profile) {
-            const name = value.profile;
+          if (object(value) && value.type === "authHello" && typeof value.profile === "string" && PROFILE_NAME_PATTERN.test(value.profile) && typeof value.controllerNonce === "string" && typeof value.controllerEphemeralPublicKey === "string" && isAuthV2RequestedAuthority(value.authority) && this.options.profile && this.options.authContext) {
+            const hello = value as { profile: string; controllerNonce: string; controllerEphemeralPublicKey: string; authority: AuthV2RequestedAuthority };
+            const name = hello.profile;
             authBusy = true;
             void (async () => {
               try {
-                const profile = await this.options.profile!(name);
-                if (!profile || socket.destroyed) { unauthorized(); return; }
-                challenge = { nonce: createProfileAuthNonce(), name, ...profile };
-                socket.write(`${JSON.stringify({ type: "authChallenge", nonce: challenge.nonce })}\n`);
+                const [profile, context] = await Promise.all([this.options.profile!(name), Promise.resolve(this.options.authContext!())]);
+                if (!profile || !context || socket.destroyed) { unauthorized(); return; }
+                const expiresAt = Date.now() + AUTH_V2_MAX_CLOCK_SKEW_MS;
+                const transcript: AuthV2Transcript = {
+                  protocolVersion: 2,
+                  cipherSuite: "P-256/SHA-256",
+                  controller: { principalId: profile.principalId, publicKeySpki: profile.publicKeySpki, role: "controller" },
+                  edge: { machineId: context.machineId, principalId: context.machineId, publicKeySpki: context.machinePublicKeySpki, role: "edge" },
+                  endpointId: context.endpointId,
+                  controllerEphemeralPublicKey: hello.controllerEphemeralPublicKey,
+                  edgeEphemeralPublicKey: createAuthV2EphemeralPublicKey(),
+                  controllerNonce: hello.controllerNonce,
+                  edgeNonce: createAuthV2Nonce(),
+                  authority: hello.authority,
+                  expiresAt,
+                  hubId: null,
+                  routeId: null,
+                  streamId: null,
+                };
+                const transcriptBytes = canonicalAuthV2Transcript(transcript);
+                challenge = { transcript, profile };
+                socket.write(`${JSON.stringify({ type: "authChallenge", transcript, signature: signTranscript(context.machinePrivateKeyPkcs8, transcriptBytes) })}\n`);
               } catch { unauthorized(); } finally { authBusy = false; }
             })();
             continue;
           }
-          if (object(value) && value.type === "authProof" && challenge && typeof value.signature === "string"
-            && verifyTranscript(challenge.publicKeySpki, profileAuthTranscript(challenge.nonce, challenge.name), value.signature)) {
-            this.principals.set(socket, { principalId: challenge.principalId, displayName: challenge.displayName });
-            challenge = null;
-            authenticated = true; this.clients.add(socket); socket.write('{"type":"authOk"}\n'); continue;
+          if (object(value) && value.type === "authProof" && challenge && typeof value.signature === "string" && isAuthV2Transcript(value.transcript)) {
+            try {
+              const transcriptBytes = canonicalAuthV2Transcript(value.transcript);
+              const expectedBytes = canonicalAuthV2Transcript(challenge.transcript);
+              const transcriptHash = createHash("sha256").update(transcriptBytes).digest("base64url");
+              if (Date.now() > challenge.transcript.expiresAt || !timingSafeEqual(transcriptBytes, expectedBytes) || this.usedAuthTranscripts.has(transcriptHash) || !verifyTranscript(challenge.profile.publicKeySpki, transcriptBytes, value.signature)) { unauthorized(); return; }
+              this.usedAuthTranscripts.set(transcriptHash, challenge.transcript.expiresAt);
+              for (const [used, expiresAt] of this.usedAuthTranscripts) if (expiresAt < Date.now()) this.usedAuthTranscripts.delete(used);
+              this.principals.set(socket, { principalId: challenge.profile.principalId, displayName: challenge.profile.displayName });
+              this.profileAuthorities.set(socket, challenge.transcript.authority);
+              challenge = null;
+              authenticated = true; this.clients.add(socket); socket.write('{"type":"authOk"}\n'); continue;
+            } catch { unauthorized(); return; }
           }
           unauthorized(); return;
         }
@@ -176,7 +218,11 @@ export class BrokerServer {
     if (!object(value) || !id(value.id) || (value.command !== "status" && value.command !== "listTabs" && value.command !== "claimTab" && value.command !== "openSession" && value.command !== "sessionUrl" && value.command !== "requestAccess" && value.command !== "revokeSession" && value.command !== "closeSession" && value.command !== "enrollProfile")) { socket.write('{"id":"","ok":false,"error":{"code":"invalidRequest","message":"invalid broker command"}}\n'); return; }
     const request = value as BrokerCommandRequest;
     if (requestIds.has(request.id)) { socket.write(JSON.stringify({ id: request.id, ok: false, error: { code: "replayedRequest", message: "request ID was already used" } } satisfies BrokerResponse) + "\n"); return; }
-    requestIds.add(request.id);
+    const authority = this.profileAuthorities.get(socket);
+    if (authority && request.command === "openSession" && !sameAuthority(authority, requestedAuthority(request.command, request))) {
+      socket.write(JSON.stringify({ id: request.id, ok: false, error: { code: "unauthorized", message: "command authority does not match the signed profile auth transcript" } } satisfies BrokerResponse) + "\n");
+      return;
+    }
     const connectionController = () => this.principals.get(socket) ?? this.options.controller();
     try {
       let result: unknown;

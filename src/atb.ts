@@ -634,12 +634,10 @@ export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {})
   if (command.kind === "install") {
     await access(executablePath, fsConstants.X_OK);
     const supportOptions = deps.stateDirectory ? { directory: deps.stateDirectory } : {};
-    await new IdentityStore("companion", supportOptions).loadOrCreate();
+    const companion = await new IdentityStore("companion", supportOptions).loadOrCreate();
     const stateStore = new CompanionStateStore(supportOptions);
     const state = await stateStore.load();
-    if (!state.brokerSecret) {
-      await stateStore.save({ ...state, brokerSecret: createBrokerSecret() });
-    }
+    await stateStore.initializeMachine(companion.principalId, state.machine.brokerSecret || createBrokerSecret());
     const paths = await installNativeManifests(params);
     Object.values(paths).forEach((value) => stdout.write(`${value}\n`));
     return 0;

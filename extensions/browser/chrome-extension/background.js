@@ -13,6 +13,7 @@ import {
   sessionOwnsTab,
   sessionTabIds,
 } from "./modules/session-core.js";
+import { accessWithinStandingGrant, isStandingGrant, localStandingGrantFor, migrateStandingGrants, rememberStandingGrant } from "./modules/standing-grants.js";
 import {
   NATIVE_PROTOCOL_VERSION as PROTOCOL_VERSION,
   fingerprintSpki,
@@ -158,19 +159,29 @@ function validId(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
 
-function validGrant(value) {
-  return !!value && typeof value === "object" &&
-    validId(value.controllerId) &&
-    typeof value.controllerName === "string" &&
-    (value.level === "selectedTabs" || value.level === "domains") &&
-    Array.isArray(value.domains) && value.domains.every((domain) => typeof domain === "string") &&
-    Number.isInteger(value.createdAt);
+function validRoute(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).length === 8 &&
+    ["kind", "endpointId", "controllerPrincipalId", "routePolicy", "accessCeiling", "hubId", "routeId", "streamId"].every((field) => Object.hasOwn(value, field)) &&
+    (value.kind === "local" || value.kind === "routed") &&
+    validId(value.endpointId) &&
+    validId(value.controllerPrincipalId) &&
+    ((value.kind === "local" && value.routePolicy === "localOnly" && value.hubId === null && value.routeId === null && value.streamId === null) || (value.kind === "routed" && value.routePolicy === "routed")) &&
+    (value.hubId === null || validId(value.hubId)) &&
+    (value.routeId === null || validId(value.routeId)) &&
+    (value.streamId === null || validId(value.streamId)) &&
+    !!normalizeAccess(value.accessCeiling);
 }
+
 
 async function loadStandingGrants() {
   try {
     const stored = await chrome.storage.local.get("standingGrants");
-    standingGrants = Array.isArray(stored?.standingGrants) ? stored.standingGrants.filter(validGrant) : [];
+    const endpointIdentity = await loadExtensionIdentity();
+    const endpointId = await fingerprintSpki(endpointIdentity.publicKeySpki);
+    const rawGrants = Array.isArray(stored?.standingGrants) ? stored.standingGrants : [];
+    standingGrants = migrateStandingGrants(rawGrants, endpointId);
+    if (JSON.stringify(rawGrants) !== JSON.stringify(standingGrants)) await saveStandingGrants();
   } catch {
     standingGrants = [];
   }
@@ -183,38 +194,22 @@ async function saveStandingGrants() {
     await chrome.storage.local.set({ standingGrants });
   }
   const stored = await chrome.storage.local.get("standingGrants");
-  const persisted = Array.isArray(stored?.standingGrants) ? stored.standingGrants.filter(validGrant) : [];
+  const persisted = Array.isArray(stored?.standingGrants) ? stored.standingGrants.filter(isStandingGrant) : [];
   if (JSON.stringify(persisted) !== JSON.stringify(standingGrants)) {
     throw new Error("Standing grant storage did not retain the requested policy.");
   }
 }
 
-function grantFor(controllerId) {
-  return standingGrants.find((grant) => grant.controllerId === controllerId) ?? null;
-}
 
 function enrolledPrincipal(controllerId) {
   return enrolledProfiles.some((profile) => profile.principalId === controllerId);
 }
 
-/** A grant never covers full access; domain requests must be a subset of the remembered domains. */
-function accessWithinGrant(access, grant) {
-  if (!grant || !access || access.level === "full") return false;
-  if (access.level === "selectedTabs") return true;
-  if (access.level === "domains") return grant.level === "domains" && access.domains.every((domain) => grant.domains.includes(domain));
-  return false;
-}
-
 async function rememberGrant(session) {
-  if (session.access.level === "full" || !enrolledPrincipal(session.controllerId)) return;
-  const existing = grantFor(session.controllerId);
-  const priorDomains = existing?.level === "domains" ? existing.domains : [];
-  const domains = session.access.level === "domains" ? [...new Set([...priorDomains, ...session.access.domains])] : priorDomains;
-  const level = session.access.level === "domains" || existing?.level === "domains" ? "domains" : "selectedTabs";
-  standingGrants = [
-    ...standingGrants.filter((grant) => grant.controllerId !== session.controllerId),
-    { controllerId: session.controllerId, controllerName: session.controllerName, level, domains, createdAt: existing?.createdAt ?? Date.now() },
-  ];
+  if (!enrolledPrincipal(session.controllerId)) return;
+  const next = rememberStandingGrant(standingGrants, session);
+  if (next === standingGrants) return;
+  standingGrants = next;
   await saveStandingGrants();
 }
 
@@ -333,6 +328,7 @@ function normalizeSession(raw, expectedState) {
     "createdAt",
     "expiresAt",
     "state",
+    "route",
   ];
   if (
     !value ||
@@ -353,6 +349,8 @@ function normalizeSession(raw, expectedState) {
     new Set(value.requestedCapabilities).size !== value.requestedCapabilities.length ||
     value.requestedCapabilities.some((capability) => capability !== "cdp") ||
     !normalizeAccess(value.access) ||
+    !validRoute(value.route) ||
+    value.route.controllerPrincipalId !== value.controllerPrincipalId ||
     !Number.isInteger(value.createdAt) ||
     (value.expiresAt !== null &&
       (!Number.isInteger(value.expiresAt) ||
@@ -373,6 +371,10 @@ function normalizeSession(raw, expectedState) {
     createdAt: value.createdAt,
     expiresAt: value.expiresAt,
     state: value.state,
+    route: {
+      ...value.route,
+      accessCeiling: normalizeAccess(value.route.accessCeiling),
+    },
   };
 }
 
@@ -387,6 +389,7 @@ function sessionDto(session) {
     createdAt: session.createdAt,
     expiresAt: session.expiresAt,
     state: session.state,
+    route: { ...session.route, accessCeiling: { ...session.route.accessCeiling, tabIds: [...session.route.accessCeiling.tabIds], domains: [...session.route.accessCeiling.domains] } },
   };
 }
 
@@ -649,6 +652,7 @@ function approveSessionNow(session) {
       requestedCapabilities: session.capabilities,
       expiresAt: session.expiresAt,
       access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] },
+      route: { ...session.route, accessCeiling: { ...session.route.accessCeiling, tabIds: [...session.route.accessCeiling.tabIds], domains: [...session.route.accessCeiling.domains] } },
     });
   } catch (error) {
     approvedSessions.delete(session.id);
@@ -656,12 +660,12 @@ function approveSessionNow(session) {
   }
 }
 
-/** Auto-approve a pending session covered by a standing grant for an enrolled profile. */
+/** Auto-approve only a local pending session covered by a local-only standing grant. */
 async function maybeAutoApprove(session) {
   await standingGrantsReady;
-  if (!session || session.state !== "pending" || approvedSessions.has(session.id)) return;
+  if (!session || session.state !== "pending" || approvedSessions.has(session.id) || session.route?.kind !== "local" || session.route.routePolicy !== "localOnly") return;
   if (!enrolledPrincipal(session.controllerId)) return;
-  if (!accessWithinGrant(session.access, grantFor(session.controllerId))) return;
+  if (!accessWithinStandingGrant(session.access, localStandingGrantFor(standingGrants, session.controllerId, session.route))) return;
   try { approveSessionNow(session); } catch { /* the popup path remains available */ }
 }
 async function handleNativeSnapshot(message) {
@@ -725,6 +729,7 @@ function sameSessionIdentity(left, right) {
     left.createdAt === right.createdAt &&
     left.expiresAt === right.expiresAt &&
     JSON.stringify(left.capabilities) === JSON.stringify(right.capabilities)
+    && JSON.stringify(left.route) === JSON.stringify(right.route)
   );
 }
 
@@ -1852,7 +1857,7 @@ async function statusDto() {
     }),
     pendingEnrollments: [...enrollmentRequests.values()].filter((request) => request.expiresAt > Date.now()).map((request) => ({ ...request, id: request.enrollmentId })),
     enrolledProfiles: enrolledProfiles.map((profile) => ({ ...profile, id: profile.principalId })),
-    standingGrants: standingGrants.map((grant) => ({ ...grant, id: grant.controllerId, domains: [...grant.domains] })),
+    standingGrants: standingGrants.map((grant) => ({ ...grant, id: grant.controllerId, level: grant.route.accessCeiling.level, domains: [...grant.route.accessCeiling.domains], route: { ...grant.route, accessCeiling: { ...grant.route.accessCeiling, tabIds: [...grant.route.accessCeiling.tabIds], domains: [...grant.route.accessCeiling.domains] } } })),
     sharedTabs: await sharedTabsDto(),
   };
 }

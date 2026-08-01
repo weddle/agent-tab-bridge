@@ -9,10 +9,12 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": ["node"],
+    "allowJs": true
   },
   "include": [
     "src/**/*.ts",
+    "src/**/*.js",
     "extensions/browser/src/browser/extension-relay/relay-server.ts"
   ],
   "exclude": [

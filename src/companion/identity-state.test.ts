@@ -1,4 +1,4 @@
-import { mkdtemp, stat, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
@@ -29,17 +29,35 @@ describe("companion identities and private state", () => {
       expect(await identities.load()).toEqual(first);
       expect((await stat(identities.filePath)).mode & 0o777).toBe(0o600);
       const state = new CompanionStateStore({ directory: root });
-      await state.update((current) => ({ ...current, companionPrincipalId: first.principalId, brokerSecret: createBrokerSecret() }));
+      await state.initializeMachine(first.principalId, createBrokerSecret());
       const extension = generateIdentity("controller");
-      await state.pinExtension({ extensionId: "extension", publicKeySpki: extension.publicKeySpki, fingerprint: extension.fingerprint, pinnedAt: Date.now() });
+      await state.pinExtension({ extensionId: "extension", publicKeySpki: extension.publicKeySpki, fingerprint: extension.fingerprint, pinnedAt: Date.now(), label: "Brave" });
       const secondExtension = generateIdentity("controller");
-      await state.pinExtension({ extensionId: "extension", publicKeySpki: secondExtension.publicKeySpki, fingerprint: secondExtension.fingerprint, pinnedAt: Date.now() });
-      expect((await state.status()).pinnedExtensions).toHaveLength(2);
+      await state.pinExtension({ extensionId: "extension", publicKeySpki: secondExtension.publicKeySpki, fingerprint: secondExtension.fingerprint, pinnedAt: Date.now(), label: "Chrome" });
       const status = await state.status();
+      expect(status.machineId).toBe(first.principalId);
+      expect(status.endpoints).toHaveLength(2);
+      expect(status.endpoints.map((endpoint) => endpoint.label)).toEqual(["Brave", "Chrome"]);
       expect(status.hasBrokerSecret).toBe(true);
       expect(JSON.stringify(status)).not.toContain("privateKeyPkcs8");
       expect((await stat(state.filePath)).mode & 0o777).toBe(0o600);
       expect(() => applicationSupportPath("../escape.json", { directory: root })).toThrow();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+  it("migrates legacy machine records into one endpoint-scoped state exactly once", async () => {
+    const root = await mkdtemp(join(tmpdir(), "atb-state-migration-"));
+    try {
+      const machine = generateIdentity("companion");
+      const extension = generateIdentity("controller");
+      const legacy = { version: 1, companionPrincipalId: machine.principalId, pinnedExtensions: [{ extensionId: "extension", publicKeySpki: extension.publicKeySpki, fingerprint: extension.fingerprint, pinnedAt: 1 }], sessions: [{ id: "session-1", controllerPrincipalId: "sha256/controller", displayControllerName: "Research", taskLabel: "Task", requestedCapabilities: ["cdp"], access: { level: "selectedTabs", tabIds: [], domains: [] }, createdAt: 1, expiresAt: null, state: "pending" }], brokerSecret: createBrokerSecret(), enrolledProfiles: [] };
+      const store = new CompanionStateStore({ directory: root });
+      await writeFile(store.filePath, JSON.stringify(legacy));
+      const migrated = await store.load();
+      expect(migrated.machine.identity.machineId).toBe(machine.principalId);
+      expect(migrated.endpoints).toHaveLength(1);
+      expect(migrated.endpoints[0]?.sessions[0]?.route).toMatchObject({ endpointId: extension.fingerprint, controllerPrincipalId: "sha256/controller", routePolicy: "localOnly", hubId: null, routeId: null, streamId: null });
+      expect(JSON.parse(await readFile(store.filePath, "utf8"))).toMatchObject({ version: 2, machine: { identity: { machineId: machine.principalId } } });
+      expect(await new CompanionStateStore({ directory: root }).load()).toEqual(migrated);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
   it("fails closed for corrupted key pairs and derives controller identity from broker secret", async () => {
