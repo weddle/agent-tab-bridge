@@ -19,6 +19,7 @@ import { routedChannelContext } from "./channel/context.js";
 import { SecureChannelTransportAdapter, connectTransports } from "./transport-adapter.js";
 import type { RoutedBrokerAddress } from "../hub/routing.js";
 import type { NativeEndpointRecovery } from "./endpoint-recovery.js";
+import { ENDPOINT_RECOVERY_GRACE_MS } from "./endpoint-contracts.js";
 import type { TaskSessionRelay } from "./task-sessions.js";
 
 export const SUPERVISOR_CONTROL_SOCKET_FILE = "supervisor.sock";
@@ -77,9 +78,8 @@ export type NativeMessagingShimOptions = ApplicationSupportOptions & {
   startSupervisor?: (layout: SupervisorSocketLayout) => Promise<void>;
 };
 
-type EndpointRuntime = { endpoint: LiveEndpointRecord; broker: BrokerServer; recovery: NativeEndpointRecovery; recoveryTimer?: NodeJS.Timeout };
+type EndpointRuntime = { endpoint: LiveEndpointRecord; broker: BrokerServer; recovery: NativeEndpointRecovery; generation: symbol; recoveryTimer?: NodeJS.Timeout };
 
-export const ENDPOINT_RECOVERY_GRACE_MS = 30_000;
 export function supervisorSocketLayout(options: ApplicationSupportOptions = {}): SupervisorSocketLayout {
   const directory = applicationSupportDirectory(options);
   return {
@@ -261,6 +261,7 @@ export class EdgeSupervisor {
     if (this.closing) { socket.destroy(); return; }
     this.shims.add(socket);
     emit(this.options.onEvent, { type: "shimConnected" });
+    const generation = Symbol("native-endpoint-run");
     const run = runNativeEndpoint({
       input: socket,
       output: socket,
@@ -269,10 +270,10 @@ export class EdgeSupervisor {
       identityStore: this.identityStore,
       startRelay: this.options.startRelay ?? startAgentTabRelay,
       brokerSocketPath: (identity) => endpointSocketPath(identity.fingerprint, this.options),
-      recoverEndpoint: (identity) => this.recoverEndpoint(identity),
-      onEndpointReady: async (identity, broker, recovery) => await this.endpointReady(identity, broker, recovery),
-      onEndpointSuspended: async (recovery) => await this.endpointSuspended(recovery),
-      onEndpointClosed: async (endpointId, broker) => await this.endpointClosed(endpointId, broker),
+      recoverEndpoint: (identity) => this.recoverEndpoint(identity, generation),
+      onEndpointReady: async (identity, broker, recovery) => await this.endpointReady(identity, broker, recovery, generation),
+      onEndpointSuspended: async (recovery) => await this.endpointSuspended(recovery, generation),
+      onEndpointClosed: async (endpointId, broker) => await this.endpointClosed(endpointId, broker, generation),
     }).catch(() => {}).finally(() => {
       this.endpointRuns.delete(run);
       this.shims.delete(socket);
@@ -283,32 +284,43 @@ export class EdgeSupervisor {
     this.endpointRuns.add(run);
   }
 
-  private recoverEndpoint(identity: PinnedExtensionIdentity): NativeEndpointRecovery | undefined {
-    return this.suspendedEndpoints.get(identity.fingerprint)?.recovery;
+  private recoverEndpoint(identity: PinnedExtensionIdentity, generation: symbol): NativeEndpointRecovery | undefined {
+    const live = this.endpoints.get(identity.fingerprint);
+    if (live) {
+      live.generation = generation;
+      live.recovery.sessions.suspend();
+      return live.recovery;
+    }
+    const suspended = this.suspendedEndpoints.get(identity.fingerprint);
+    if (suspended) suspended.generation = generation;
+    return suspended?.recovery;
   }
 
-  private async endpointReady(identity: PinnedExtensionIdentity, broker: BrokerServer, recovery: NativeEndpointRecovery): Promise<void> {
+  private async endpointReady(identity: PinnedExtensionIdentity, broker: BrokerServer, recovery: NativeEndpointRecovery, generation: symbol): Promise<void> {
     const socketPath = endpointSocketPath(identity.fingerprint, this.options);
     const existing = this.endpoints.get(identity.fingerprint);
-    if (existing && existing.broker !== broker) throw new Error("endpoint is already connected");
+    if (existing && (existing.broker !== broker || existing.recovery !== recovery || existing.generation !== generation)) throw new Error("endpoint run was replaced");
     const suspended = this.suspendedEndpoints.get(identity.fingerprint);
-    if (suspended && suspended.recovery !== recovery) throw new Error("endpoint recovery identity does not match");
+    if (suspended && (suspended.recovery !== recovery || suspended.generation !== generation)) throw new Error("endpoint recovery run was replaced");
     if (suspended) {
       clearTimeout(suspended.recoveryTimer);
       this.suspendedEndpoints.delete(identity.fingerprint);
     }
     const endpoint = endpointRecord(identity, socketPath);
-    this.endpoints.set(identity.fingerprint, { endpoint, broker, recovery });
+    this.endpoints.set(identity.fingerprint, { endpoint, broker, recovery, generation });
     await this.writeRegistry();
     emit(this.options.onEvent, { type: "endpointReady", endpoint });
     if (this.hubSocket) await this.hubPairing.pushPresence(this.hubSocket).catch(() => undefined);
   }
 
-  private async endpointSuspended(recovery: NativeEndpointRecovery): Promise<boolean> {
+  private async endpointSuspended(recovery: NativeEndpointRecovery, generation: symbol): Promise<boolean> {
     if (this.closing) return false;
     const endpointId = recovery.identity.fingerprint;
     const existing = this.endpoints.get(endpointId);
-    if (!existing || existing.recovery !== recovery || !recovery.sessions.snapshot().some((session) => session.state === "active")) return false;
+    if (!existing) return this.suspendedEndpoints.get(endpointId)?.recovery === recovery;
+    if (existing.recovery !== recovery) return false;
+    if (existing.generation !== generation) return true;
+    if (!recovery.sessions.snapshot().some((session) => session.state === "active" || session.state === "reconnecting")) return false;
     recovery.sessions.suspend();
     this.endpoints.delete(endpointId);
     existing.recoveryTimer = setTimeout(() => void this.expireRecovery(endpointId, recovery), ENDPOINT_RECOVERY_GRACE_MS);
@@ -330,11 +342,11 @@ export class EdgeSupervisor {
     void this.exitIfIdle();
   }
 
-  private async endpointClosed(endpointId: string, broker: BrokerServer | null): Promise<void> {
+  private async endpointClosed(endpointId: string, broker: BrokerServer | null, generation: symbol): Promise<void> {
     const live = this.endpoints.get(endpointId);
     const suspended = this.suspendedEndpoints.get(endpointId);
     const existing = live ?? suspended;
-    if (!existing || (broker && existing.broker !== broker)) return;
+    if (!existing || existing.generation !== generation || (broker && existing.broker !== broker)) return;
     clearTimeout(existing.recoveryTimer);
     this.endpoints.delete(endpointId);
     this.suspendedEndpoints.delete(endpointId);
@@ -582,7 +594,8 @@ async function acquireElection(layout: SupervisorSocketLayout, start: (layout: S
 
 /** Native Messaging transport only: it forwards raw framed bytes and never parses identity or authority. */
 export async function runNativeMessagingShim(options: NativeMessagingShimOptions = {}): Promise<void> {
-  const layout = supervisorSocketLayout(options);
+  const directory = options.directory ?? process.env.ATB_STATE_DIRECTORY;
+  const layout = supervisorSocketLayout(directory ? { ...options, directory } : options);
   await mkdir(dirname(layout.controlSocketPath), { recursive: true, mode: 0o700 });
   await chmod(dirname(layout.controlSocketPath), 0o700);
   const connect = options.connect ?? connected;

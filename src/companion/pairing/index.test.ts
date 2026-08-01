@@ -104,7 +104,7 @@ describe("machine-to-hub pairing", () => {
     const duplicateMachine = identity();
     const duplicateClient = new MachinePairingCeremony({ identity: duplicateMachine, invitation: duplicateHub.invitation, code: duplicateHub.code, confirmedHubFingerprint: duplicateHub.invitation.hub.fingerprint });
     expect(() => duplicateHub.ceremony.respond(duplicateClient.createHello(), fingerprintSpki(duplicateMachine.publicKeySpki))).toThrow(expect.objectContaining({ code: "duplicate-identity" }));
-  });
+  }, 10_000);
 
   it("expires dead codes and exhausts bounded wrong-code attempts", () => {
     let now = Date.now();

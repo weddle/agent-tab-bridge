@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  createSerialNativeMessageHandler,
   fingerprintSpki,
   nativeProofTranscript,
   toBase64Url,
@@ -92,5 +93,42 @@ describe("Native Messaging identity transcript", () => {
     expect(await verifyExtensionIdentity({ ...first, privateKey: second.privateKey })).toBe(false);
     expect(await fingerprintSpki(first.publicKeySpki)).toMatch(/^sha256\/[A-Za-z0-9+/]+={0,2}$/u);
     expect(await fingerprintSpki(first.publicKeySpki)).not.toBe(await fingerprintSpki(second.publicKeySpki));
+  });
+});
+
+describe("Native Messaging message ordering", () => {
+  it("finishes each asynchronous frame before handling the next", async () => {
+    const { promise: firstGate, resolve: releaseFirst } = Promise.withResolvers<void>();
+    const events: string[] = [];
+    const dispatch = createSerialNativeMessageHandler(async (message) => {
+      events.push(`start:${message}`);
+      if (message === "trusted") await firstGate;
+      events.push(`finish:${message}`);
+    }, () => {});
+
+    const trusted = dispatch("trusted");
+    const snapshot = dispatch("snapshot");
+    await Promise.resolve();
+    expect(events).toEqual(["start:trusted"]);
+
+    releaseFirst();
+    await Promise.all([trusted, snapshot]);
+    expect(events).toEqual(["start:trusted", "finish:trusted", "start:snapshot", "finish:snapshot"]);
+  });
+
+  it("settles a failed frame before handling the next guarded frame", async () => {
+    const events: string[] = [];
+    const dispatch = createSerialNativeMessageHandler(
+      async (message) => {
+        events.push(`handle:${message}`);
+        if (message === "bad") throw new Error("bad frame");
+      },
+      async () => {
+        events.push("terminate");
+      },
+    );
+
+    await Promise.all([dispatch("bad"), dispatch("guarded")]);
+    expect(events).toEqual(["handle:bad", "terminate", "handle:guarded"]);
   });
 });

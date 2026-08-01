@@ -20,3 +20,17 @@ export type NativeEndpointRecovery = {
   broker: BrokerServer;
   binding: NativeEndpointBinding;
 };
+
+export type NativeEndpointStopDisposition = "suspend" | "revoke";
+
+/**
+ * A broken Native Messaging output is endpoint loss, not authority loss.
+ * Only missing recovery state or an explicit permanent close bypasses grace.
+ */
+export function nativeEndpointStopDisposition(state: Readonly<{
+  hasRecovery: boolean;
+  outputFailed: boolean;
+  permanentClose: boolean;
+}>): NativeEndpointStopDisposition {
+  return state.hasRecovery && !state.permanentClose ? "suspend" : "revoke";
+}

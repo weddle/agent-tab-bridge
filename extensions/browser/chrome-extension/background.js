@@ -1,10 +1,11 @@
-import { toRelayTabInfo } from "./modules/relay-core.js";
+import { isCurrentRelaySocketFailure, relaySocketCloseDisposition, toRelayTabInfo } from "./modules/relay-core.js";
 import { isPermittedPageCdpMethod } from "./modules/cdp-policy.js";
 import {
   buildRelayWsProtocols,
   claimTab,
   classifyTabAccess,
   matchesSessionAuthority,
+  makeSessionRecoveryRecord,
   parseRelayPairingUrl,
   reconnectDelayMs,
   releaseSessionTabs,
@@ -12,10 +13,14 @@ import {
   sessionOwnsGroup,
   sessionOwnsTab,
   sessionTabIds,
+  sessionAuthorityMismatchField,
+  sameSessionAuthority,
+  validateSessionRecoveryRecord,
 } from "./modules/session-core.js";
 import { accessWithinStandingGrant, isStandingGrant, localStandingGrantFor, migrateStandingGrants, rememberStandingGrant, routedStandingGrantFor } from "./modules/standing-grants.js";
 import {
   NATIVE_PROTOCOL_VERSION as PROTOCOL_VERSION,
+  createSerialNativeMessageHandler,
   fingerprintSpki,
   forgetPinnedCompanion,
   loadExtensionIdentity,
@@ -28,10 +33,12 @@ import {
 import { renderClaimedString, renderRouteMarker } from "./modules/ui-vocabulary.js";
 const NATIVE_HOST_NAME = "com.agenttabbridge.companion";
 const TASK_GROUP_COLOR = "blue";
+const TASK_GROUP_TITLE_PREFIX = "Agent Tab Bridge · ";
 const MAX_TASK_LABEL_LENGTH = 128;
 const CDP_POLICY_ERROR = "CDP method is not permitted by Agent Tab Bridge";
 const SESSION_PAGE_URL = chrome.runtime.getURL("session.html");
 const TOOLBAR_TITLE = "Agent Tab Bridge";
+const SESSION_RECOVERY_STORAGE_PREFIX = "sessionRecovery:";
 /** Session records supplied by the authenticated companion, keyed by task ID. */
 const sessions = new Map();
 /** One ephemeral relay socket per active task session. */
@@ -44,6 +51,8 @@ const failedRelaySockets = new WeakSet();
 const sessionAnchors = new Map();
 /** Authoritative extension-created group ID per task session; titles are display-only. */
 const sessionGroups = new Map();
+/** Expired recovery groups awaiting Chromium's tab/session restore events. */
+const orphanedRecoveryGroups = new Map();
 /** Serializes first-group creation so a session never acquires competing groups. */
 const creatingSessionGroups = new Map();
 /** Authoritative tab ownership; a tab ID maps to at most one task session. */
@@ -52,7 +61,7 @@ const tabOwners = new Map();
 const attachedTabs = new Map();
 /** Coalesces attach requests for one owned tab. */
 const attachingTabs = new Map();
-/** Suppresses duplicate group-change callbacks while a claimed tab is revoked. */
+/** Suppresses group-change callbacks while the extension repairs authoritative membership. */
 const revokingTabs = new Set();
 /** Suppresses the expected onDetach callback while the extension itself detaches. */
 const intentionalDebuggerDetaches = new Set();
@@ -83,6 +92,7 @@ let nativeGeneration = 0;
 let nativeReconnectAttempt = 0;
 let nativeReconnectTimer = null;
 let nativeReconnectAllowed = true;
+let runtimeSuspending = false;
 let nativeIdentityPromise = null;
 let pendingHello = null;
 let trustedCompanion = null;
@@ -432,7 +442,7 @@ function sessionCanAdoptTab(session, tab) {
 function taskGroupTitle(session) {
   const label = session.taskLabel || "Task";
   const routeMarker = renderRouteMarker(session);
-  return `Agent Tab Bridge · ${renderClaimedString(label)}${routeMarker}`;
+  return `${TASK_GROUP_TITLE_PREFIX}${renderClaimedString(label)}${routeMarker}`;
 }
 function sessionPageUrl(session) {
   const url = new URL(SESSION_PAGE_URL);
@@ -452,10 +462,15 @@ async function updateSessionPageState(sessionId, state) {
   const anchorId = sessionAnchors.get(sessionId);
   const session = sessions.get(sessionId);
   if (!Number.isInteger(anchorId) || !session) return;
+  const groupId = sessionGroups.get(sessionId);
+  revokingTabs.add(anchorId);
   try {
-    await chrome.tabs.update(anchorId, { url: sessionPageUrl({ ...session, state }) });
+    const updated = await chrome.tabs.update(anchorId, { url: sessionPageUrl({ ...session, state }) });
+    if (Number.isInteger(groupId) && updated.groupId !== groupId) await chrome.tabs.group({ tabIds: [anchorId], groupId });
   } catch {
     // The popup and agent carry the state when the anchor is unavailable.
+  } finally {
+    revokingTabs.delete(anchorId);
   }
 }
 
@@ -466,6 +481,220 @@ function isSessionPageTab(tab) {
       tab.url === SESSION_PAGE_URL ||
       (typeof tab.url === "string" && tab.url.startsWith(`${SESSION_PAGE_URL}?`)))
   );
+}
+
+function sessionRecoveryStorageKey(sessionId) {
+  return `${SESSION_RECOVERY_STORAGE_PREFIX}${sessionId}`;
+}
+
+function anchorSessionId(tab) {
+  if (!Number.isInteger(tab?.id) || typeof tab.url !== "string") return null;
+  try {
+    const actual = new URL(tab.url);
+    const expected = new URL(SESSION_PAGE_URL);
+    if (
+      actual.protocol !== expected.protocol ||
+      actual.host !== expected.host ||
+      actual.pathname !== expected.pathname
+    ) {
+      return null;
+    }
+    const sessionId = actual.searchParams.get("sessionId");
+    return validId(sessionId) ? sessionId : null;
+  } catch {
+    return null;
+  }
+}
+
+async function storedSessionRecoveryRecords() {
+  const stored = await chrome.storage.local.get(null);
+  const records = new Map();
+  const malformedKeys = [];
+  for (const [key, value] of Object.entries(stored)) {
+    if (!key.startsWith(SESSION_RECOVERY_STORAGE_PREFIX)) continue;
+    const sessionId = key.slice(SESSION_RECOVERY_STORAGE_PREFIX.length);
+    const record = makeSessionRecoveryRecord(value?.session, value?.groupId, value?.anchorId, value?.tabIds);
+    if (!record || record.session?.id !== sessionId) {
+      malformedKeys.push(key);
+      continue;
+    }
+    records.set(sessionId, record);
+  }
+  if (malformedKeys.length > 0) await chrome.storage.local.remove(malformedKeys);
+  return records;
+}
+
+async function persistSessionRecovery(sessionId) {
+  const session = sessions.get(sessionId);
+  const groupId = sessionGroups.get(sessionId);
+  const anchorId = sessionAnchors.get(sessionId);
+  const record = makeSessionRecoveryRecord(session, groupId, anchorId, sessionTabIds(tabOwners, sessionId));
+  if (!record) throw new Error("Task session recovery state is incomplete.");
+  await chrome.storage.local.set({ [sessionRecoveryStorageKey(sessionId)]: record });
+}
+
+async function removeSessionRecovery(sessionId) {
+  await chrome.storage.local.remove(sessionRecoveryStorageKey(sessionId));
+}
+
+async function cleanupOrphanedRecoveryGroup(groupId) {
+  if (orphanedRecoveryGroups.size === 0) return false;
+  let groups;
+  try {
+    groups = Number.isInteger(groupId) && groupId >= 0 ? [await chrome.tabGroups.get(groupId)] : await chrome.tabGroups.query({});
+  } catch {
+    return false;
+  }
+  const ownedGroupIds = new Set(sessionGroups.values());
+  let cleaned = false;
+  for (const pending of orphanedRecoveryGroups.values()) {
+    const matches = groups.filter((group) => group.title === pending.title && !ownedGroupIds.has(group.id));
+    if (matches.length === 0) continue;
+    for (const group of matches) {
+      const groupTabs = await chrome.tabs.query({ groupId: group.id });
+      const tabIds = groupTabs.map((tab) => tab.id).filter((tabId) => Number.isInteger(tabId));
+      if (tabIds.length > 0) await chrome.tabs.ungroup(tabIds);
+    }
+    orphanedRecoveryGroups.delete(pending.sessionId);
+    await removeSessionRecovery(pending.sessionId);
+    cleaned = true;
+  }
+  return cleaned;
+}
+
+async function discardSessionRecovery(sessionId, record) {
+  orphanedRecoveryGroups.set(sessionId, { sessionId, title: taskGroupTitle(record.session) });
+  let anchor;
+  try {
+    anchor = await chrome.tabs.get(record.anchorId);
+  } catch {
+    // Tab and group IDs are not stable across a full browser restart.
+  }
+  const matchingAnchor = anchorSessionId(anchor) === sessionId && anchor.groupId === record.groupId;
+  await cleanupOrphanedRecoveryGroup();
+  if (!matchingAnchor) return;
+  try {
+    await chrome.tabs.remove(record.anchorId);
+  } catch {
+    // The anchor may already be gone.
+  }
+}
+
+async function discardUnrecordedSessionArtifacts(sessionId) {
+  const tabs = await chrome.tabs.query({});
+  const anchors = tabs.filter((tab) => anchorSessionId(tab) === sessionId);
+  await Promise.all(
+    anchors.map(async (anchor) => {
+      if (Number.isInteger(anchor.groupId) && anchor.groupId >= 0) {
+        try {
+          const groupTabs = await chrome.tabs.query({ groupId: anchor.groupId });
+          const tabIds = groupTabs.map((tab) => tab.id).filter((tabId) => Number.isInteger(tabId));
+          if (tabIds.length > 0) await chrome.tabs.ungroup(tabIds);
+        } catch {
+          // The group may already be gone.
+        }
+      }
+      try {
+        await chrome.tabs.remove(anchor.id);
+      } catch {
+        // The anchor may already be gone.
+      }
+    }),
+  );
+}
+
+async function restoreSessionRecovery(session) {
+  const key = sessionRecoveryStorageKey(session.id);
+  const stored = await chrome.storage.local.get(key);
+  const storedValue = stored?.[key];
+  const record = validateSessionRecoveryRecord(storedValue, session);
+  if (!record) {
+    console.warn(`Agent Tab Bridge recovery rejected: ${storedValue === undefined ? "record missing" : `authority changed (${sessionAuthorityMismatchField(storedValue?.session, session) ?? "record"})`}`);
+    await removeSessionRecovery(session.id);
+    await discardUnrecordedSessionArtifacts(session.id);
+    return storedValue === undefined ? "record missing" : "authority changed";
+  }
+  try {
+    let anchor = null;
+    try {
+      anchor = await chrome.tabs.get(record.anchorId);
+    } catch {
+      // Chromium can remove extension-owned pages while reloading an unpacked extension.
+    }
+    if (anchor && (anchorSessionId(anchor) !== session.id || anchor.groupId !== record.groupId)) {
+      throw new Error("Stored session anchor no longer matches its group.");
+    }
+    const group = await chrome.tabGroups.get(record.groupId);
+    if (anchor && group.windowId !== anchor.windowId) throw new Error("Stored session group moved windows.");
+    const groupTabs = await chrome.tabs.query({ groupId: record.groupId });
+    const sharedTabs = anchor ? groupTabs.filter((tab) => tab.id !== record.anchorId) : groupTabs;
+    const actualTabIds = sharedTabs
+      .map((tab) => tab.id)
+      .filter((tabId) => Number.isInteger(tabId))
+      .sort((left, right) => left - right);
+    if (
+      actualTabIds.length !== sharedTabs.length ||
+      JSON.stringify(actualTabIds) !== JSON.stringify(record.tabIds) ||
+      sharedTabs.some((tab) => !sessionCanAdoptTab(session, tab))
+    ) {
+      throw new Error("Stored session tabs no longer match approved ownership.");
+    }
+    sessions.set(session.id, session);
+    sessionGroups.set(session.id, record.groupId);
+    if (anchor) sessionAnchors.set(session.id, record.anchorId);
+    for (const tabId of record.tabIds) {
+      if (!claimTab(tabOwners, session.id, tabId).ok) {
+        throw new Error("Stored session tab is owned by another live session.");
+      }
+    }
+    if (!anchor) {
+      await ensureSessionGroup(session.id, group.windowId, true);
+      await persistSessionRecovery(session.id);
+    }
+    return null;
+  } catch (error) {
+    console.warn(`Agent Tab Bridge recovery rejected: ${error instanceof Error ? error.message : "tab ownership changed"}`);
+    sessions.delete(session.id);
+    sessionAnchors.delete(session.id);
+    sessionGroups.delete(session.id);
+    releaseSessionTabs(tabOwners, session.id);
+    await discardSessionRecovery(session.id, record);
+    return "tab ownership changed";
+  }
+}
+
+async function cleanupUnownedSessionGroups(records, retainedSessionIds) {
+  const ownedGroupIds = new Set(sessionGroups.values());
+  const retainedTitles = new Set(
+    [...records]
+      .filter(([sessionId]) => retainedSessionIds.has(sessionId))
+      .map(([, record]) => taskGroupTitle(record.session)),
+  );
+  const groups = await chrome.tabGroups.query({});
+  await Promise.all(
+    groups
+      .filter(
+        (group) =>
+          group.title?.startsWith(TASK_GROUP_TITLE_PREFIX) &&
+          !ownedGroupIds.has(group.id) &&
+          !retainedTitles.has(group.title),
+      )
+      .map(async (group) => {
+        const tabs = await chrome.tabs.query({ groupId: group.id });
+        const tabIds = tabs.map((tab) => tab.id).filter((tabId) => Number.isInteger(tabId));
+        if (tabIds.length > 0) await chrome.tabs.ungroup(tabIds);
+      }),
+  );
+}
+
+async function cleanupOrphanedSessionRecovery(retainedSessionIds = new Set(sessions.keys())) {
+  const records = await storedSessionRecoveryRecords();
+  await Promise.all(
+    [...records].map(async ([sessionId, record]) => {
+      if (!retainedSessionIds.has(sessionId)) await discardSessionRecovery(sessionId, record);
+    }),
+  );
+  await cleanupUnownedSessionGroups(records, retainedSessionIds);
 }
 
 function stopNativeReconnect() {
@@ -697,6 +926,12 @@ async function handleNativeSnapshot(message) {
     ...(Array.isArray(message.pending) ? message.pending : []),
     ...(Array.isArray(message.active) ? message.active : []),
   ];
+  const hasRecoveryInventory = Array.isArray(message.reconnecting);
+  const reconnecting = new Map();
+  for (const raw of Array.isArray(message.reconnecting) ? message.reconnecting : []) {
+    const session = normalizeSession(raw, "reconnecting");
+    if (session) reconnecting.set(session.id, session);
+  }
   const incoming = new Map();
   for (const raw of rawSessions) {
     const session = normalizeSession(raw);
@@ -737,6 +972,9 @@ async function handleNativeSnapshot(message) {
   for (const [id, request] of incomingAccess) accessRequests.set(id, request);
   for (const id of [...approvedAccessRequests.keys()]) {
     if (!incomingAccess.has(id)) approvedAccessRequests.delete(id);
+  }
+  if (hasRecoveryInventory) {
+    await cleanupOrphanedSessionRecovery(new Set([...incoming.keys(), ...reconnecting.keys()]));
   }
 }
 
@@ -805,7 +1043,7 @@ async function handleAccessUpdated(message) {
   sessions.set(session.id, session);
   accessRequests.delete(request.id);
   approvedAccessRequests.delete(request.id);
-  await syncSessionTabs(session.id);
+  await syncAndPersistSessionTabs(session.id);
 }
 
 function handleAccessDeclined(message) {
@@ -867,9 +1105,21 @@ async function handleSessionStarted(message) {
 }
 async function handleSessionResuming(message) {
   const sessionUpdate = normalizeSession(message, "reconnecting");
-  if (!sessionUpdate || typeof message?.relayUrl !== "string") return;
-  const known = sessions.get(sessionUpdate.id);
-  if (!known || known.state !== "reconnecting" || !matchesSessionAuthority(known, sessionUpdate) || relaySockets.has(sessionUpdate.id)) return;
+  if (!sessionUpdate || typeof message?.relayUrl !== "string" || relaySockets.has(sessionUpdate?.id)) return;
+  let known = sessions.get(sessionUpdate.id);
+  if (!known) {
+    const recoveryFailure = await restoreSessionRecovery(sessionUpdate);
+    if (recoveryFailure) {
+      postSessionRevocation(sessionUpdate.id, `browser recovery ${recoveryFailure}`);
+      return;
+    }
+    known = sessions.get(sessionUpdate.id);
+  }
+  if (known?.state !== "reconnecting" || !sameSessionAuthority(known, sessionUpdate)) {
+    postSessionRevocation(sessionUpdate.id, "browser recovery authority changed");
+    await stopSession(sessionUpdate.id, { removeSession: true });
+    return;
+  }
   sessions.set(sessionUpdate.id, { ...known, ...sessionUpdate, rememberedGrant: known.rememberedGrant === true });
   await openSessionRelay(sessionUpdate.id, message.relayUrl);
   await updateSessionPageState(sessionUpdate.id, "active");
@@ -1060,10 +1310,12 @@ async function terminateNativeConnection(port, generation) {
 
 async function removeOrphanedSessionPages() {
   try {
+    const recoveryRecords = await storedSessionRecoveryRecords();
+    const retainedAnchors = new Set([...recoveryRecords.values()].map((record) => record.anchorId));
     const tabs = await chrome.tabs.query({});
     await Promise.all(
       tabs
-        .filter((tab) => isSessionPageTab(tab))
+        .filter((tab) => isSessionPageTab(tab) && !retainedAnchors.has(tab.id))
         .map((tab) => chrome.tabs.remove(tab.id).catch(() => {})),
     );
   } catch {
@@ -1091,10 +1343,12 @@ async function connectNative() {
   const generation = nativeGeneration + 1;
   nativeGeneration = generation;
   nativePort = port;
+  const dispatchNativeMessage = createSerialNativeMessageHandler(
+    (message) => handleNativeMessage(message, port, generation),
+    () => terminateNativeConnection(port, generation),
+  );
   port.onMessage.addListener((message) => {
-    void handleNativeMessage(message, port, generation).catch(() => {
-      void terminateNativeConnection(port, generation).catch(() => {});
-    });
+    void dispatchNativeMessage(message);
   });
   port.onDisconnect.addListener(() => {
     void handleNativeDisconnect(port, generation).catch(() => {});
@@ -1131,15 +1385,16 @@ async function sessionRelayTabs(sessionId) {
   }
 }
 
-async function syncSessionTabs(sessionId) {
+async function syncAndPersistSessionTabs(sessionId) {
   if (!sessionIsActive(sessionId)) {
     return;
   }
   sendRelay(sessionId, { type: "tabs", tabs: await sessionRelayTabs(sessionId) });
+  await persistSessionRecovery(sessionId);
 }
 
 async function syncActiveRelaySessions() {
-  await Promise.all([...readyRelaySessions].map((sessionId) => syncSessionTabs(sessionId)));
+  await Promise.all([...readyRelaySessions].map((sessionId) => syncAndPersistSessionTabs(sessionId)));
 }
 
 
@@ -1212,15 +1467,23 @@ async function failRelaySession(sessionId, socket, error) {
     return;
   }
   const current = relaySockets.get(sessionId);
-  if (socket && current && current !== socket) {
+  if (!isCurrentRelaySocketFailure(current, socket, runtimeSuspending)) {
     return;
   }
   if (socket) {
     failedRelaySockets.add(socket);
   }
+  const wasReady = readyRelaySessions.has(sessionId);
   reportRelayFailure(sessionId, error);
   if (current === socket) {
     closeRelaySocket(sessionId);
+  }
+  const session = sessions.get(sessionId);
+  if (wasReady && nativeReconnectAllowed && session && (session.state === "active" || session.state === "reconnecting")) {
+    sessions.set(sessionId, { ...session, state: "reconnecting" });
+    await updateSessionPageState(sessionId, "reconnecting");
+    refreshBadge();
+    return;
   }
   try {
     await stopSession(sessionId, { removeSession: true });
@@ -1240,17 +1503,23 @@ async function handleRelayOpen(sessionId, socket, relayUrl) {
     throw new Error("The local relay was removed during startup.");
   }
   const session = sessions.get(sessionId);
-  readyRelaySessions.add(sessionId);
   try {
-    if (session.access.tabIds.length > 0) {
-      const firstTab = await chrome.tabs.get(session.access.tabIds[0]);
-      await ensureSessionGroup(sessionId, firstTab.windowId);
-      for (const tabId of session.access.tabIds) {
-        await claimAndGroupTab(sessionId, tabId);
+    const firstTab =
+      session.state !== "reconnecting" && session.access.tabIds.length > 0
+        ? await chrome.tabs.get(session.access.tabIds[0])
+        : null;
+    readyRelaySessions.add(sessionId);
+    if (session.state !== "reconnecting") {
+      if (firstTab) {
+        await ensureSessionGroup(sessionId, firstTab.windowId);
+        for (const tabId of session.access.tabIds) {
+          await claimAndGroupTab(sessionId, tabId);
+        }
+        await syncAndPersistSessionTabs(sessionId);
+      } else {
+        await ensureSessionGroup(sessionId);
+        await persistSessionRecovery(sessionId);
       }
-      await syncSessionTabs(sessionId);
-    } else {
-      await ensureSessionGroup(sessionId);
     }
     if (!reportRelayReady(sessionId, relayUrl)) {
       throw new Error("Native Messaging companion disconnected before relay readiness.");
@@ -1267,21 +1536,20 @@ async function handleRelayOpen(sessionId, socket, relayUrl) {
 }
 
 async function handleRelayClose(sessionId, socket, ready) {
-  if (relaySockets.get(sessionId) !== socket) {
+  const disposition = relaySocketCloseDisposition(
+    relaySockets.get(sessionId),
+    socket,
+    ready,
+    runtimeSuspending,
+  );
+  if (disposition === "ignore") {
     return;
   }
-  relaySockets.delete(sessionId);
-  readyRelaySessions.delete(sessionId);
-  if (!ready) {
+  if (disposition === "startupFailure") {
     await failRelaySession(sessionId, socket, "The local relay closed before readiness.");
     return;
   }
-  try {
-    await stopSession(sessionId, { removeSession: true });
-  } finally {
-    postSessionRevocation(sessionId, "local relay disconnected");
-    refreshBadge();
-  }
+  await failRelaySession(sessionId, socket, "The local relay disconnected.");
 }
 
 async function openSessionRelay(sessionId, pairingUrl) {
@@ -1385,7 +1653,7 @@ async function requireSessionGroupInWindow(sessionId, groupId, windowId) {
   return groupId;
 }
 
-async function ensureSessionGroup(sessionId, windowId = null) {
+async function ensureSessionGroup(sessionId, windowId = null, allowReconnecting = false) {
   const session = sessions.get(sessionId);
   if (!session) {
     throw new Error("The task session is no longer available.");
@@ -1412,55 +1680,59 @@ async function ensureSessionGroup(sessionId, windowId = null) {
     return await inFlight;
   }
 
-  const creation = (async () => {
-    let anchorId = null;
-    let groupId = sessionGroups.get(sessionId);
-    try {
-      const anchor = await chrome.tabs.create({
-        url: sessionPageUrl(session),
-        active: false,
-        ...(Number.isInteger(windowId) ? { windowId } : {}),
-      });
-      if (!Number.isInteger(anchor.id)) {
-        throw new Error("Browser did not return a session tab ID.");
-      }
-      anchorId = anchor.id;
-
-      if (Number.isInteger(groupId)) {
-        await requireSessionGroupInWindow(sessionId, groupId, anchor.windowId);
-        await chrome.tabs.group({ tabIds: [anchorId], groupId });
-      } else {
-        groupId = await chrome.tabs.group({ tabIds: [anchorId] });
-      }
-      await chrome.tabGroups.update(groupId, {
-        title: taskGroupTitle(session),
-        color: taskGroupColor(session),
-      });
-      if (!sessionIsActive(sessionId)) {
-        throw new Error("Task session stopped while its group was being created.");
-      }
-      sessionAnchors.set(sessionId, anchorId);
-      sessionGroups.set(sessionId, groupId);
-      return groupId;
-    } catch (error) {
-      if (Number.isInteger(anchorId)) {
-        try {
-          await chrome.tabs.ungroup([anchorId]);
-        } catch {
-          // The browser may already have removed the group.
-        }
-        try {
-          await chrome.tabs.remove(anchorId);
-        } catch {
-          // The browser may already have removed the anchor.
-        }
-      }
-      throw error;
-    }
-  })();
+  let resolveCreation;
+  let rejectCreation;
+  const creation = new Promise((resolve, reject) => {
+    resolveCreation = resolve;
+    rejectCreation = reject;
+  });
+  void creation.catch(() => {});
   creatingSessionGroups.set(sessionId, creation);
+  let anchorId = null;
+  let groupId = sessionGroups.get(sessionId);
   try {
-    return await creation;
+    const anchor = await chrome.tabs.create({
+      url: sessionPageUrl(session),
+      active: false,
+      ...(Number.isInteger(windowId) ? { windowId } : {}),
+    });
+    if (!Number.isInteger(anchor.id)) {
+      throw new Error("Browser did not return a session tab ID.");
+    }
+    anchorId = anchor.id;
+
+    if (Number.isInteger(groupId)) {
+      await requireSessionGroupInWindow(sessionId, groupId, anchor.windowId);
+      await chrome.tabs.group({ tabIds: [anchorId], groupId });
+    } else {
+      groupId = await chrome.tabs.group({ tabIds: [anchorId], createProperties: { windowId: anchor.windowId } });
+    }
+    await chrome.tabGroups.update(groupId, {
+      title: taskGroupTitle(session),
+      color: taskGroupColor(session),
+    });
+    if (!sessionIsActive(sessionId) && !(allowReconnecting && sessions.get(sessionId)?.state === "reconnecting")) {
+      throw new Error("Task session stopped while its group was being created.");
+    }
+    sessionAnchors.set(sessionId, anchorId);
+    sessionGroups.set(sessionId, groupId);
+    resolveCreation(groupId);
+    return groupId;
+  } catch (error) {
+    if (Number.isInteger(anchorId)) {
+      try {
+        await chrome.tabs.ungroup([anchorId]);
+      } catch {
+        // The browser may already have removed the group.
+      }
+      try {
+        await chrome.tabs.remove(anchorId);
+      } catch {
+        // The browser may already have removed the anchor.
+      }
+    }
+    rejectCreation(error);
+    throw error;
   } finally {
     if (creatingSessionGroups.get(sessionId) === creation) {
       creatingSessionGroups.delete(sessionId);
@@ -1502,7 +1774,7 @@ async function claimAndGroupTab(sessionId, tabId) {
 
 async function shareTab(sessionId, tabId) {
   await claimAndGroupTab(sessionId, tabId);
-  await syncSessionTabs(sessionId);
+  await syncAndPersistSessionTabs(sessionId);
 }
 
 async function detachChromeDebugger(tabId) {
@@ -1587,7 +1859,7 @@ async function revokeTabAccess(sessionId, tabId, reason, { notifyRelay = true } 
   }
   if (notifyRelay && sessionIsActive(sessionId)) {
     sendRelay(sessionId, { type: "detached", tabId, reason });
-    await syncSessionTabs(sessionId);
+    await syncAndPersistSessionTabs(sessionId);
   }
 }
 
@@ -1596,7 +1868,7 @@ async function unshareTab(sessionId, tabId) {
     throw new Error("This tab is not shared with the selected task session.");
   }
   await revokeTabAccess(sessionId, tabId, "user removed shared tab", { notifyRelay: false });
-  await syncSessionTabs(sessionId);
+  await syncAndPersistSessionTabs(sessionId);
 }
 
 async function stopSession(sessionId, { removeSession = true } = {}) {
@@ -1636,6 +1908,7 @@ async function stopSession(sessionId, { removeSession = true } = {}) {
         // The browser may already have removed the anchor.
       }
     }
+    await removeSessionRecovery(sessionId);
     if (removeSession) {
       sessions.delete(sessionId);
       approvedSessions.delete(sessionId);
@@ -1667,6 +1940,7 @@ async function stopAllSessions() {
   sessionAnchors.clear();
   tabOwners.clear();
   approvedSessions.clear();
+  await cleanupOrphanedSessionRecovery();
 }
 
 async function forwardDebuggerEvent(source, method, params) {
@@ -1762,7 +2036,7 @@ async function handleRelayCommand(sessionId, socket, message) {
         await detachDebugger(message.tabId);
         releaseTab(tabOwners, sessionId, message.tabId);
         await chrome.tabs.remove(message.tabId);
-        await syncSessionTabs(sessionId);
+        await syncAndPersistSessionTabs(sessionId);
         sendRelay(sessionId, { type: "result", seq, result: {} });
         return;
       case "activateTab": {
@@ -2153,17 +2427,20 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   })().catch(() => {});
 });
 
-chrome.tabs.onCreated.addListener(() => {
-  void syncActiveRelaySessions().catch(() => {});
+chrome.tabs.onCreated.addListener((tab) => {
+  void cleanupOrphanedRecoveryGroup(tab.groupId).then(() => syncActiveRelaySessions()).catch(() => {});
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   const anchorSessionId = [...sessionAnchors.entries()].find(([, anchorId]) => anchorId === tabId)?.[0];
   if (anchorSessionId) {
     sessionAnchors.delete(anchorSessionId);
-    if (sessionIsActive(anchorSessionId)) {
-      void stopSession(anchorSessionId, { removeSession: true })
-        .then(() => postSessionRevocation(anchorSessionId, "task session tab was closed"))
+    const session = sessions.get(anchorSessionId);
+    const groupId = sessionGroups.get(anchorSessionId);
+    if (!runtimeSuspending && nativeState === "connected" && session?.state === "active" && Number.isInteger(groupId)) {
+      void chrome.tabGroups.get(groupId)
+        .then((group) => ensureSessionGroup(anchorSessionId, group.windowId))
+        .then(() => persistSessionRecovery(anchorSessionId))
         .catch(() => {});
     }
   }
@@ -2175,6 +2452,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   void syncActiveRelaySessions().catch(() => {});
 });
 
+
+chrome.tabGroups.onCreated.addListener((group) => {
+  void cleanupOrphanedRecoveryGroup(group.id).catch(() => {});
+});
 
 chrome.tabGroups.onRemoved.addListener((group) => {
   const sessionId = [...sessionGroups.entries()].find(([, groupId]) => groupId === group.id)?.[0];
@@ -2191,6 +2472,17 @@ async function initializeExtension() {
   await connectNative();
 }
 
+chrome.runtime.onSuspend.addListener(() => {
+  runtimeSuspending = true;
+});
+chrome.runtime.onSuspendCanceled.addListener(() => {
+  runtimeSuspending = false;
+  for (const [sessionId, socket] of relaySockets) {
+    if (socket.readyState === WebSocket.CLOSED) {
+      void failRelaySession(sessionId, socket, "The local relay closed during canceled extension suspension.").catch(() => {});
+    }
+  }
+});
 chrome.runtime.onStartup.addListener(() => void initializeExtension().catch(() => {}));
 chrome.runtime.onInstalled.addListener(() => void initializeExtension().catch(() => {}));
 void initializeExtension().catch(() => {});

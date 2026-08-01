@@ -52,6 +52,17 @@ function nativeEndpoint(socketPath: string, extensionId: string, extension = gen
 async function closeSocket(socket: Socket): Promise<void> {
   await new Promise<void>((resolvePromise) => { socket.once("close", resolvePromise); socket.end(); });
 }
+async function within<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function relay() { return async () => ({ pairingUrl: "ws://127.0.0.1/extension#token", cdpUrl: "ws://127.0.0.1/cdp?token=token", close: async () => undefined }); }
 
@@ -166,16 +177,25 @@ async function resumesActiveSessionAfterSameEndpointReconnect(): Promise<void> {
     }
     const active = await approveSession(first);
     assert.equal(active.id, opened.session.id);
-    const disconnected = lifecycle.wait(first.extension.principalId);
-    await closeSocket(first.socket);
-    await disconnected;
+    await writeNativeFrame(first.socket, { version: NATIVE_PROTOCOL_VERSION, type: "relayFailed", sessionId: active.id, error: "extension relay disconnected during reload" });
+    const interrupted = await first.next("sessionResuming");
+    assert.equal(interrupted.session.id, active.id);
+    assert.equal(interrupted.session.state, "reconnecting");
+    assert.equal(interrupted.relayUrl, "ws://127.0.0.1/extension#token");
     const restored = nativeEndpoint(supervisor.sockets.controlSocketPath, "chrome", first.extension);
-    await restored.authenticate();
+    await within(restored.authenticate(), 1_000, "replacement endpoint did not authenticate before old shim teardown");
+    const snapshot = await restored.next("snapshot");
+    assert.deepEqual(snapshot.active, []);
+    assert.deepEqual(snapshot.reconnecting.map(({ id }) => id), [active.id]);
     const resuming = await restored.next("sessionResuming");
     assert.equal(resuming.session.id, active.id);
     assert.equal(resuming.session.state, "reconnecting");
     assert.equal(resuming.relayUrl, "ws://127.0.0.1/extension#token");
+    await closeSocket(first.socket);
     await writeNativeFrame(restored.socket, { version: NATIVE_PROTOCOL_VERSION, type: "relayReady", sessionId: active.id, relayUrl: resuming.relayUrl });
+    const resumed = await restored.next("snapshot");
+    assert.deepEqual(resumed.active.map(({ id }) => id), [active.id]);
+    assert.deepEqual(resumed.reconnecting, []);
     await writeNativeFrame(restored.socket, { version: NATIVE_PROTOCOL_VERSION, type: "revokeSession", sessionId: active.id, reason: "complete" });
     await restored.next("sessionStopped");
     const restoredDisconnected = lifecycle.wait(restored.extension.principalId);

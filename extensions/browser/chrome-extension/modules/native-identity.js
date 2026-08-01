@@ -129,6 +129,21 @@ export async function fingerprintSpki(publicKeySpki) {
   return `sha256/${bytesToBase64(new Uint8Array(digest))}`;
 }
 
+/** Preserve Native Messaging frame order across asynchronous handlers. */
+export function createSerialNativeMessageHandler(handle, onError) {
+  let tail = Promise.resolve();
+  return (message) => {
+    tail = tail.then(() => handle(message)).catch(async (error) => {
+      try {
+        await onError(error);
+      } catch {
+        // Connection teardown is best-effort; keep the queue settled.
+      }
+    });
+    return tail;
+  };
+}
+
 /**
  * Prove a persisted extension public/private pair still corresponds before
  * allowing it to authenticate a Native Messaging companion.

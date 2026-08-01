@@ -22,6 +22,10 @@ export function fromBase64Url(value: string): Uint8Array;
 export function fingerprintSpki(publicKeySpki: string): Promise<string>;
 export function verifyExtensionIdentity(identity: unknown): Promise<boolean>;
 
+export function createSerialNativeMessageHandler<T>(
+  handle: (message: T) => void | Promise<void>,
+  onError: (error: unknown) => void | Promise<void>,
+): (message: T) => Promise<void>;
 export function loadExtensionIdentity(): Promise<ExtensionIdentity>;
 export function pinCompanion(companion: {
   id: string;

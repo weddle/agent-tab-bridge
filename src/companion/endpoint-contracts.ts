@@ -1,5 +1,8 @@
 import { isSessionAccess, type SessionAccess } from "./session-access.js";
 
+/** Approved endpoint/session recovery grace: approximately two minutes. */
+export const ENDPOINT_RECOVERY_GRACE_MS = 2 * 60_000;
+
 /** Stable IDs are SPKI fingerprints; principal IDs use this same representation. */
 export type MachineId = string;
 export type EndpointId = string;

@@ -129,27 +129,94 @@ export function classifyTabAccess(tabOwners, sessionId, tabId, canAdopt) {
 }
 
 
+function sameArray(left, right) {
+  return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameAccess(left, right) {
+  return !!left && !!right && left.level === right.level && sameArray(left.tabIds, right.tabIds) && sameArray(left.domains, right.domains);
+}
+
+function sameRoute(left, right) {
+  return !!left && !!right &&
+    left.kind === right.kind &&
+    left.endpointId === right.endpointId &&
+    left.controllerPrincipalId === right.controllerPrincipalId &&
+    left.routePolicy === right.routePolicy &&
+    sameAccess(left.accessCeiling, right.accessCeiling) &&
+    left.hubId === right.hubId &&
+    left.routeId === right.routeId &&
+    left.streamId === right.streamId;
+}
+
+/** Name the first authority-bearing field that differs, or null for an exact match. */
+export function sessionAuthorityMismatchField(left, right) {
+  if (!left || !right) return "record";
+  if (left.id !== right.id) return "id";
+  if (left.controllerId !== right.controllerId) return "controllerId";
+  if (left.controllerName !== right.controllerName) return "controllerName";
+  if (left.taskLabel !== right.taskLabel) return "taskLabel";
+  if (left.createdAt !== right.createdAt) return "createdAt";
+  if (left.expiresAt !== right.expiresAt) return "expiresAt";
+  if (!sameArray(left.capabilities, right.capabilities)) return "capabilities";
+  if (!sameAccess(left.access, right.access)) return "access";
+  if (!sameRoute(left.route, right.route)) return "route";
+  return null;
+}
+
+/** Compare every authority-bearing field while deliberately ignoring lifecycle state. */
+export function sameSessionAuthority(left, right) {
+  return sessionAuthorityMismatchField(left, right) === null;
+}
+
 /**
  * A host may transition only the exact popup-approved pending session to
- * active. Display text, expiry, controller, requested capability, and access
- * scope are authority-bearing and must remain unchanged.
+ * active. Display text, expiry, controller, requested capability, access
+ * scope, and route are authority-bearing and must remain unchanged.
  */
 export function matchesSessionAuthority(pending, active) {
   return (
-    !!pending &&
-    !!active &&
-    pending.state === "pending" &&
-    active.state === "active" &&
-    pending.id === active.id &&
-    pending.controllerId === active.controllerId &&
-    pending.controllerName === active.controllerName &&
-    pending.taskLabel === active.taskLabel &&
-    pending.createdAt === active.createdAt &&
-    pending.expiresAt === active.expiresAt &&
-    Array.isArray(pending.capabilities) &&
-    Array.isArray(active.capabilities) &&
-    pending.capabilities.length === active.capabilities.length &&
-    pending.capabilities.every((capability, index) => capability === active.capabilities[index]) &&
-    JSON.stringify(pending.access) === JSON.stringify(active.access)
+    pending?.state === "pending" &&
+    active?.state === "active" &&
+    sameSessionAuthority(pending, active)
   );
+}
+
+export function makeSessionRecoveryRecord(session, groupId, anchorId, tabIds) {
+  if (
+    !session ||
+    !Number.isInteger(groupId) ||
+    groupId < 0 ||
+    !Number.isInteger(anchorId) ||
+    anchorId < 0 ||
+    !Array.isArray(tabIds) ||
+    tabIds.some((tabId) => !Number.isInteger(tabId) || tabId < 0) ||
+    new Set(tabIds).size !== tabIds.length
+  ) {
+    return null;
+  }
+  return {
+    version: 1,
+    session,
+    groupId,
+    anchorId,
+    tabIds: [...tabIds].sort((left, right) => left - right),
+  };
+}
+
+export function validateSessionRecoveryRecord(value, resumedSession) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 5 ||
+    !["version", "session", "groupId", "anchorId", "tabIds"].every((key) => Object.hasOwn(value, key)) ||
+    value.version !== 1 ||
+    !["active", "reconnecting"].includes(value.session?.state) ||
+    resumedSession?.state !== "reconnecting" ||
+    !sameSessionAuthority(value.session, resumedSession)
+  ) {
+    return null;
+  }
+  return makeSessionRecoveryRecord(value.session, value.groupId, value.anchorId, value.tabIds);
 }

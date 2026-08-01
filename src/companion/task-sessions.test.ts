@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { ENDPOINT_RECOVERY_GRACE_MS } from "./endpoint-contracts.js";
 import { TaskSessionManager } from "./task-sessions.js";
 
 type FakeRelay = {
@@ -71,6 +72,43 @@ describe("TaskSessionManager integration contract", () => {
     expect(manager.get(pending.id)).toMatchObject({ state: "active" });
     expect(manager.cdpUrl(pending.id)).toBe(relays[0]?.cdpUrl);
     expect(events).toEqual(["pending", "active", "reconnecting", "active"]);
+  });
+
+  it("recovers a ready relay failure within a bounded grace period", async () => {
+    let expireRecovery = () => {};
+    const recoveryTimer = { unref: vi.fn() } as unknown as NodeJS.Timeout;
+    const setTimer = vi.fn((callback: () => void) => {
+      expireRecovery = callback;
+      return recoveryTimer;
+    });
+    const clearTimer = vi.fn();
+    const events: Array<{ type: string; reason?: string }> = [];
+    const { relays, startRelay } = makeRelayFactory();
+    const manager = new TaskSessionManager({
+      startRelay,
+      idFactory: () => "session-relay-recovery",
+      setTimer,
+      clearTimer,
+      onEvent: (event) => events.push(event),
+    });
+    const session = manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "relay recovery", capabilities: ["cdp"] });
+    await manager.approve(session.id);
+    manager.relayReady(session.id);
+
+    await expect(manager.relayFailed(session.id)).resolves.toMatchObject({ state: "reconnecting" });
+    expect(manager.pairingUrl(session.id)).toBe(relays[0]?.pairingUrl);
+    expect(relays[0]?.close).not.toHaveBeenCalled();
+    expect(setTimer).toHaveBeenCalledWith(expect.any(Function), ENDPOINT_RECOVERY_GRACE_MS);
+
+    manager.relayReady(session.id);
+    expect(manager.get(session.id)).toMatchObject({ state: "active" });
+    expect(clearTimer).toHaveBeenCalledWith(recoveryTimer);
+
+    await manager.relayFailed(session.id);
+    expireRecovery();
+    expect(manager.get(session.id)).toMatchObject({ state: "revoked" });
+    expect(events.at(-1)).toMatchObject({ type: "revoked", reason: "relayRecoveryExpired" });
+    expect(relays[0]?.close).toHaveBeenCalledTimes(1);
   });
 
   it("creates an indefinite session without an expiry timer", async () => {

@@ -20,6 +20,20 @@ export function reconnectDelayMs(attempt) {
   return Math.min(1000 * 2 ** capped, 30_000);
 }
 
+/** Ignore errors from intentionally removed sockets and during runtime suspension. */
+export function isCurrentRelaySocketFailure(currentSocket, failedSocket, runtimeSuspending = false) {
+  return !runtimeSuspending && (failedSocket === null || currentSocket === failedSocket);
+}
+
+/** Classify a WebSocket close before mutating relay ownership. */
+export function relaySocketCloseDisposition(currentSocket, closedSocket, ready, runtimeSuspending = false) {
+  if (runtimeSuspending || currentSocket !== closedSocket) {
+    return "ignore";
+  }
+  return ready ? "disconnect" : "startupFailure";
+}
+
+
 
 /** Normalize a chrome.tabs.Tab into the relay's tab-info shape. */
 export function toRelayTabInfo(tab) {

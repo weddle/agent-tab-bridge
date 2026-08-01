@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { isStableSessionKey } from "./stable-session-key.js";
 import { normalizeSessionAccess, sameSessionAccess, upgradeSessionAccess, type SessionAccess, type SessionAccessDelta } from "./session-access.js";
-import { localRouteProvenance, type RouteProvenance } from "./endpoint-contracts.js";
+import { ENDPOINT_RECOVERY_GRACE_MS, localRouteProvenance, type RouteProvenance } from "./endpoint-contracts.js";
 export const TASK_SESSION_CAPABILITIES = ["cdp"] as const;
 export type TaskSessionCapability = (typeof TASK_SESSION_CAPABILITIES)[number];
 export type TaskSessionState = "pending" | "active" | "reconnecting" | "revoked";
@@ -14,7 +14,7 @@ export type OpenTaskSessionInput = Readonly<{ controllerPrincipalId: string; con
 export type SessionApproval = Readonly<{ session: TaskSession; pairingUrl: string }>;
 export type SessionLifecycleEvent = Readonly<{ type: "pending"; session: TaskSession }> | Readonly<{ type: "active"; session: TaskSession; cdpUrl: string }> | Readonly<{ type: "reconnecting"; session: TaskSession }> | Readonly<{ type: "revoked"; session: TaskSession; reason: string }>;
 export type TaskSessionManagerOptions = Readonly<{ startRelay: () => Promise<TaskSessionRelay>; localEndpointId?: string; routeFor?: (controllerPrincipalId: string, access: SessionAccess) => RouteProvenance; now?: () => number; setTimer?: (callback: () => void, delayMs: number) => NodeJS.Timeout; clearTimer?: (timer: NodeJS.Timeout | null) => void; idFactory?: () => string; onEvent?: (event: SessionLifecycleEvent) => void }>;
-type Stored = { session: TaskSession; stableSessionKey: string | null; relay: TaskSessionRelay | null; approval: Promise<SessionApproval> | null; ready: boolean; timer: NodeJS.Timeout | null; revoking: Promise<TaskSession> | null };
+type Stored = { session: TaskSession; stableSessionKey: string | null; relay: TaskSessionRelay | null; approval: Promise<SessionApproval> | null; ready: boolean; timer: NodeJS.Timeout | null; recoveryTimer: NodeJS.Timeout | null; revoking: Promise<TaskSession> | null };
 export class TaskSessionError extends Error { constructor(readonly code: "invalidSession" | "unsupportedCapability" | "invalidTtl" | "notPending" | "notActive" | "notFound" | "sessionConflict", message: string) { super(message); this.name = "TaskSessionError"; } }
 const clone = (session: TaskSession): TaskSession => ({ ...session, requestedCapabilities: [...session.requestedCapabilities], access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] }, route: { ...session.route, accessCeiling: { ...session.route.accessCeiling, tabIds: [...session.route.accessCeiling.tabIds], domains: [...session.route.accessCeiling.domains] } } });
 const changed = (session: TaskSession, state: TaskSessionState): TaskSession => ({ ...clone(session), state });
@@ -71,7 +71,7 @@ export class TaskSessionManager {
       route: { ...route, accessCeiling: { ...route.accessCeiling, tabIds: [...route.accessCeiling.tabIds], domains: [...route.accessCeiling.domains] } },
     };
     if (this.stored.has(session.id)) throw new TaskSessionError("invalidSession", "session ID collision");
-    const stored: Stored = { session, stableSessionKey, relay: null, approval: null, ready: false, timer: null, revoking: null };
+    const stored: Stored = { session, stableSessionKey, relay: null, approval: null, ready: false, timer: null, recoveryTimer: null, revoking: null };
     if (ttl !== undefined) {
       stored.timer = this.setTimer(() => { void this.revoke(session.id, "ttlExpired").catch(() => {}); }, ttl);
       stored.timer.unref?.();
@@ -87,18 +87,45 @@ export class TaskSessionManager {
     stored.approval = (async () => { try { const relay = await this.options.startRelay(); if (stored.session.state === "revoked") { await relay.close(); throw new TaskSessionError("notActive", "session was revoked"); } stored.relay = relay; return { session: clone(stored.session), pairingUrl: relay.pairingUrl }; } catch (error) { await this.revoke(id, "relayStartFailed"); throw error; } })();
     return stored.approval;
   }
-  relayReady(id: string): TaskSession { const stored = this.require(id); if ((stored.session.state !== "active" && stored.session.state !== "reconnecting") || !stored.relay) throw new TaskSessionError("notActive", "session relay is not active"); const resumed = stored.session.state === "reconnecting"; if (resumed) stored.session = changed(stored.session, "active"); if (!stored.ready) { stored.ready = true; this.emit({ type: "active", session: clone(stored.session), cdpUrl: stored.relay.cdpUrl }); } else if (resumed) this.emit({ type: "active", session: clone(stored.session), cdpUrl: stored.relay.cdpUrl }); return clone(stored.session); }
-  async relayFailed(id: string, reason = "relayFailed"): Promise<TaskSession> { return await this.revoke(id, reason); }
+  relayReady(id: string): TaskSession {
+    const stored = this.require(id);
+    if ((stored.session.state !== "active" && stored.session.state !== "reconnecting") || !stored.relay) throw new TaskSessionError("notActive", "session relay is not active");
+    const resumed = stored.session.state === "reconnecting";
+    this.clearTimer(stored.recoveryTimer);
+    stored.recoveryTimer = null;
+    if (resumed) stored.session = changed(stored.session, "active");
+    if (!stored.ready) {
+      stored.ready = true;
+      this.emit({ type: "active", session: clone(stored.session), cdpUrl: stored.relay.cdpUrl });
+    } else if (resumed) {
+      this.emit({ type: "active", session: clone(stored.session), cdpUrl: stored.relay.cdpUrl });
+    }
+    return clone(stored.session);
+  }
+  async relayFailed(id: string, reason = "relayFailed"): Promise<TaskSession> {
+    const stored = this.require(id);
+    if (!stored.ready) return await this.revoke(id, reason);
+    return this.beginRecovery(stored) ?? await this.revoke(id, reason);
+  }
   suspend(): TaskSession[] {
     const suspended: TaskSession[] = [];
     for (const stored of this.stored.values()) {
-      if (stored.session.state !== "active") continue;
-      stored.session = changed(stored.session, "reconnecting");
-      const session = clone(stored.session);
-      suspended.push(session);
-      this.emit({ type: "reconnecting", session });
+      const session = this.beginRecovery(stored);
+      if (session) suspended.push(session);
     }
     return suspended;
+  }
+  private beginRecovery(stored: Stored): TaskSession | undefined {
+    if (stored.session.state === "reconnecting") return clone(stored.session);
+    if (stored.session.state !== "active") return undefined;
+    stored.session = changed(stored.session, "reconnecting");
+    stored.ready = false;
+    this.clearTimer(stored.recoveryTimer);
+    stored.recoveryTimer = this.setTimer(() => { void this.revoke(stored.session.id, "relayRecoveryExpired").catch(() => {}); }, ENDPOINT_RECOVERY_GRACE_MS);
+    stored.recoveryTimer.unref?.();
+    const session = clone(stored.session);
+    this.emit({ type: "reconnecting", session });
+    return session;
   }
   async revoke(id: string, reason = "revoked"): Promise<TaskSession> {
     const stored = this.require(id);
@@ -108,7 +135,9 @@ export class TaskSessionManager {
     this.forgetReusableSession(stored);
     stored.ready = false;
     this.clearTimer(stored.timer);
+    this.clearTimer(stored.recoveryTimer);
     stored.timer = null;
+    stored.recoveryTimer = null;
     const relay = stored.relay;
     stored.relay = null;
     stored.revoking = (async () => {

@@ -68,7 +68,17 @@ export interface DeclineAccessMessage { version: typeof NATIVE_PROTOCOL_VERSION;
 export interface RelayReadyMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "relayReady"; requestId?: string; sessionId: string; relayUrl: string; }
 export interface RelayFailedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "relayFailed"; requestId?: string; sessionId: string; error: string; }
 export interface TrustedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "trusted"; requestId?: string; companionPrincipalId: string; extensionFingerprint: string; }
-export interface SnapshotMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "snapshot"; requestId?: string; pending: SessionRecord[]; active: SessionRecord[]; sharedTabs: SharedTabRecord[]; pendingAccess: AccessUpgradeRecord[]; enrolledProfiles?: EnrolledProfileRecord[]; }
+export interface SnapshotMessage {
+  version: typeof NATIVE_PROTOCOL_VERSION;
+  type: "snapshot";
+  requestId?: string;
+  pending: SessionRecord[];
+  active: SessionRecord[];
+  reconnecting: SessionRecord[];
+  sharedTabs: SharedTabRecord[];
+  pendingAccess: AccessUpgradeRecord[];
+  enrolledProfiles?: EnrolledProfileRecord[];
+}
 export interface SessionPendingMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionPending"; requestId?: string; session: SessionRecord; }
 export interface SessionStartedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionStarted"; requestId?: string; session: SessionRecord; relayUrl?: string; }
 export interface SessionStoppedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionStopped"; requestId?: string; session: SessionRecord; reason?: string; }
@@ -154,7 +164,22 @@ export function validateNativeMessage(value: unknown): value is NativeMessage {
     case "accessPending": return hasVersionAndType(value, "accessPending", ["request"]) && validateAccessUpgrade(value.request);
     case "accessUpdated": return hasVersionAndType(value, "accessUpdated", ["accessRequestId", "session"]) && validId(value.accessRequestId) && validateSessionRecord(value.session);
     case "accessDeclined": return hasVersionAndType(value, "accessDeclined", ["accessRequestId", "sessionId"]) && validId(value.accessRequestId) && validId(value.sessionId);
-    case "snapshot": return hasVersionAndType(value, "snapshot", ["pending", "active", "sharedTabs", "pendingAccess"], ["enrolledProfiles"]) && Array.isArray(value.pending) && Array.isArray(value.active) && Array.isArray(value.sharedTabs) && Array.isArray(value.pendingAccess) && value.pending.every(validateSessionRecord) && value.active.every(validateSessionRecord) && value.sharedTabs.every(validateSharedTab) && value.pendingAccess.every(validateAccessUpgrade) && (value.enrolledProfiles === undefined || (Array.isArray(value.enrolledProfiles) && value.enrolledProfiles.length <= 1000 && value.enrolledProfiles.every(validateEnrolledProfile)));
+    case "snapshot":
+      return hasVersionAndType(value, "snapshot", ["pending", "active", "reconnecting", "sharedTabs", "pendingAccess"], ["enrolledProfiles"]) &&
+        Array.isArray(value.pending) &&
+        Array.isArray(value.active) &&
+        Array.isArray(value.reconnecting) &&
+        Array.isArray(value.sharedTabs) &&
+        Array.isArray(value.pendingAccess) &&
+        value.pending.every((session) => validateSessionRecord(session) && session.state === "pending") &&
+        value.active.every((session) => validateSessionRecord(session) && session.state === "active") &&
+        value.reconnecting.every((session) => validateSessionRecord(session) && session.state === "reconnecting") &&
+        value.sharedTabs.every(validateSharedTab) &&
+        value.pendingAccess.every(validateAccessUpgrade) &&
+        (value.enrolledProfiles === undefined ||
+          (Array.isArray(value.enrolledProfiles) &&
+            value.enrolledProfiles.length <= 1000 &&
+            value.enrolledProfiles.every(validateEnrolledProfile)));
     case "relayReady": return hasVersionAndType(value, "relayReady", ["sessionId", "relayUrl"]) && validId(value.sessionId) && isString(value.relayUrl, 8192) && /^ws:\/\/127\.0\.0\.1(?::\d+)?\//.test(value.relayUrl);
     case "relayFailed": return hasVersionAndType(value, "relayFailed", ["sessionId", "error"]) && validId(value.sessionId) && isString(value.error, 512);
     case "trusted": return hasVersionAndType(value, "trusted", ["companionPrincipalId", "extensionFingerprint"]) && validPrincipalId(value.companionPrincipalId) && validPrincipalId(value.extensionFingerprint);

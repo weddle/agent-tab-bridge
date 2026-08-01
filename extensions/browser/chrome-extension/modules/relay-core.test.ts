@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  isCurrentRelaySocketFailure,
+  relaySocketCloseDisposition,
   reconnectDelayMs,
   toRelayTabInfo,
 } from "./relay-core.js";
@@ -31,6 +33,26 @@ describe("extension relay helpers", () => {
     expect(reconnectDelayMs(5)).toBe(30_000);
     expect(reconnectDelayMs(100)).toBe(30_000);
   });
+
+  it("ignores delayed errors from removed or replaced relay sockets", () => {
+    const stale = {};
+    const current = {};
+    expect(isCurrentRelaySocketFailure(stale, stale)).toBe(true);
+    expect(isCurrentRelaySocketFailure(undefined, stale)).toBe(false);
+    expect(isCurrentRelaySocketFailure(current, stale)).toBe(false);
+    expect(isCurrentRelaySocketFailure(undefined, null)).toBe(true);
+    expect(isCurrentRelaySocketFailure(current, current, true)).toBe(false);
+  });
+
+  it("classifies a current close before relay ownership is removed", () => {
+    const stale = {};
+    const current = {};
+    expect(relaySocketCloseDisposition(current, stale, false)).toBe("ignore");
+    expect(relaySocketCloseDisposition(current, current, false)).toBe("startupFailure");
+    expect(relaySocketCloseDisposition(current, current, true)).toBe("disconnect");
+    expect(relaySocketCloseDisposition(current, current, true, true)).toBe("ignore");
+  });
+
 
 });
 

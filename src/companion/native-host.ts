@@ -9,7 +9,7 @@ import { CompanionStateStore, type PinnedExtensionIdentity } from "./state.js";
 import { TaskSessionError, TaskSessionManager, type TaskSessionRelay } from "./task-sessions.js";
 import { sameSessionAccess, type SessionAccessDelta } from "./session-access.js";
 import { localRouteProvenance, sameRouteProvenance } from "./endpoint-contracts.js";
-import type { NativeEndpointBinding, NativeEndpointRecovery } from "./endpoint-recovery.js";
+import { nativeEndpointStopDisposition, type NativeEndpointBinding, type NativeEndpointRecovery } from "./endpoint-recovery.js";
 
 export const NATIVE_HOST_NAME = "com.agenttabbridge.companion";
 export type NativeHostOptions = {
@@ -212,7 +212,7 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
   let permanentClose = false;
   const stop = async () => {
     if (outputFailure) trusted = null;
-    if (binding) {
+    if (binding?.send === send) {
       binding.trusted = false;
       binding.send = undefined;
       binding.listTabs = undefined;
@@ -230,7 +230,12 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
       pending.reject(new Error("native host is closing"));
     }
     pendingClaimRequests.clear();
-    if (recovery && !outputFailure && !permanentClose && await options.onEndpointSuspended?.(recovery)) return;
+    const stopDisposition = nativeEndpointStopDisposition({
+      hasRecovery: recovery !== undefined,
+      outputFailed: outputFailure !== null,
+      permanentClose,
+    });
+    if (recovery && stopDisposition === "suspend" && await options.onEndpointSuspended?.(recovery)) return;
     try {
       await sessions?.revokeAll("hostClosing");
     } finally {
@@ -243,7 +248,16 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
     const all = manager.snapshot().map((session) => ({ ...session, requestedCapabilities: [...session.requestedCapabilities], access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] }, route: { ...session.route, accessCeiling: { ...session.route.accessCeiling, tabIds: [...session.route.accessCeiling.tabIds], domains: [...session.route.accessCeiling.domains] } } }));
     const current = await stateStore.load();
     const enrolledProfiles = current.machine.enrollments.map(({ name, principalId, enrolledAt }) => ({ name, principalId, enrolledAt }));
-    await send({ version: NATIVE_PROTOCOL_VERSION, type: "snapshot", pending: all.filter(({ state }) => state === "pending"), active: all.filter(({ state }) => state === "active"), sharedTabs: [], pendingAccess: [...pendingAccess.values()], enrolledProfiles });
+    await send({
+      version: NATIVE_PROTOCOL_VERSION,
+      type: "snapshot",
+      pending: all.filter(({ state }) => state === "pending"),
+      active: all.filter(({ state }) => state === "active"),
+      reconnecting: all.filter(({ state }) => state === "reconnecting"),
+      sharedTabs: [],
+      pendingAccess: [...pendingAccess.values()],
+      enrolledProfiles,
+    });
     for (const session of all.filter(({ state }) => state === "reconnecting")) {
       const relayUrl = manager.pairingUrl(session.id);
       if (relayUrl) await send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionResuming", session, relayUrl });
@@ -278,7 +292,6 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
             broker = recovery.broker;
             sessions.setEventListener(emitSessionEvent);
             attachBinding(recovery.binding);
-            if (binding) binding.trusted = false;
           } else {
             sessions = createSessions(pinned);
             const freshBinding: NativeEndpointBinding = { trusted: false, send: undefined, listTabs: undefined, claimTab: undefined, requestAccess: undefined, enrollProfile: undefined };
@@ -383,8 +396,25 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
         }
         if (message.type === "revokeSession" && sessionManager().get(message.sessionId)) { await sessionManager().revoke(message.sessionId, message.reason ?? "browserRevoked"); return; }
         if (message.type === "relayReady") { sessionManager().relayReady(message.sessionId); if (binding) binding.trusted = true; await snapshot(); return; }
-        if (message.type === "relayFailed" && sessionManager().get(message.sessionId)) await sessionManager().relayFailed(message.sessionId, "relayFailed");
-      } catch (error) { if (error instanceof NativeOutputFailure) throw error; if (message.type === "helloProof" || message.type === "approveSession" || message.type === "approveAccess" || message.type === "declineAccess" || message.type === "confirmEnrollment" || message.type === "revokeProfile" || message.type === "revokeSession" || message.type === "relayReady" || message.type === "relayFailed") return; throw error; }
+        if (message.type === "relayFailed") {
+          const manager = sessionManager();
+          const current = manager.get(message.sessionId);
+          if (!current) return;
+          const session = await manager.relayFailed(message.sessionId, "relayFailed");
+          if (current.state === "active" && session.state === "reconnecting") {
+            const relayUrl = manager.pairingUrl(message.sessionId);
+            if (relayUrl) await send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionResuming", session, relayUrl });
+          }
+        }
+      } catch (error) {
+        if (error instanceof NativeOutputFailure) throw error;
+        if (message.type === "helloProof") {
+          finishHost();
+          return;
+        }
+        if (message.type === "approveSession" || message.type === "approveAccess" || message.type === "declineAccess" || message.type === "confirmEnrollment" || message.type === "revokeProfile" || message.type === "revokeSession" || message.type === "relayReady" || message.type === "relayFailed") return;
+        throw error;
+      }
     }
   });
 }

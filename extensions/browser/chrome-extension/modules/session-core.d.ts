@@ -40,9 +40,29 @@ export type SessionAuthorityRecord = {
   };
   createdAt: number;
   expiresAt: number | null;
-  state: "pending" | "active";
+  state: "pending" | "active" | "reconnecting" | "revoked";
+  route: Record<string, unknown>;
 };
+export function sessionAuthorityMismatchField(left: SessionAuthorityRecord, right: SessionAuthorityRecord): string | null;
+export function sameSessionAuthority(left: SessionAuthorityRecord, right: SessionAuthorityRecord): boolean;
 export function matchesSessionAuthority(
   pending: SessionAuthorityRecord,
   active: SessionAuthorityRecord,
 ): boolean;
+export type SessionRecoveryRecord = {
+  version: 1;
+  session: SessionAuthorityRecord;
+  groupId: number;
+  anchorId: number;
+  tabIds: number[];
+};
+export function makeSessionRecoveryRecord(
+  session: SessionAuthorityRecord,
+  groupId: number,
+  anchorId: number,
+  tabIds: number[],
+): SessionRecoveryRecord | null;
+export function validateSessionRecoveryRecord(
+  value: unknown,
+  resumedSession: SessionAuthorityRecord,
+): SessionRecoveryRecord | null;

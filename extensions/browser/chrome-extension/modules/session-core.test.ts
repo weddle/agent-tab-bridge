@@ -4,12 +4,14 @@ import {
   classifyTabAccess,
   parseRelayPairingUrl,
   matchesSessionAuthority,
+  makeSessionRecoveryRecord,
 
   releaseSessionTabs,
   releaseTab,
   sessionOwnsGroup,
   sessionOwnsTab,
   sessionTabIds,
+  validateSessionRecoveryRecord,
 } from "./session-core.js";
 
 describe("Native Messaging session ownership", () => {
@@ -80,9 +82,11 @@ describe("popup approval authority", () => {
     controllerName: "Local controller",
     taskLabel: "Research",
     capabilities: ["cdp"],
+    access: { level: "selectedTabs", tabIds: [42], domains: [] },
     createdAt: 1_000,
     expiresAt: 61_000,
     state: "pending",
+    route: { kind: "local", endpointId: "endpoint-a", controllerPrincipalId: "sha256/controller", routePolicy: "localOnly", accessCeiling: { level: "selectedTabs", tabIds: [42], domains: [] }, hubId: null, routeId: null, streamId: null },
   };
 
   it("permits only the exact approved pending record to become active", () => {
@@ -96,13 +100,39 @@ describe("popup approval authority", () => {
       { controllerName: "Other controller" },
       { taskLabel: "Other task" },
       { capabilities: [] },
+      { access: { level: "selectedTabs", tabIds: [43], domains: [] } },
       { createdAt: 2_000 },
       { expiresAt: 62_000 },
+      { route: { kind: "local", endpointId: "endpoint-b", routePolicy: "localOnly" } },
     ]) {
       expect(matchesSessionAuthority(pending, { ...pending, ...replacement, state: "active" })).toBe(false);
     }
     expect(matchesSessionAuthority(pending, { ...pending, state: "pending" })).toBe(false);
     expect(matchesSessionAuthority({ ...pending, state: "active" }, { ...pending, state: "active" })).toBe(false);
+  });
+
+  it("restores only an exact locally persisted authority and ownership record", () => {
+    const active = { ...pending, state: "active" };
+    const reconnecting = { ...pending, state: "reconnecting" };
+    const record = makeSessionRecoveryRecord(active, 7, 11, [42]);
+    expect(record).toEqual({
+      version: 1,
+      session: active,
+      groupId: 7,
+      anchorId: 11,
+      tabIds: [42],
+    });
+    expect(validateSessionRecoveryRecord(record, reconnecting)).toEqual(record);
+    const storageOrderedActive = {
+      ...active,
+      access: { domains: [], level: "selectedTabs", tabIds: [42] },
+      route: { accessCeiling: { domains: [], level: "selectedTabs", tabIds: [42] }, controllerPrincipalId: "sha256/controller", endpointId: "endpoint-a", hubId: null, kind: "local", routeId: null, routePolicy: "localOnly", streamId: null },
+    };
+    const storageOrderedRecord = makeSessionRecoveryRecord(storageOrderedActive, 7, 11, [42]);
+    expect(validateSessionRecoveryRecord(storageOrderedRecord, reconnecting)).not.toBeNull();
+    expect(validateSessionRecoveryRecord(record, { ...reconnecting, taskLabel: "Substituted" })).toBeNull();
+    expect(validateSessionRecoveryRecord({ ...record, tabIds: [42, 42] }, reconnecting)).toBeNull();
+    expect(validateSessionRecoveryRecord({ ...record, extra: true }, reconnecting)).toBeNull();
   });
 });
 
