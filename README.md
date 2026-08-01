@@ -17,7 +17,7 @@ Launching a browser with `--remote-debugging-port` exposes a broad automation su
 
 The immediate motivation was finding a narrow, user-consented way to expose an existing Brave session to [Hermes](https://github.com/NousResearch/hermes-agent) through its `BROWSER_CDP_URL` interface. The bridge itself is intentionally agent-agnostic: any compatible CDP client can use the authenticated loopback endpoint.
 
-## How it fits together
+## How the accepted local path fits together
 
 ```mermaid
 flowchart LR
@@ -27,7 +27,7 @@ flowchart LR
   U((Browser user)) -->|pair · approve · revoke| E
 ```
 
-The companion is installed as a Chromium Native Messaging host. The extension and companion authenticate and pin each other's device identity. For each approved task, the companion starts a token-protected loopback relay and injects its short-lived `BROWSER_CDP_URL` only into the launched child process.
+The companion is installed as a Chromium Native Messaging host. The extension and companion authenticate and pin each other's device identity. For each approved task, the companion starts a token-protected, session-scoped loopback relay and injects its `BROWSER_CDP_URL` only into the launched child process.
 
 The extension remains the authority for browser access. It owns the visible consent UI, tab groups, target filtering, and immediate revocation. Agent Tab Bridge does not import the browser profile's cookie store or expose a reusable browser-wide debugging endpoint; after a tab is shared, its page content and page-accessible state are available through CDP.
 
@@ -36,23 +36,39 @@ The extension remains the authority for browser access. It owns the visible cons
 > [!WARNING]
 > This is an early, source-only prototype. The CLI, Native Messaging protocol, and installation layout may change without migration support. Use a disposable browser profile until you have reviewed the code and consent model.
 
-Working today:
+The labels below distinguish code existence from proof. **Live-accepted** means the milestone scenario has been exercised end to end in a real browser. **Automated** means the repository suite covers the stated contracts. Neither label is an external security audit or a claim of exhaustive testing.
 
-- Trusted same-machine operation with an authenticated Native Messaging companion and an ephemeral relay bound only to `127.0.0.1`.
-- Browser-local approval for selected tabs, approved domains, or full website access; full access still requires tabs to enter the session's visible group.
-- Named sessions, separately approved access upgrades, session-aware tab inventory, ownership conflict detection, and explicit revocation.
-- Live end-to-end acceptance in Brave, plus automated protocol, relay, authorization, and extension-UI coverage.
-- Bounded endpoint recovery for extension reloads and transient Native Messaging loss: the same pinned browser identity resumes the same loopback CDP URL without re-approval, while expiry or identity changes fail closed.
+### Live-accepted local path
 
-Not yet provided:
+- Same-machine operation: authenticated extension/companion identity, loopback-only ephemeral CDP relays, browser-local approval, visible session groups, and immediate tab/session revocation.
+- Selected-tab, listed-domain, and full-access sessions; separately approved monotonic access upgrades; named principals and sessions; standing grants; tab ownership isolation; and explicit cleanup.
+- Concurrent Brave and Chrome-for-Testing endpoints on one machine, including refusal to guess when CLI endpoint selection is ambiguous.
+- Bounded recovery from extension reload or transient Native Messaging loss. The same pinned browser identity resumes the same relay URL without re-approval.
+- Full browser quit. Active session authority, debugger attachments, ephemeral relay credentials, and session groups are removed. Paired-companion trust, enrolled profiles, and standing grants persist.
 
+These paths also have automated protocol, authentication, authorization, relay, supervisor, recovery, and extension-core coverage through `npm test`, including fail-closed rejection of identity changes and grace expiry.
+
+### Implemented; live acceptance pending
+
+The optional home-mesh path is present in the codebase and covered by automated tests and findings-only security review gates, but its human and multi-machine milestone proofs have not been completed:
+
+- PAKE/TLS machine-to-hub pairing, pinned endpoint presence, enable/disable, and unpairing.
+- Zero-authority hub routing, remote profile enrollment and session requests, browser-owned remote consent, and routed session addressing.
+- End-to-end encrypted routed broker/CDP channels and the loopback harness connector.
+- Profile/endpoint/hub/device revocation fan-out, hub-loss degradation, and local-session continuity during remote failure.
+
+Pending live evidence includes the two-machine pairing ceremony, remote enrollment and decline flows, a real remote CDP session with tab-drag revocation, and the final three-machine hub-loss and LAN-listener checks. Until those pass, mesh operation is experimental rather than a supported path.
+
+### Explicitly not provided
+
+- Preservation of active sessions across a full browser or companion process restart. Persistent device/profile trust survives; active session authority does not.
+- Bookmark or history APIs, managed actions, or Guardian Auto.
 - A packaged, signed, notarized, npm, or browser-store release.
 - A stable public CLI/protocol or migration support for stored identities.
+- Full acceptance on regular Google Chrome; current Chrome acceptance uses Chrome-for-Testing.
 - An external security audit or a claim that the prototype is safe for unattended use.
-- Full acceptance on regular Google Chrome; current Chrome coverage uses Chrome-for-Testing.
-- Session preservation across full browser or companion process restarts, trusted-LAN operation, bookmarks/history access, managed actions, or Guardian Auto. A full browser quit revokes sessions and removes their groups.
 
-See [`ROADMAP.md`](ROADMAP.md) for implemented boundaries, remaining hardening, and later capability work.
+See [`MILESTONES.md`](MILESTONES.md) for the binary acceptance gates, [`ARCHITECTURE.md`](ARCHITECTURE.md) for trust boundaries, and [`ROADMAP.md`](ROADMAP.md) for later capability work.
 
 ## Developer build and install
 
@@ -140,7 +156,7 @@ node dist/src/atb.js claim-tab --session research --tab 311
 
 The all-tabs inventory labels each tab's `ownership` as `unclaimed`, `currentSession`, or `otherSession` and its `claimability` as `claimable`, `approvalRequired`, `alreadyShared`, or `blocked`. It does not reveal another session's identity. `--scope session` returns only tabs already in the named session. `claim-tab` succeeds without another prompt only when the session's existing selected-tab, domain, or full-access grant authorizes that tab; otherwise request and approve an access upgrade first.
 
-Every upgrade is separately displayed and approved or declined in the popup. Access can expand from selected tabs to requested sites to full access, but never silently narrows or broadens. `atb run` injects the ephemeral `BROWSER_CDP_URL` only into a launched child process. Browser loss, session revocation, tab-group removal, or debugger detachment removes the corresponding authority.
+Every upgrade is separately displayed and approved or declined in the popup. Access can expand from selected tabs to requested sites to full access, but never silently narrows or broadens. `atb run` injects the ephemeral `BROWSER_CDP_URL` only into a launched child process. Transient extension or Native Messaging loss suspends control during the bounded recovery grace. Explicit revocation, full browser quit, tab-group removal, or debugger detachment removes the corresponding authority.
 
 A long-running harness that cannot be launched as a child of `atb run` (a persistent Hermes or omp process) can attach to a named session instead. Open and approve the session once, then request its live relay URL explicitly:
 
@@ -149,7 +165,7 @@ node dist/src/atb.js open --session research --label "Research task" --domain ex
 node dist/src/atb.js url --session research
 ```
 
-`atb url` prints the session's loopback `ws://127.0.0.1:...` endpoint exactly once per invocation for the operator to paste into the harness (Hermes `/browser connect` or `browser.cdp_url`; omp `browser.cdpUrl`). The URL is session-scoped and ephemeral: atb never writes it to disk, it stops working the moment the session is revoked or closed, and a new relay means a new URL. Do not persist it in configuration files or logs.
+`atb url` prints the session's loopback `ws://127.0.0.1:...` endpoint exactly once per invocation for the operator to paste into the harness (Hermes `/browser connect` or `browser.cdp_url`; omp `browser.cdpUrl`). The URL is session-scoped and ephemeral: atb never writes it to disk, it stops working when the session is revoked or closed, and a later session or replacement relay receives a new URL. Bounded recovery of the same relay deliberately preserves its URL. Do not persist it in configuration files or logs.
 
 ## Agent profiles
 
