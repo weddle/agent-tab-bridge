@@ -62,6 +62,10 @@ describe("native protocol validation", () => {
     expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: "req-1", enrollmentId: "enroll-1", ok: false, error: "incorrect code", unexpected: 1 })).toBe(false);
     expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "revokeProfile", requestId: "req-2", profileName: "hermes-research" })).toBe(true);
     expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "revokeProfile", requestId: "req-2", profileName: "bad/name" })).toBe(false);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "setHubEnabled", requestId: "hub-1", enabled: true })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "setHubEnabled", requestId: "hub-1", enabled: "yes" })).toBe(false);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "forgetHub", requestId: "hub-2" })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "forgetHub", requestId: "hub-2", enabled: false })).toBe(false);
     const snapshot = { version: NATIVE_PROTOCOL_VERSION, type: "snapshot", pending: [], active: [], reconnecting: [], sharedTabs: [], pendingAccess: [] } as const;
     expect(validateNativeMessage(snapshot)).toBe(true);
     expect(validateNativeMessage({ ...snapshot, reconnecting: [session({ state: "reconnecting" })] })).toBe(true);
@@ -69,5 +73,13 @@ describe("native protocol validation", () => {
     expect(validateNativeMessage({ ...snapshot, active: [session({ state: "reconnecting" })] })).toBe(false);
     expect(validateNativeMessage({ ...snapshot, enrolledProfiles: [{ name: "hermes-research", principalId: "sha256/abc", enrolledAt: 10 }] })).toBe(true);
     expect(validateNativeMessage({ ...snapshot, enrolledProfiles: [{ name: "hermes-research", principalId: "not-a-fingerprint", enrolledAt: 10 }] })).toBe(false);
+    const hub = { fingerprint: "sha256/hub-key", enabled: false, connectionState: "connected" } as const;
+    expect(validateNativeMessage({ ...snapshot, hub })).toBe(true);
+    expect(validateNativeMessage({ ...snapshot, hub: { ...hub, connectionState: "online" } })).toBe(false);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "hubResult", requestId: "hub-1", ok: true, hub: { ...hub, enabled: true } })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "hubResult", requestId: "hub-1", ok: true, hub: { ...hub, extra: true } })).toBe(false);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "hubState", hub })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "hubState", hub: null })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "hubState", hub: { ...hub, enabled: "yes" } })).toBe(false);
   });
 });

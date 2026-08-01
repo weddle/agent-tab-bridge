@@ -19,6 +19,7 @@ import { routedChannelContext } from "./channel/context.js";
 import { SecureChannelTransportAdapter, connectTransports } from "./transport-adapter.js";
 import type { RoutedBrokerAddress } from "../hub/routing.js";
 import type { NativeEndpointRecovery } from "./endpoint-recovery.js";
+import { NATIVE_PROTOCOL_VERSION, type NativeHubStatus } from "./native-protocol.js";
 import { ENDPOINT_RECOVERY_GRACE_MS } from "./endpoint-contracts.js";
 import type { TaskSessionRelay } from "./task-sessions.js";
 
@@ -274,6 +275,9 @@ export class EdgeSupervisor {
       onEndpointReady: async (identity, broker, recovery) => await this.endpointReady(identity, broker, recovery, generation),
       onEndpointSuspended: async (recovery) => await this.endpointSuspended(recovery, generation),
       onEndpointClosed: async (endpointId, broker) => await this.endpointClosed(endpointId, broker, generation),
+      hubStatus: async (endpointId) => await this.nativeHubStatus(endpointId),
+      setHubEnabled: async (endpointId, enabled) => await this.setHubEnabled(endpointId, enabled),
+      forgetHub: async () => await this.forgetHub(),
     }).catch(() => {}).finally(() => {
       this.endpointRuns.delete(run);
       this.shims.delete(socket);
@@ -356,7 +360,55 @@ export class EdgeSupervisor {
     if (this.hubSocket) await this.hubPairing.pushPresence(this.hubSocket).catch(() => undefined);
   }
 
-  /** Terminates a routed profile-auth stream and begins only explicit remote enrollments at its selected edge. */
+  private async nativeHubStatus(endpointId: string): Promise<NativeHubStatus | null> {
+    const state = await this.hubPairing.store.load();
+    if (!state) return null;
+    const connectionState = this.hubSocket
+      ? "connected"
+      : this.hubReconnectTimer || this.hubReconnectInFlight
+        ? "connecting"
+        : "unreachable";
+    return {
+      fingerprint: state.pairing.pinnedPeerKey.fingerprint,
+      enabled: state.enabledEndpointIds.includes(endpointId),
+      connectionState,
+    };
+  }
+
+  private async publishHubState(): Promise<void> {
+    await Promise.all([...this.endpoints.values()].map(async ({ endpoint, recovery }) => {
+      if (!recovery.binding.send) return;
+      const hub = await this.nativeHubStatus(endpoint.endpointId);
+      await recovery.binding.send({ version: NATIVE_PROTOCOL_VERSION, type: "hubState", hub });
+    }));
+  }
+
+  private async setHubEnabled(endpointId: string, enabled: boolean): Promise<NativeHubStatus | null> {
+    const state = await this.hubPairing.store.setEndpointEnabled(endpointId, enabled);
+    if (!state) return null;
+    this.hubId = state.pairing.pinnedPeerKey.principalId;
+    if (this.hubSocket) {
+      await this.hubPairing.pushPresence(this.hubSocket);
+    } else {
+      await this.connectHub().catch(() => this.scheduleHubReconnect());
+    }
+    return await this.nativeHubStatus(endpointId);
+  }
+
+  private async forgetHub(): Promise<void> {
+    this.hubId = undefined;
+    clearTimeout(this.hubReconnectTimer);
+    this.hubReconnectTimer = undefined;
+    this.hubRoutes?.close();
+    this.hubRoutes = undefined;
+    this.hubSocket?.destroy();
+    this.hubSocket = undefined;
+    await this.hubPairing.unpair();
+    await Promise.all([...this.endpoints.values(), ...this.suspendedEndpoints.values()].map(async ({ broker }) => await broker.revokeRoutedSessions()));
+    emit(this.options.onEvent, { type: "hubDisconnected" });
+    await this.publishHubState();
+  }
+
   private async connectHub(): Promise<void> {
     if (this.closing || !this.hubId || this.hubSocket) return;
     const routes = await this.hubPairing.connectRoutes((stream, address) => this.routeHubBroker(stream, address));
@@ -366,6 +418,7 @@ export class EdgeSupervisor {
     this.hubSocket = socket;
     socket.once("close", () => { void this.handleHubDisconnected(socket); });
     emit(this.options.onEvent, { type: "hubConnected" });
+    await this.publishHubState();
   }
 
   private async handleHubDisconnected(socket: TLSSocket): Promise<void> {
@@ -375,6 +428,7 @@ export class EdgeSupervisor {
     await Promise.all([...this.endpoints.values(), ...this.suspendedEndpoints.values()].map(async ({ broker }) => await broker.revokeRoutedSessions()));
     emit(this.options.onEvent, { type: "hubDisconnected" });
     this.scheduleHubReconnect();
+    await this.publishHubState();
   }
 
   private scheduleHubReconnect(): void {

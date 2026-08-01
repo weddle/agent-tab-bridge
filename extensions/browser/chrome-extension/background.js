@@ -77,8 +77,12 @@ const approvedAccessRequests = new Map();
 const enrollmentRequests = new Map();
 /** In-flight enrollment confirmations awaiting the host's result, keyed by requestId. */
 const pendingEnrollConfirms = new Map();
+/** In-flight hub mutations awaiting the authenticated companion's result. */
+const pendingHubMutations = new Map();
 /** Enrolled agent profiles reported by the companion's latest snapshot. */
 let enrolledProfiles = [];
+/** Paired hub state reported by the companion for this browser endpoint. */
+let pairedHub = null;
 /**
  * Standing grants: auto-approve a NEW session from an enrolled profile up to
  * the remembered level. Full access is never remembered, and access upgrades
@@ -167,6 +171,11 @@ function newRequestId() {
 
 function validId(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 256;
+}
+function normalizeHub(value) {
+  if (!value || typeof value !== "object" || !validId(value.fingerprint) || typeof value.enabled !== "boolean") return null;
+  if (!["connected", "connecting", "unreachable", "off"].includes(value.connectionState)) return null;
+  return { fingerprint: value.fingerprint, enabled: value.enabled, connectionState: value.connectionState };
 }
 
 function validRoute(value) {
@@ -922,6 +931,7 @@ async function handleNativeSnapshot(message) {
   enrolledProfiles = (Array.isArray(message.enrolledProfiles) ? message.enrolledProfiles : [])
     .filter((profile) => !!profile && typeof profile === "object" && validId(profile.name) && validId(profile.principalId) && Number.isInteger(profile.enrolledAt))
     .map(({ name, principalId, enrolledAt }) => ({ name, principalId, enrolledAt }));
+  pairedHub = message.hub === null || message.hub === undefined ? null : normalizeHub(message.hub);
   const rawSessions = [
     ...(Array.isArray(message.pending) ? message.pending : []),
     ...(Array.isArray(message.active) ? message.active : []),
@@ -1256,6 +1266,22 @@ async function handleNativeMessage(message, port, generation) {
       refreshBadge();
       return;
     }
+    case "hubResult": {
+      const waiting = typeof message.requestId === "string" ? pendingHubMutations.get(message.requestId) : undefined;
+      if (!waiting) return;
+      pendingHubMutations.delete(message.requestId);
+      const nextHub = message.hub === null ? null : normalizeHub(message.hub);
+      if (message.ok === true && (message.hub === null || nextHub)) pairedHub = nextHub;
+      waiting.resolve({ ok: message.ok === true && (message.hub === null || !!nextHub), error: typeof message.error === "string" ? message.error : undefined });
+      return;
+    }
+    case "hubState":
+      if (message.hub === null) pairedHub = null;
+      else {
+        const nextHub = normalizeHub(message.hub);
+        if (nextHub) pairedHub = nextHub;
+      }
+      return;
     default:
       return;
   }
@@ -1294,6 +1320,8 @@ async function handleNativeDisconnect(port, generation) {
     enrollmentRequests.clear();
     for (const pending of pendingEnrollConfirms.values()) pending.resolve({ ok: false, error: "companion disconnected" });
     pendingEnrollConfirms.clear();
+    for (const pending of pendingHubMutations.values()) pending.resolve({ ok: false, error: "companion disconnected" });
+    pendingHubMutations.clear();
     refreshBadge();
     scheduleNativeReconnect();
   }
@@ -2117,6 +2145,9 @@ async function forgetCompanion() {
   enrollmentRequests.clear();
   for (const pending of pendingEnrollConfirms.values()) pending.resolve({ ok: false, error: "companion disconnected" });
   pendingEnrollConfirms.clear();
+  for (const pending of pendingHubMutations.values()) pending.resolve({ ok: false, error: "companion disconnected" });
+  pendingHubMutations.clear();
+  pairedHub = null;
   pendingHello = null;
   trustedCompanion = null;
   nativeState = "disconnected";
@@ -2141,6 +2172,24 @@ async function forgetCompanion() {
     throw firstError;
   }
 }
+async function requestHubMutation(type, fields = {}) {
+  const requestId = newRequestId();
+  const outcome = new Promise((resolve) => {
+    pendingHubMutations.set(requestId, { resolve });
+    setTimeout(() => {
+      if (pendingHubMutations.delete(requestId)) resolve({ ok: false, error: "companion did not answer" });
+    }, 5_000);
+  });
+  try {
+    postNative({ version: PROTOCOL_VERSION, type, requestId, ...fields });
+  } catch (error) {
+    pendingHubMutations.delete(requestId);
+    throw error;
+  }
+  const result = await outcome;
+  if (!result.ok) throw new Error(result.error ?? "hub mutation failed");
+}
+
 
 async function statusDto() {
   await standingGrantsReady;
@@ -2186,6 +2235,7 @@ async function statusDto() {
     enrolledProfiles: enrolledProfiles.map((profile) => ({ ...profile, id: profile.principalId })),
     standingGrants: standingGrants.map((grant) => ({ ...grant, id: grant.controllerId, level: grant.route.accessCeiling.level, domains: [...grant.route.accessCeiling.domains], route: { ...grant.route, accessCeiling: { ...grant.route.accessCeiling, tabIds: [...grant.route.accessCeiling.tabIds], domains: [...grant.route.accessCeiling.domains] } } })),
     sharedTabs: await sharedTabsDto(),
+    hub: pairedHub ? { ...pairedHub } : null,
   };
 }
 
@@ -2208,6 +2258,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return;
       case "forgetCompanion":
         await forgetCompanion();
+        sendResponse({ ok: true });
+        return;
+      case "setHubEnabled":
+        if (!pairedHub) throw new Error("This machine is not paired with a home hub.");
+        if (typeof message.enabled !== "boolean") throw new Error("The home hub setting is invalid.");
+        await requestHubMutation("setHubEnabled", { enabled: message.enabled });
+        sendResponse({ ok: true });
+        return;
+      case "forgetHub":
+        if (!pairedHub) throw new Error("This machine is not paired with a home hub.");
+        await requestHubMutation("forgetHub");
         sendResponse({ ok: true });
         return;
       case "approveSession": {

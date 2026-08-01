@@ -30,6 +30,7 @@ export type TabOwnership = "unclaimed" | "currentSession" | "otherSession";
 export type TabClaimability = "alreadyShared" | "claimable" | "approvalRequired" | "blocked";
 export interface SharedTabRecord { tabId: number; title: string; url: string; ownership: TabOwnership; claimability: TabClaimability; }
 export interface EnrolledProfileRecord { name: string; principalId: string; enrolledAt: number; }
+export interface NativeHubStatus { fingerprint: string; enabled: boolean; connectionState: "connected" | "connecting" | "unreachable" | "off"; }
 export interface AccessUpgradeRecord {
   id: string;
   sessionId: string;
@@ -65,6 +66,8 @@ export interface TabClaimedMessage { version: typeof NATIVE_PROTOCOL_VERSION; ty
 export interface ApproveAccessMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "approveAccess"; requestId?: string; accessRequestId: string; sessionId: string; requestedAccess: SessionAccess; }
 export interface DeclineAccessMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "declineAccess"; requestId?: string; accessRequestId: string; sessionId: string; }
 
+export interface SetHubEnabledMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "setHubEnabled"; requestId: string; enabled: boolean; }
+export interface ForgetHubMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "forgetHub"; requestId: string; }
 export interface RelayReadyMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "relayReady"; requestId?: string; sessionId: string; relayUrl: string; }
 export interface RelayFailedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "relayFailed"; requestId?: string; sessionId: string; error: string; }
 export interface TrustedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "trusted"; requestId?: string; companionPrincipalId: string; extensionFingerprint: string; }
@@ -78,6 +81,7 @@ export interface SnapshotMessage {
   sharedTabs: SharedTabRecord[];
   pendingAccess: AccessUpgradeRecord[];
   enrolledProfiles?: EnrolledProfileRecord[];
+  hub?: NativeHubStatus | null;
 }
 export interface SessionPendingMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionPending"; requestId?: string; session: SessionRecord; }
 export interface SessionStartedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionStarted"; requestId?: string; session: SessionRecord; relayUrl?: string; }
@@ -90,10 +94,12 @@ export interface EnrollPendingMessage { version: typeof NATIVE_PROTOCOL_VERSION;
 export interface ConfirmEnrollmentMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "confirmEnrollment"; requestId: string; enrollmentId: string; code: string; }
 export interface EnrollResultMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "enrollResult"; requestId: string; enrollmentId: string; ok: boolean; profileName?: string; error?: string; }
 export interface RevokeProfileMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "revokeProfile"; requestId: string; profileName: string; }
+export interface HubResultMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "hubResult"; requestId: string; ok: boolean; hub?: NativeHubStatus | null; error?: string; }
+export interface HubStateMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "hubState"; hub: NativeHubStatus | null; }
 
-export type ExtensionToHostMessage = HelloMessage | HelloProofMessage | ApproveSessionMessage | RevokeSessionMessage | RevokeDeviceMessage | RelayReadyMessage | RelayFailedMessage | TabsListedMessage | TabClaimedMessage | ApproveAccessMessage | DeclineAccessMessage | ConfirmEnrollmentMessage | RevokeProfileMessage;
+export type ExtensionToHostMessage = HelloMessage | HelloProofMessage | ApproveSessionMessage | RevokeSessionMessage | RevokeDeviceMessage | RelayReadyMessage | RelayFailedMessage | TabsListedMessage | TabClaimedMessage | ApproveAccessMessage | DeclineAccessMessage | ConfirmEnrollmentMessage | RevokeProfileMessage | SetHubEnabledMessage | ForgetHubMessage;
 
-export type HostToExtensionMessage = HelloChallengeMessage | TrustedMessage | SnapshotMessage | SessionPendingMessage | SessionStartedMessage | SessionResumingMessage | SessionStoppedMessage | ListTabsMessage | ClaimTabMessage | AccessPendingMessage | AccessUpdatedMessage | AccessDeclinedMessage | EnrollPendingMessage | EnrollResultMessage;
+export type HostToExtensionMessage = HelloChallengeMessage | TrustedMessage | SnapshotMessage | SessionPendingMessage | SessionStartedMessage | SessionResumingMessage | SessionStoppedMessage | ListTabsMessage | ClaimTabMessage | AccessPendingMessage | AccessUpdatedMessage | AccessDeclinedMessage | EnrollPendingMessage | EnrollResultMessage | HubResultMessage | HubStateMessage;
 export type NativeMessage = ExtensionToHostMessage | HostToExtensionMessage;
 
 export interface HandshakeTranscript {
@@ -132,6 +138,7 @@ export function validateSessionApproval(value: unknown): value is SessionApprova
 }
 function validateSharedTab(value: unknown): value is SharedTabRecord { return isRecord(value) && keysExactly(value, ["tabId", "title", "url", "ownership", "claimability"]) && isInteger(value.tabId) && value.tabId >= 0 && isString(value.title, 4096) && isString(value.url, 8192) && (value.ownership === "unclaimed" || value.ownership === "currentSession" || value.ownership === "otherSession") && (value.claimability === "alreadyShared" || value.claimability === "claimable" || value.claimability === "approvalRequired" || value.claimability === "blocked"); }
 function validateEnrolledProfile(value: unknown): value is EnrolledProfileRecord { return isRecord(value) && keysExactly(value, ["name", "principalId", "enrolledAt"]) && validId(value.name, 64) && validPrincipalId(value.principalId) && isInteger(value.enrolledAt); }
+function validateHubStatus(value: unknown): value is NativeHubStatus { return isRecord(value) && keysExactly(value, ["fingerprint", "enabled", "connectionState"]) && validPrincipalId(value.fingerprint) && typeof value.enabled === "boolean" && (value.connectionState === "connected" || value.connectionState === "connecting" || value.connectionState === "unreachable" || value.connectionState === "off"); }
 function validateAccessUpgrade(value: unknown): value is AccessUpgradeRecord {
   return isRecord(value) &&
     keysExactly(value, ["id", "sessionId", "delta", "requestedAccess", "createdAt"]) &&
@@ -165,7 +172,7 @@ export function validateNativeMessage(value: unknown): value is NativeMessage {
     case "accessUpdated": return hasVersionAndType(value, "accessUpdated", ["accessRequestId", "session"]) && validId(value.accessRequestId) && validateSessionRecord(value.session);
     case "accessDeclined": return hasVersionAndType(value, "accessDeclined", ["accessRequestId", "sessionId"]) && validId(value.accessRequestId) && validId(value.sessionId);
     case "snapshot":
-      return hasVersionAndType(value, "snapshot", ["pending", "active", "reconnecting", "sharedTabs", "pendingAccess"], ["enrolledProfiles"]) &&
+      return hasVersionAndType(value, "snapshot", ["pending", "active", "reconnecting", "sharedTabs", "pendingAccess"], ["enrolledProfiles", "hub"]) &&
         Array.isArray(value.pending) &&
         Array.isArray(value.active) &&
         Array.isArray(value.reconnecting) &&
@@ -179,7 +186,8 @@ export function validateNativeMessage(value: unknown): value is NativeMessage {
         (value.enrolledProfiles === undefined ||
           (Array.isArray(value.enrolledProfiles) &&
             value.enrolledProfiles.length <= 1000 &&
-            value.enrolledProfiles.every(validateEnrolledProfile)));
+            value.enrolledProfiles.every(validateEnrolledProfile))) &&
+        (value.hub === undefined || value.hub === null || validateHubStatus(value.hub));
     case "relayReady": return hasVersionAndType(value, "relayReady", ["sessionId", "relayUrl"]) && validId(value.sessionId) && isString(value.relayUrl, 8192) && /^ws:\/\/127\.0\.0\.1(?::\d+)?\//.test(value.relayUrl);
     case "relayFailed": return hasVersionAndType(value, "relayFailed", ["sessionId", "error"]) && validId(value.sessionId) && isString(value.error, 512);
     case "trusted": return hasVersionAndType(value, "trusted", ["companionPrincipalId", "extensionFingerprint"]) && validPrincipalId(value.companionPrincipalId) && validPrincipalId(value.extensionFingerprint);
@@ -191,6 +199,10 @@ export function validateNativeMessage(value: unknown): value is NativeMessage {
     case "confirmEnrollment": return hasVersionAndType(value, "confirmEnrollment", ["enrollmentId", "code"]) && typeof value.requestId === "string" && validId(value.enrollmentId) && isString(value.code, 16) && /^\d{6}$/.test(value.code);
     case "enrollResult": return hasVersionAndType(value, "enrollResult", ["enrollmentId", "ok"], ["profileName", "error"]) && typeof value.requestId === "string" && validId(value.enrollmentId) && typeof value.ok === "boolean" && (value.profileName === undefined || validId(value.profileName, 64)) && (value.error === undefined || isString(value.error, 512));
     case "revokeProfile": return hasVersionAndType(value, "revokeProfile", ["profileName"]) && typeof value.requestId === "string" && validId(value.profileName, 64);
+    case "setHubEnabled": return hasVersionAndType(value, "setHubEnabled", ["enabled"]) && typeof value.requestId === "string" && typeof value.enabled === "boolean";
+    case "forgetHub": return hasVersionAndType(value, "forgetHub", []) && typeof value.requestId === "string";
+    case "hubResult": return hasVersionAndType(value, "hubResult", ["ok"], ["hub", "error"]) && typeof value.requestId === "string" && typeof value.ok === "boolean" && (value.hub === undefined || value.hub === null || validateHubStatus(value.hub)) && (value.error === undefined || isString(value.error, 512));
+    case "hubState": return hasVersionAndType(value, "hubState", ["hub"]) && (value.hub === null || validateHubStatus(value.hub));
     default: return false;
   }
 }

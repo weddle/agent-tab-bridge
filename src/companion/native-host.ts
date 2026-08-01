@@ -4,7 +4,7 @@ import { startAgentTabRelay } from "../../extensions/browser/src/browser/extensi
 import { BrokerServer, startBrokerServer } from "./broker.js";
 import { deriveControllerPrincipalId, fingerprintSpki, HostIdentityHandshake, IdentityStore, createBrokerSecret } from "./identity.js";
 import { NativeMessageDecoder, writeNativeFrame } from "./native-framing.js";
-import { NATIVE_PROTOCOL_VERSION, type AccessUpgradeRecord, type ExtensionToHostMessage, type HostToExtensionMessage, type NativeMessage, type SharedTabRecord } from "./native-protocol.js";
+import { NATIVE_PROTOCOL_VERSION, type AccessUpgradeRecord, type ExtensionToHostMessage, type HostToExtensionMessage, type NativeHubStatus, type NativeMessage, type SharedTabRecord } from "./native-protocol.js";
 import { CompanionStateStore, type PinnedExtensionIdentity } from "./state.js";
 import { TaskSessionError, TaskSessionManager, type TaskSessionRelay } from "./task-sessions.js";
 import { sameSessionAccess, type SessionAccessDelta } from "./session-access.js";
@@ -24,6 +24,9 @@ export type NativeHostOptions = {
   onEndpointSuspended?: (recovery: NativeEndpointRecovery) => boolean | Promise<boolean>;
   onEndpointClosed?: (endpointId: string, broker: BrokerServer | null) => void | Promise<void>;
   onProfileEnrolled?: (record: Readonly<{ endpointId: string; profileName: string; principalId: string; publicKeySpki: string; enrolledAt: number }>) => void | Promise<void>;
+  hubStatus?: (endpointId: string) => NativeHubStatus | null | Promise<NativeHubStatus | null>;
+  setHubEnabled?: (endpointId: string, enabled: boolean) => NativeHubStatus | null | Promise<NativeHubStatus | null>;
+  forgetHub?: () => void | Promise<void>;
 };
 class NativeOutputFailure extends Error { constructor(cause: unknown) { super(`native messaging output failed: ${cause instanceof Error ? cause.message : String(cause)}`); this.name = "NativeOutputFailure"; } }
 
@@ -248,6 +251,7 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
     const all = manager.snapshot().map((session) => ({ ...session, requestedCapabilities: [...session.requestedCapabilities], access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] }, route: { ...session.route, accessCeiling: { ...session.route.accessCeiling, tabIds: [...session.route.accessCeiling.tabIds], domains: [...session.route.accessCeiling.domains] } } }));
     const current = await stateStore.load();
     const enrolledProfiles = current.machine.enrollments.map(({ name, principalId, enrolledAt }) => ({ name, principalId, enrolledAt }));
+    const hub = endpointId && options.hubStatus ? await options.hubStatus(endpointId) : undefined;
     await send({
       version: NATIVE_PROTOCOL_VERSION,
       type: "snapshot",
@@ -257,6 +261,7 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
       sharedTabs: [],
       pendingAccess: [...pendingAccess.values()],
       enrolledProfiles,
+      ...(hub === undefined ? {} : { hub }),
     });
     for (const session of all.filter(({ state }) => state === "reconnecting")) {
       const relayUrl = manager.pairingUrl(session.id);
@@ -392,6 +397,33 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
             await Promise.allSettled(sessionManager().snapshot().filter((session) => session.controllerPrincipalId === record.principalId && session.state !== "revoked").map(async (session) => await sessionManager().revoke(session.id, "profileRevoked")));
           }
           await snapshot();
+          return;
+        }
+        if (message.type === "setHubEnabled") {
+          if (!endpointId || !options.setHubEnabled) {
+            await send({ version: NATIVE_PROTOCOL_VERSION, type: "hubResult", requestId: message.requestId, ok: false, error: "hub controls are unavailable" });
+            return;
+          }
+          try {
+            const hub = await options.setHubEnabled(endpointId, message.enabled);
+            if (!hub) throw new Error("this machine is not paired with a hub");
+            await send({ version: NATIVE_PROTOCOL_VERSION, type: "hubResult", requestId: message.requestId, ok: true, hub });
+          } catch (error) {
+            await send({ version: NATIVE_PROTOCOL_VERSION, type: "hubResult", requestId: message.requestId, ok: false, error: error instanceof Error ? error.message : String(error) });
+          }
+          return;
+        }
+        if (message.type === "forgetHub") {
+          if (!options.forgetHub) {
+            await send({ version: NATIVE_PROTOCOL_VERSION, type: "hubResult", requestId: message.requestId, ok: false, error: "hub controls are unavailable" });
+            return;
+          }
+          try {
+            await options.forgetHub();
+            await send({ version: NATIVE_PROTOCOL_VERSION, type: "hubResult", requestId: message.requestId, ok: true, hub: null });
+          } catch (error) {
+            await send({ version: NATIVE_PROTOCOL_VERSION, type: "hubResult", requestId: message.requestId, ok: false, error: error instanceof Error ? error.message : String(error) });
+          }
           return;
         }
         if (message.type === "revokeSession" && sessionManager().get(message.sessionId)) { await sessionManager().revoke(message.sessionId, message.reason ?? "browserRevoked"); return; }

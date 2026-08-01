@@ -38,26 +38,26 @@ The extension remains the authority for browser access. It owns the visible cons
 
 The labels below distinguish code existence from proof. **Live-accepted** means the milestone scenario has been exercised end to end in a real browser. **Automated** means the repository suite covers the stated contracts. Neither label is an external security audit or a claim of exhaustive testing.
 
-### Live-accepted local path
+### Live-accepted paths
 
 - Same-machine operation: authenticated extension/companion identity, loopback-only ephemeral CDP relays, browser-local approval, visible session groups, and immediate tab/session revocation.
 - Selected-tab, listed-domain, and full-access sessions; separately approved monotonic access upgrades; named principals and sessions; standing grants; tab ownership isolation; and explicit cleanup.
 - Concurrent Brave and Chrome-for-Testing endpoints on one machine, including refusal to guess when CLI endpoint selection is ambiguous.
 - Bounded recovery from extension reload or transient Native Messaging loss. The same pinned browser identity resumes the same relay URL without re-approval.
 - Full browser quit. Active session authority, debugger attachments, ephemeral relay credentials, and session groups are removed. Paired-companion trust, enrolled profiles, and standing grants persist.
+- Two-machine home-hub pairing and presence: the desktop hosted the only temporary LAN listener; the laptop paired by verified fingerprints and a one-time code; the laptop's Brave popup explicitly enabled the endpoint; the hub directory reported it online; and hub restart/loss updated the popup live without exposing a browser-side LAN listener.
 
 These paths also have automated protocol, authentication, authorization, relay, supervisor, recovery, and extension-core coverage through `npm test`, including fail-closed rejection of identity changes and grace expiry.
 
-### Implemented; live acceptance pending
+### Implemented; further live acceptance pending
 
-The optional home-mesh path is present in the codebase and covered by automated tests and findings-only security review gates, but its human and multi-machine milestone proofs have not been completed:
+The remaining optional home-mesh path is present in the codebase and covered by automated tests and findings-only security review gates, but its remote-control and multi-machine milestone proofs have not been completed:
 
-- PAKE/TLS machine-to-hub pairing, pinned endpoint presence, enable/disable, and unpairing.
 - Zero-authority hub routing, remote profile enrollment and session requests, browser-owned remote consent, and routed session addressing.
 - End-to-end encrypted routed broker/CDP channels and the loopback harness connector.
 - Profile/endpoint/hub/device revocation fan-out, hub-loss degradation, and local-session continuity during remote failure.
 
-Pending live evidence includes the two-machine pairing ceremony, remote enrollment and decline flows, a real remote CDP session with tab-drag revocation, and the final three-machine hub-loss and LAN-listener checks. Until those pass, mesh operation is experimental rather than a supported path.
+Pending live evidence includes remote enrollment and decline flows, a real remote CDP session with tab-drag revocation, and the final three-machine session-revocation, hub-loss, and LAN-listener checks. Until those pass, remote mesh operation is experimental rather than a supported path.
 
 ### Explicitly not provided
 
