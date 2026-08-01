@@ -44,7 +44,10 @@ export function routedStandingGrantFor(grants, controllerId, route) {
 export function accessWithinStandingGrant(access, grant) {
   if (!grant || !access || access.level === "full") return false;
   const ceiling = grant.route.accessCeiling;
-  return access.level === "selectedTabs" || (access.level === "domains" && ceiling.level === "domains" && access.domains.every((domain) => ceiling.domains.includes(domain)));
+  if (access.level === "selectedTabs") {
+    return ceiling.level === "domains" || access.tabIds.every((tabId) => ceiling.tabIds.includes(tabId));
+  }
+  return access.level === "domains" && ceiling.level === "domains" && access.domains.every((domain) => ceiling.domains.includes(domain));
 }
 
 export function rememberStandingGrant(grants, session) {
@@ -54,5 +57,6 @@ export function rememberStandingGrant(grants, session) {
   const priorDomains = existing?.route.accessCeiling.level === "domains" ? existing.route.accessCeiling.domains : [];
   const domains = session.access.level === "domains" ? [...new Set([...priorDomains, ...session.access.domains])].sort() : priorDomains;
   const level = session.access.level === "domains" || existing?.route.accessCeiling.level === "domains" ? "domains" : "selectedTabs";
-  return [...grants.filter((grant) => grant.controllerId !== session.controllerId || (route.kind === "routed" ? grant.route.kind !== "routed" || grant.route.hubId !== route.hubId : grant.route.endpointId !== route.endpointId)), { version: 2, controllerId: session.controllerId, controllerName: session.controllerName, route: { ...route, accessCeiling: { level, tabIds: [], domains } }, createdAt: existing?.createdAt ?? Date.now() }];
+  const tabIds = level === "selectedTabs" ? [...new Set(session.access.tabIds)].sort((left, right) => left - right) : [];
+  return [...grants.filter((grant) => grant.controllerId !== session.controllerId || (route.kind === "routed" ? grant.route.kind !== "routed" || grant.route.hubId !== route.hubId : grant.route.kind !== "local" || grant.route.endpointId !== route.endpointId)), { version: 2, controllerId: session.controllerId, controllerName: session.controllerName, route: { ...route, accessCeiling: { level, tabIds, domains } }, createdAt: existing?.createdAt ?? Date.now() }];
 }

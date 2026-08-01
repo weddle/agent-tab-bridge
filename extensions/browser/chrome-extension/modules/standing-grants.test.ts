@@ -37,4 +37,11 @@ describe("standing grant route policy", () => {
     expect(accessWithinStandingGrant({ level: "domains", tabIds: [], domains: ["example.com"] }, grant)).toBe(true);
     expect(accessWithinStandingGrant({ level: "domains", tabIds: [], domains: ["other.example"] }, grant)).toBe(false);
   });
+
+  it("does not widen remembered selected-tab scope", () => {
+    const session = { controllerId, controllerName: "Research", route: routedRoute, access: { level: "selectedTabs", tabIds: [4], domains: [] } };
+    const [grant] = rememberStandingGrant([], session);
+    expect(accessWithinStandingGrant({ level: "selectedTabs", tabIds: [4], domains: [] }, grant)).toBe(true);
+    expect(accessWithinStandingGrant({ level: "selectedTabs", tabIds: [5], domains: [] }, grant)).toBe(false);
+  });
 });
