@@ -29,6 +29,7 @@
         color: var(--atb-text-muted);
         overflow-wrap: anywhere;
       }
+      .session-state.reconnecting { color: var(--atb-status-attention); }
       .group-chip {
         display: flex;
         align-items: center;
@@ -57,6 +58,7 @@
       <p class="description" id="description">Approved local controller session</p>
       <p class="meta" id="controller"></p>
       <p class="meta" id="session"></p>
+      <p class="meta session-state" id="sessionState" aria-live="polite"></p>
       <p class="meta" id="capabilities"></p>
       <p class="group-chip">
         <span id="groupSwatch" class="swatch" aria-hidden="true"></span>

@@ -5,6 +5,9 @@ import {
   isLocalOnlyGrant,
   rememberedGrantLabel,
   renderClaimedString,
+  renderHubConnectionStatus,
+  renderPairingFailure,
+  renderSessionState,
   renderRememberedGrantChip,
   renderStandingGrantScope,
   renderVerifiedIdentity,
@@ -27,6 +30,21 @@ describe("consent vocabulary renderers", () => {
       text: "“Research task” (unverified)",
       policyRelevant: false,
     });
+  });
+});
+
+describe("reconnecting and hub vocabulary", () => {
+  it("uses amber attention for reconnecting and does not treat it as active", () => {
+    expect(renderHubConnectionStatus("unreachable")).toEqual({ state: "connecting", text: "unreachable" });
+    expect(renderHubConnectionStatus("connected")).toEqual({ state: "connected", text: "connected" });
+    expect(renderSessionState("reconnecting")).toEqual({ state: "connecting", text: "reconnecting" });
+    expect(renderSessionState("active")).toEqual({ state: "connected", text: "active" });
+  });
+
+  it("names pairing failures with a fresh-code or refusal action", () => {
+    expect(renderPairingFailure("wrong-code")).toContain("fresh code");
+    expect(renderPairingFailure("key-mismatch")).toContain("refused");
+    expect(renderPairingFailure("duplicate-identity")).toContain("already enrolled");
   });
 });
 

@@ -10,8 +10,11 @@ import { startAgentTabRelay } from "../../extensions/browser/src/browser/extensi
 import { BrokerServer } from "./broker.js";
 import { IdentityStore, createBrokerSecret } from "./identity.js";
 import { runNativeEndpoint } from "./native-host.js";
+import { createEnrollmentStatement } from "./enrollment-statement.js";
 import { applicationSupportDirectory, atomicWritePrivateJson, readPrivateJson, CompanionStateStore, type ApplicationSupportOptions, type PinnedExtensionIdentity } from "./state.js";
 import { EdgeHubPairingClient } from "./pairing/edge.js";
+import type { HubRouteConnection, HubRouteStream } from "./pairing/routes.js";
+import type { RoutedBrokerAddress } from "../hub/routing.js";
 import type { NativeEndpointRecovery } from "./endpoint-recovery.js";
 import type { TaskSessionRelay } from "./task-sessions.js";
 
@@ -153,6 +156,8 @@ export class EdgeSupervisor {
   private readonly endpointRuns = new Set<Promise<void>>();
   private machineId = "";
   private hubSocket?: TLSSocket;
+  private hubRoutes?: HubRouteConnection;
+  private hubId?: string;
   private started = false;
   private closing: Promise<void> | undefined;
   private registryTail = Promise.resolve();
@@ -189,10 +194,14 @@ export class EdgeSupervisor {
     await this.writeRegistry();
     emit(this.options.onEvent, { type: "started", machineId: this.machineId });
     try {
-      this.hubSocket = await this.hubPairing.connectPresence();
-      if (this.hubSocket) {
+      const pairing = await this.hubPairing.store.load();
+      this.hubId = pairing?.pairing.pinnedPeerKey.principalId;
+      const routes = await this.hubPairing.connectRoutes((stream, address) => this.routeHubBroker(stream, address));
+      if (routes) {
+        this.hubRoutes = routes;
+        this.hubSocket = routes.connectionSocket;
         emit(this.options.onEvent, { type: "hubConnected" });
-        this.hubSocket.once("close", () => { this.hubSocket = undefined; emit(this.options.onEvent, { type: "hubDisconnected" }); });
+        this.hubSocket.once("close", () => { this.hubSocket = undefined; this.hubRoutes = undefined; emit(this.options.onEvent, { type: "hubDisconnected" }); });
       }
     } catch { emit(this.options.onEvent, { type: "hubDisconnected" }); }
     return this;
@@ -218,6 +227,8 @@ export class EdgeSupervisor {
 
   private async stop(): Promise<void> {
     emit(this.options.onEvent, { type: "stopping" });
+    this.hubRoutes?.close();
+    this.hubRoutes = undefined;
     this.hubSocket?.destroy();
     this.hubSocket = undefined;
     for (const socket of this.brokerClients) socket.destroy();
@@ -250,6 +261,7 @@ export class EdgeSupervisor {
       input: socket,
       output: socket,
       stateStore: this.stateStore,
+      onProfileEnrolled: async (record) => await this.publishEnrollment(record),
       identityStore: this.identityStore,
       startRelay: this.options.startRelay ?? startAgentTabRelay,
       brokerSocketPath: (identity) => endpointSocketPath(identity.fingerprint, this.options),
@@ -327,6 +339,48 @@ export class EdgeSupervisor {
     emit(this.options.onEvent, { type: "endpointDisconnected", endpointId });
     if (this.hubSocket) await this.hubPairing.pushPresence(this.hubSocket).catch(() => undefined);
   }
+
+  /** Terminates a routed profile-auth stream and begins only explicit remote enrollments at its selected edge. */
+  private routeHubBroker(stream: HubRouteStream, address: RoutedBrokerAddress): void {
+    const runtime = this.endpoints.get(address.endpointId);
+    const hubId = this.hubId;
+    if (!hubId || address.machineId !== this.machineId || !runtime || runtime.endpoint.endpointId !== address.endpointId) { stream.close(); return; }
+    let upstream: Socket | undefined;
+    let first = true;
+    const close = () => { stream.close(); upstream?.destroy(); };
+    stream.onPayload((payload) => {
+      if (first) {
+        first = false;
+        try {
+          const request = JSON.parse(payload.toString("utf8")) as Record<string, unknown>;
+          if (request.type === "remoteEnroll" && Object.keys(request).length === 3 && typeof request.profileName === "string" && typeof request.publicKeySpki === "string") {
+            void runtime.broker.enrollProfile(request.profileName, request.publicKeySpki).then((enrollment) => {
+              stream.send(Buffer.from(JSON.stringify({ type: "remoteEnrollResult", ok: true, enrollment }), "utf8"));
+              stream.close();
+            }, (error: unknown) => {
+              stream.send(Buffer.from(JSON.stringify({ type: "remoteEnrollResult", ok: false, error: error instanceof Error ? error.message : "enrollment failed" }), "utf8"));
+              stream.close();
+            });
+            return;
+          }
+        } catch { /* A broker protocol line need not be a standalone JSON enrollment request. */ }
+        upstream = createConnection(runtime.endpoint.socketPath);
+        upstream.once("error", close);
+        upstream.once("close", () => stream.close());
+        upstream.on("data", (chunk: Buffer) => { try { stream.send(chunk); } catch { close(); } });
+        stream.onClose(close);
+        upstream.write(`${JSON.stringify(runtime.broker.authorizeRoutedContext({ hubId, routeId: stream.routeId, streamId: stream.streamId, address }))}\n`);
+      }
+      if (!upstream || upstream.destroyed) { close(); return; }
+      upstream.write(payload, (error) => { if (error) close(); });
+    });
+  }
+  private async publishEnrollment(record: Readonly<{ endpointId: string; profileName: string; principalId: string; publicKeySpki: string; enrolledAt: number }>): Promise<void> {
+    if (!this.hubSocket) return;
+    const identity = await this.identityStore.loadOrCreate();
+    await this.hubPairing.pushEnrollment(createEnrollmentStatement(identity, record));
+  }
+
 
   private routeBroker(socket: Socket): void {
     if (this.closing) { socket.destroy(); return; }

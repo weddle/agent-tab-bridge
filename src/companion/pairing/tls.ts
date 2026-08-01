@@ -25,12 +25,14 @@ export function pinnedTlsOptions(pairing: PinnedPeerKeyset): TlsPinningOptions {
     maxVersion: "TLSv1.3",
     rejectUnauthorized: true,
     checkServerIdentity(_hostname, certificate) {
-      const spki = peerSpki(certificate);
-      if (!spki) return new Error("TLS peer key does not match the pinned pairing key");
-      const actual = Buffer.from(fingerprintSpki(spki));
-      const expected = Buffer.from(pairing.pinnedPeerKey.fingerprint);
-      if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return new Error("TLS peer key does not match the pinned pairing key");
-      return undefined;
+      try {
+        const spki = peerSpki(certificate);
+        if (!spki) return new Error("TLS peer key does not match the pinned pairing key");
+        const actual = Buffer.from(fingerprintSpki(spki));
+        const expected = Buffer.from(pairing.pinnedPeerKey.fingerprint);
+        if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return new Error("TLS peer key does not match the pinned pairing key");
+        return undefined;
+      } catch { return new Error("TLS peer key does not match the pinned pairing key"); }
     },
   };
 }

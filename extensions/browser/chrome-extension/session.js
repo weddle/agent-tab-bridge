@@ -26,6 +26,12 @@ controller.textContent = identity.text;
 controller.title = identity.fullValue;
 controller.setAttribute("aria-label", identity.ariaLabel);
 document.getElementById("session").textContent = `Session: ${text("sessionId", "Unavailable")}`;
+const sessionState = document.getElementById("sessionState");
+const reconnecting = text("state", "active") === "reconnecting";
+sessionState.textContent = reconnecting
+  ? "Reconnecting — the session is paused while this browser resumes."
+  : "Active";
+sessionState.classList.toggle("reconnecting", reconnecting);
 document.getElementById("capabilities").textContent = `Approved capabilities: ${text("capabilities", "None")}`;
 
 const access = text("access", "selectedTabs");

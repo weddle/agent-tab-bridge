@@ -33,7 +33,7 @@ export type CliCommand =
   | { kind: "profileCreate"; name: string }
   | { kind: "profileEnroll"; name: string }
   | { kind: "profileList" }
-  | { kind: "pair"; address: string }
+  | { kind: "pair"; address: string; code: string; hubFingerprint: string }
   | { kind: "unpair" }
   | { kind: "hub"; action: "start" | "pair" | "status" | "stop" | "forget"; port?: number; host?: string; machine?: string }
   | { kind: "nativeHost" };
@@ -300,8 +300,8 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     return { kind: "browsers" };
   }
   if (first === "pair") {
-    if (rest.length !== 1) throw new Error("usage: atb pair <hub-address:port>");
-    return { kind: "pair", address: rest[0]! };
+    if (rest.length !== 3) throw new Error("usage: atb pair <hub-address:port> <pairing-code> <hub-fingerprint>");
+    return { kind: "pair", address: rest[0]!, code: rest[1]!, hubFingerprint: rest[2]! };
   }
   if (first === "unpair") {
     if (rest.length !== 0) throw new Error("usage: atb unpair");
@@ -330,8 +330,8 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
     }
     if ((action === "start" || action === "pair") && port === undefined) throw new Error(`hub ${action} requires --port (mesh is inert when unconfigured)`);
     if (action !== "start" && action !== "pair" && port !== undefined) throw new Error(`hub ${action} does not accept --port`);
-    if (action !== "forget" && machine !== undefined) throw new Error(`hub ${action} does not accept --machine`);
-    if (action === "forget" && !machine) throw new Error("hub forget requires --machine <fingerprint>");
+    if (action !== "forget" && action !== "pair" && machine !== undefined) throw new Error(`hub ${action} does not accept --machine`);
+    if (action === "pair" && !machine) throw new Error("hub pair requires --machine <fingerprint> (admin confirmation)");
     return { kind: "hub", action, ...(port === undefined ? {} : { port }), ...(host === undefined ? {} : { host }), ...(machine === undefined ? {} : { machine }) };
   }
   if (first === "native-host") return { kind: "nativeHost" };
@@ -674,7 +674,7 @@ export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {})
     const supportOptions = deps.stateDirectory === undefined ? {} : { directory: deps.stateDirectory };
     const pairing = deps.hubPairing ?? new EdgeHubPairingClient(supportOptions);
     if (command.kind === "pair") {
-      const result = await pairing.pair(command.address);
+      const result = await pairing.pair(command.address, command.code, command.hubFingerprint);
       (deps.stdout ?? process.stdout).write(`${result.code}\n`);
     } else await pairing.unpair();
     return 0;
@@ -694,6 +694,7 @@ export async function main(argv = process.argv.slice(2), deps: AtbMainDeps = {})
     if (command.action === "start" || command.action === "pair") {
       const started = await service.start();
       if (command.action === "pair") {
+        service.confirmPairingMachineFingerprint(command.machine!);
         const ceremony = await service.startPairing();
         (deps.stdout ?? process.stdout).write(`${ceremony.code}\n`);
         if (started) process.stderr.write(`listen address\t${started.address}\n`);

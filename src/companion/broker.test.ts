@@ -215,6 +215,37 @@ describe("BrokerServer socket ownership", () => {
       await broker.close();
     }
   });
+  it("binds a routed profile session to the hub route and rejects an asserted endpoint substitution", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "atb-broker-")); directories.push(directory);
+    const profile = await createProfile("remote", { directory });
+    const machine = generateIdentity("companion");
+    const endpoint = generateIdentity("controller");
+    const hub = generateIdentity("controller");
+    const sessions = new TaskSessionManager({ startRelay: async () => ({ pairingUrl: "ws://127.0.0.1/extension#token", cdpUrl: "ws://127.0.0.1/cdp?token=token", close: async () => undefined }) });
+    const context = { hubId: hub.principalId, routeId: "route-1", streamId: "stream-1", address: { machineId: machine.principalId, endpointId: endpoint.principalId, principalId: profile.principalId, stableSessionKey: "remote-key" } };
+    const broker = await startBrokerServer({
+      socketPath: join(directory, "broker.sock"), token: "a".repeat(32), sessions, isTrusted: () => true, controller: () => null,
+      profile: (name) => name === profile.name ? { principalId: profile.principalId, displayName: profile.name, publicKeySpki: profile.publicKeySpki } : null,
+      authContext: () => ({ machineId: machine.principalId, machinePublicKeySpki: machine.publicKeySpki, machinePrivateKeyPkcs8: machine.privateKeyPkcs8, endpointId: endpoint.principalId }),
+      routeFor: (route, principalId, authority) => ({ kind: "routed", endpointId: route.address.endpointId, controllerPrincipalId: principalId, routePolicy: "routed", accessCeiling: authority.scope!, hubId: route.hubId, routeId: route.routeId, streamId: route.streamId }),
+    });
+    try {
+      const socket = createConnection(broker.socketPath);
+      socket.once("connect", () => socket.write(`${JSON.stringify(broker.authorizeRoutedContext(context))}\n`));
+      const client = createBrokerClient({ socketPath: broker.socketPath, socketFactory: () => socket, profile: { name: profile.name, principalId: profile.principalId, publicKeySpki: profile.publicKeySpki, privateKeyPkcs8: profile.privateKeyPkcs8 }, route: context });
+      const opened = await client.request("openSession", { taskLabel: "Remote research", requestedCapabilities: ["cdp"], stableSessionKey: "remote-key" }) as { session: { route: { kind: string; hubId: string | null; routeId: string | null; streamId: string | null } } };
+      expect(opened.session.route).toMatchObject({ kind: "routed", hubId: context.hubId, routeId: context.routeId, streamId: context.streamId });
+      expect(sessions.snapshot()).toHaveLength(1);
+      expect(sessions.snapshot()[0]!.state).toBe("pending");
+      await client.close();
+
+      const forgedSocket = createConnection(broker.socketPath);
+      forgedSocket.once("connect", () => forgedSocket.write(`${JSON.stringify(broker.authorizeRoutedContext(context))}\n`));
+      const forged = createBrokerClient({ socketPath: broker.socketPath, socketFactory: () => forgedSocket, profile: { name: profile.name, principalId: profile.principalId, publicKeySpki: profile.publicKeySpki, privateKeyPkcs8: profile.privateKeyPkcs8 }, route: { ...context, address: { ...context.address, endpointId: generateIdentity("controller").principalId } } });
+      await expect(forged.request("openSession", { taskLabel: "Remote research", requestedCapabilities: ["cdp"], stableSessionKey: "remote-key" })).rejects.toThrow(/authentication failed/);
+      await forged.close().catch(() => undefined);
+    } finally { await broker.close(); }
+  });
   it("rejects replayed and field-substituted v2 profile transcripts", async () => {
     const directory = await mkdtemp(join(tmpdir(), "atb-broker-")); directories.push(directory);
     const profile = await createProfile("profile", { directory });

@@ -129,6 +129,13 @@
       .remembered-grant { display: flex; align-items: center; gap: var(--atb-space-1); font-size: 12px; }
       .remembered-grant .atb-btn { min-height: 24px; padding: 2px 7px; font-size: 12px; }
       .verified-identity { overflow-wrap: anywhere; }
+      .session-status {
+        display: flex;
+        align-items: center;
+        gap: var(--atb-space-2);
+        color: var(--atb-text-muted);
+        font-size: 12px;
+      }
       .card-header {
         display: flex;
         justify-content: space-between;
@@ -276,7 +283,12 @@
         <div id="activeSessions" class="cards"></div>
         <p id="activeEmpty" class="meta">No active sessions.</p>
       </section>
+      <section id="hubPairingSection" class="section hidden" aria-labelledby="hubPairingHeading">
+        <h2 id="hubPairingHeading">Home hub pairing (0)</h2>
+        <div id="hubPairingRequests" class="cards"></div>
+      </section>
     </main>
+
 
     <footer class="device" aria-labelledby="deviceHeading">
       <h2 id="deviceHeading">Device</h2>
@@ -293,6 +305,21 @@
         Stops all sessions and removes the stored companion identity. Pairing must be repeated
         before access can be granted again.
       </p>
+      <div id="hubBlock" class="hidden">
+        <h3 id="hubHeading" class="meta">Home hub</h3>
+        <p id="hubIdentity" class="meta"></p>
+        <p class="status">
+          <span id="hubStatusDot" class="dot disconnected" aria-hidden="true"></span>
+          <span id="hubStatus" aria-live="polite"></span>
+        </p>
+        <label class="hub-toggle">
+          <input id="hubEnabled" type="checkbox" />
+          Enabled for this browser
+        </label>
+        <p id="hubToggleHint" class="hint">Controls whether this browser accepts sessions routed through the home hub. This does not unpair the machine.</p>
+        <button id="forgetHubButton" class="atb-btn atb-btn--danger-quiet" type="button">Forget hub…</button>
+        <p id="forgetHubHint" class="hint">Forgets the paired home hub for this machine. It does not end local sessions.</p>
+      </div>
       <button id="forgetCompanionButton" class="atb-btn atb-btn--danger-quiet" type="button" disabled
         aria-describedby="forgetCompanionHint">Forget companion…</button>
       <p id="forgetAnnounce" class="atb-sr-only" aria-live="polite"></p>

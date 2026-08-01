@@ -100,3 +100,28 @@ export function rememberedGrantLabel() {
 export function renderRememberedGrantChip() {
   return rememberedGrantLabel();
 }
+
+export function renderHubConnectionStatus(value) {
+  if (value === "connected") return { state: "connected", text: "connected" };
+  if (value === "connecting") return { state: "connecting", text: "connecting" };
+  if (value === "unreachable") return { state: "connecting", text: "unreachable" };
+  return { state: "disconnected", text: "off" };
+}
+
+export function renderPairingFailure(value) {
+  const code = typeof value === "string" ? value : value?.code;
+  if (code === "wrong-code") return "The pairing code was incorrect. A fresh code is required.";
+  if (code === "expired-code") return "The pairing code expired. A fresh code is required.";
+  if (code === "key-mismatch") return "Pairing refused: the verified key does not match the invitation.";
+  if (code === "duplicate-identity") return "Pairing refused: this identity is already enrolled.";
+  if (code === "attempts-exhausted") return "Pairing refused: attempts are exhausted. Request a fresh code.";
+  if (code === "replayed-confirmation") return "Pairing refused: this confirmation was already used.";
+  if (code === "protocol-downgrade") return "Pairing refused: the protocol does not meet the required version.";
+  return "Pairing failed. Request a fresh code.";
+}
+
+export function renderSessionState(value) {
+  return value === "reconnecting"
+    ? { state: "connecting", text: "reconnecting" }
+    : { state: "connected", text: "active" };
+}

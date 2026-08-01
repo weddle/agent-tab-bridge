@@ -2,6 +2,7 @@
  * Vendored from @cipherman/pake-js 0.1.1.
  * Source: https://registry.npmjs.org/@cipherman/pake-js/-/pake-js-0.1.1.tgz
  * Upstream: https://github.com/alicommit-malp/pake-js
+ * Local delta: retained only the P-256 SPAKE2+ surface used by Agent Tab Bridge; upstream CPace/Ristretto surfaces and unrelated exports are removed.
  *
  * MIT License
  *

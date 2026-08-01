@@ -17,7 +17,10 @@ import {
   renderAccessScope,
   renderClaimedString,
   renderRememberedGrantChip,
+  renderPairingFailure,
   renderScopeChips,
+  renderHubConnectionStatus,
+  renderSessionState,
   renderStandingGrantScope,
   verifiedIdentityDetails,
 } from "./modules/ui-vocabulary.js";
@@ -37,6 +40,17 @@ const accessList = document.getElementById("accessRequests");
 const enrollSection = document.getElementById("enrollSection");
 const enrollHeading = document.getElementById("enrollHeading");
 const enrollList = document.getElementById("enrollRequests");
+const hubPairingSection = document.getElementById("hubPairingSection");
+const hubPairingHeading = document.getElementById("hubPairingHeading");
+const hubPairingList = document.getElementById("hubPairingRequests");
+const hubBlock = document.getElementById("hubBlock");
+const hubIdentity = document.getElementById("hubIdentity");
+const hubStatusDot = document.getElementById("hubStatusDot");
+const hubStatus = document.getElementById("hubStatus");
+const hubEnabled = document.getElementById("hubEnabled");
+const forgetHubButton = document.getElementById("forgetHubButton");
+const hubToggleHint = document.getElementById("hubToggleHint");
+const forgetHubHint = document.getElementById("forgetHubHint");
 const profilesHeading = document.getElementById("profilesHeading");
 const grantsHeading = document.getElementById("grantsHeading");
 const activeSection = document.getElementById("activeSection");
@@ -62,6 +76,8 @@ let state = {
   activeSessions: [],
   pendingAccess: [],
   pendingEnrollments: [],
+  hub: null,
+  pendingHubPairings: [],
   enrolledProfiles: [],
   standingGrants: [],
   sharedTabs: [],
@@ -69,6 +85,8 @@ let state = {
 let currentTab = null;
 let refreshRevision = 0;
 let errorText = "";
+const HUB_ENABLE_KEY = "\u0000hub-enabled";
+const HUB_FORGET_KEY = "\u0000hub-forget";
 let forgetConfirmTimer = null;
 const CONNECT_KEY = "\u0000connect";
 
@@ -81,6 +99,7 @@ const pendingCards = new Map();
 const accessCards = new Map();
 const enrollCards = new Map();
 const activeCards = new Map();
+const hubPairingCards = new Map();
 
 function makeElement(tag, className, text) {
   const element = document.createElement(tag);
@@ -289,6 +308,20 @@ function healthText(session) {
   return "active";
 }
 
+function isReconnecting(session) {
+  return session?.state === "reconnecting" || session?.health === "reconnecting";
+}
+
+function appendSessionStatus(card, session) {
+  const status = renderSessionState(session?.state ?? session?.health);
+  const row = makeElement("p", "session-status");
+  const dot = makeElement("span", `dot ${status.state}`);
+  dot.setAttribute("aria-hidden", "true");
+  row.append(dot, makeElement("span", undefined, status.text));
+  row.setAttribute("aria-live", "polite");
+  card.append(row);
+}
+
 function tabsForSession(id) {
   return state.sharedTabs.filter((tab) => String(tab?.sessionId) === id);
 }
@@ -375,6 +408,7 @@ function activeSignature(session) {
     formatCapabilities(session?.capabilities),
     JSON.stringify(session?.access ?? null),
     healthText(session),
+    session?.state ?? "",
     tabs,
     share.label,
     share.variant,
@@ -439,6 +473,7 @@ function buildActiveCard(session) {
   header.append(task, remainingEl);
   card.append(header);
   appendVerifiedIdentity(card, session);
+  appendSessionStatus(card, session);
   appendClaimedContext(card, taskLabel(session), controllerLabel(session));
   appendScope(card, session?.access);
   card.append(makeElement("p", "access-summary", formatAccess(session)));
@@ -477,6 +512,10 @@ function buildActiveCard(session) {
     makeElement("p", "meta", `Session id ${abbreviate(session?.id)}`),
   );
   card.append(details);
+  if (isReconnecting(session)) {
+    card.append(makeElement("p", "meta", "Reconnecting. Controls return when the session resumes."));
+    return { node: card, remainingEl, signature: "" };
+  }
 
   const share = shareMode(session);
   const shareButton = makeButton(share.label, share.variant);
@@ -571,12 +610,73 @@ function buildEnrollCard(request) {
   input.setAttribute("aria-label", `Pairing code for profile ${request?.profileName ?? "unnamed"}`);
   const confirm = makeButton("Confirm enrollment", "primary");
   confirm.addEventListener("click", () => {
+
     const code = input.value.trim();
     if (!/^\d{6}$/.test(code)) {
       showError(new Error("Enter the 6-digit code shown by the requesting agent."));
       return;
     }
     void runMutation(id, confirm, { type: "confirmEnrollment", enrollmentId: id, code }, "The companion rejected this enrollment code.");
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") confirm.click();
+  });
+  const remainingEl = makeElement("p", "meta remaining", formatRemaining(request));
+  card.append(remainingEl);
+  const actions = makeElement("div", "actions");
+  actions.append(input, confirm);
+  card.append(actions);
+  return { node: card, remainingEl, signature: "" };
+}
+function hubPairingSignature(request) {
+  return [
+    sessionKey(request),
+    request?.hubAlias ?? "",
+    request?.hubFingerprint ?? request?.fingerprint ?? "",
+    request?.error ?? request?.failureCode ?? "",
+    request?.completed === true ? "completed" : "",
+  ].join(UNIT);
+}
+
+function buildHubPairingCard(request) {
+  const id = sessionKey(request);
+  const card = makeElement("article", "atb-card card pending access-selectedTabs");
+  const fingerprint = request?.hubFingerprint ?? request?.fingerprint;
+  const identity = verifiedIdentityDetails("Home hub", fingerprint);
+  card.append(makeElement("div", "task", "Pair home hub"));
+  const identityLine = makeElement("p", "meta verified-identity", identity.text);
+  identityLine.title = identity.fullValue;
+  identityLine.setAttribute("aria-label", identity.ariaLabel);
+  card.append(identityLine);
+  if (request?.hubAlias) card.append(makeElement("p", "meta", `Alias ${renderClaimedString(request.hubAlias)}`));
+  card.append(makeElement("p", "meta", "Match this fingerprint against the home hub before entering the code."));
+  if (request?.completed === true) {
+    card.append(makeElement("p", "meta", "Home hub paired for this machine. Pairing grants no session access."));
+    return { node: card, remainingEl: null, signature: "" };
+  }
+  const failure = request?.failureCode ?? request?.error;
+  if (failure) {
+    card.append(makeElement("p", "error", renderPairingFailure(failure)));
+    card.append(makeElement("p", "meta", "Request a fresh pairing code before trying again."));
+    return { node: card, remainingEl: null, signature: "" };
+  }
+  card.append(makeElement("p", "meta", "The code is single-use and expires in 2 minutes. Pairing grants no session access."));
+  const input = document.createElement("input");
+  input.type = "text";
+  input.inputMode = "numeric";
+  input.autocomplete = "one-time-code";
+  input.maxLength = 6;
+  input.placeholder = "6-digit code";
+  input.className = "atb-code-input";
+  input.setAttribute("aria-label", "Home hub pairing code");
+  const confirm = makeButton("Confirm pairing", "primary");
+  confirm.addEventListener("click", () => {
+    const code = input.value.trim();
+    if (!/^\d{6}$/.test(code)) {
+      showError(new Error("Enter the 6-digit pairing code."));
+      return;
+    }
+    void runMutation(id, confirm, { type: "confirmHubPairing", pairingId: id, code }, "The home hub rejected this pairing code.");
   });
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter") confirm.click();
@@ -645,9 +745,10 @@ function reconcile(container, records, sessions, signatureOf, build) {
 }
 
 /** Header status line, most-important-wins. */
-function statusText(nativeStatus, pendingCount, activeCount) {
+function statusText(nativeStatus, pendingCount, activeCount, reconnectingCount) {
   if (errorText !== "") return errorText;
   if (pendingCount > 0) return `${pendingCount} ${plural(pendingCount, "approval")} waiting`;
+  if (reconnectingCount > 0) return `${reconnectingCount} ${plural(reconnectingCount, "session")} reconnecting`;
   if (activeCount > 0) return `${activeCount} ${plural(activeCount, "session")} active`;
   if (nativeStatus === "connecting") return "Connecting to companion…";
   if (nativeStatus === "connected") return "Companion connected";
@@ -658,10 +759,11 @@ function renderStatus() {
   const nativeStatus = typeof state.native?.state === "string" ? state.native.state : "disconnected";
   const pendingCount = state.pendingSessions.length + state.pendingAccess.length;
   const activeCount = state.activeSessions.length;
-  const dotState = errorText !== "" ? "error" : nativeStatus;
+  const reconnectingCount = state.activeSessions.filter(isReconnecting).length;
+  const dotState = errorText !== "" ? "error" : reconnectingCount > 0 ? "connecting" : nativeStatus;
   const dotClass = `dot ${dotState}`;
   if (statusDot.className !== dotClass) statusDot.className = dotClass;
-  setText(connectionStatus, statusText(nativeStatus, pendingCount, activeCount));
+  setText(connectionStatus, statusText(nativeStatus, pendingCount, activeCount, reconnectingCount));
 }
 
 function renderDevice(companion) {
@@ -727,6 +829,7 @@ function render() {
   setHidden(enrollSection, enrollments.length === 0);
   setText(enrollHeading, `Agent enrollments (${enrollments.length})`);
   reconcile(enrollList, enrollCards, enrollments, enrollSignature, buildEnrollCard);
+  renderHubPairings();
 
   setHidden(activeSection, false);
   setText(activeHeading, `Active sessions (${active.length})`);
@@ -735,6 +838,7 @@ function render() {
 
   renderProfilesAndGrants();
   renderDevice(companion);
+  renderHub();
 }
 
 function renderProfilesAndGrants() {
@@ -769,6 +873,32 @@ function renderProfilesAndGrants() {
   }));
 }
 
+function renderHub() {
+  const hub = state.hub;
+  const paired = !!hub && hub.paired !== false && typeof (hub.fingerprint ?? hub.verifiedKey?.fingerprint) === "string";
+  setHidden(hubBlock, !paired);
+  if (!paired) return;
+  const identity = verifiedIdentityDetails("Home hub", hub.fingerprint ?? hub.verifiedKey?.fingerprint);
+  setText(hubIdentity, `${hub.alias ? `Alias ${renderClaimedString(hub.alias)} · ` : ""}${identity.text}`);
+  hubIdentity.title = identity.fullValue;
+  hubIdentity.setAttribute("aria-label", identity.ariaLabel);
+  const connection = renderHubConnectionStatus(hub.connectionState ?? hub.state);
+  hubStatusDot.className = `dot ${connection.state}`;
+  setText(hubStatus, connection.text);
+  if (!inFlight.has("hub-enabled") && !holdsUserContext(hubEnabled)) hubEnabled.checked = hub.enabled === true;
+  hubEnabled.disabled = inFlight.has("hub-enabled");
+  forgetHubButton.disabled = inFlight.has("hub-forget");
+  hubToggleHint.textContent = "Controls whether this browser accepts sessions routed through the home hub. This does not unpair the machine.";
+  forgetHubHint.textContent = "Forgets the paired home hub for this machine. It does not end local sessions.";
+}
+
+function renderHubPairings() {
+  const pairings = state.pendingHubPairings;
+  setHidden(hubPairingSection, pairings.length === 0);
+  setText(hubPairingHeading, `Home hub pairing (${pairings.length})`);
+  reconcile(hubPairingList, hubPairingCards, pairings, hubPairingSignature, buildHubPairingCard);
+}
+
 async function queryActiveTab() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -792,6 +922,8 @@ async function refresh() {
       activeSessions: Array.isArray(result.activeSessions) ? result.activeSessions : [],
       pendingAccess: Array.isArray(result.pendingAccess) ? result.pendingAccess : [],
       pendingEnrollments: Array.isArray(result.pendingEnrollments) ? result.pendingEnrollments : [],
+      hub: result.hub ?? null,
+      pendingHubPairings: Array.isArray(result.pendingHubPairings) ? result.pendingHubPairings : [],
       enrolledProfiles: Array.isArray(result.enrolledProfiles) ? result.enrolledProfiles : [],
       standingGrants: Array.isArray(result.standingGrants) ? result.standingGrants : [],
       sharedTabs: Array.isArray(result.sharedTabs) ? result.sharedTabs : [],
@@ -882,7 +1014,28 @@ function armForget() {
   forgetConfirmTimer = setTimeout(disarmForget, FORGET_CONFIRM_MS);
 }
 
+hubEnabled.addEventListener("change", () => {
+  if (hubEnabled.disabled) return;
+  void runMutation(
+    HUB_ENABLE_KEY,
+    hubEnabled,
+    { type: "setHubEnabled", enabled: hubEnabled.checked },
+    "The home hub setting could not be changed.",
+  );
+});
+
+forgetHubButton.addEventListener("click", () => {
+  if (forgetHubButton.disabled) return;
+  void runMutation(
+    HUB_FORGET_KEY,
+    forgetHubButton,
+    { type: "forgetHub" },
+    "The home hub could not be forgotten.",
+  );
+});
+
 connectButton.addEventListener("click", () => {
+
   if (connectButton.disabled) return;
   void runMutation(
     CONNECT_KEY,

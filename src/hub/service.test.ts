@@ -14,9 +14,10 @@ async function pairedHub(directory: string) {
   const machineIdentity = identity();
   const hub = new HubService({ identity: hubIdentity, directory, port: 0 });
   const ceremony = await hub.startPairing();
+  hub.confirmPairingMachineFingerprint(machineIdentity.principalId);
   const machine = new MachinePairingCeremony({ identity: machineIdentity, invitation: ceremony.invitation, code: ceremony.code, confirmedHubFingerprint: ceremony.invitation.hub.fingerprint });
   const hello = machine.createHello();
-  const response = await hub.respondPairing(hello, hello.machine.fingerprint);
+  const response = await hub.respondPairing(hello, machineIdentity.principalId);
   const machineResult = machine.complete(response);
   await hub.completePairing(response, machineResult.confirmation, "desk");
   return { hub, machineIdentity, machineResult };

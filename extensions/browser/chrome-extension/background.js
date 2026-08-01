@@ -443,9 +443,21 @@ function sessionPageUrl(session) {
   url.searchParams.set("label", session.taskLabel);
   url.searchParams.set("capabilities", session.capabilities.join(", "));
   url.searchParams.set("access", session.access.level);
+  url.searchParams.set("state", session.state);
   if (session.access.tabIds.length) url.searchParams.set("tabIds", session.access.tabIds.join(","));
   if (session.access.domains.length) url.searchParams.set("domains", session.access.domains.join(","));
   return url.toString();
+}
+
+async function updateSessionPageState(sessionId, state) {
+  const anchorId = sessionAnchors.get(sessionId);
+  const session = sessions.get(sessionId);
+  if (!Number.isInteger(anchorId) || !session) return;
+  try {
+    await chrome.tabs.update(anchorId, { url: sessionPageUrl({ ...session, state }) });
+  } catch {
+    // The popup and agent carry the state when the anchor is unavailable.
+  }
 }
 
 function isSessionPageTab(tab) {
@@ -859,6 +871,7 @@ async function handleSessionResuming(message) {
   if (!known || known.state !== "reconnecting" || !matchesSessionAuthority(known, sessionUpdate) || relaySockets.has(sessionUpdate.id)) return;
   sessions.set(sessionUpdate.id, { ...known, ...sessionUpdate, rememberedGrant: known.rememberedGrant === true });
   await openSessionRelay(sessionUpdate.id, message.relayUrl);
+  await updateSessionPageState(sessionUpdate.id, "active");
 }
 
 async function handleSessionStopped(message) {
@@ -996,11 +1009,14 @@ async function handleNativeMessage(message, port, generation) {
       return;
   }
 }
+
 function suspendSessionsForNativeRecovery() {
   for (const [sessionId, session] of sessions) {
     if (session.state === "active") {
       closeRelaySocket(sessionId);
-      sessions.set(sessionId, { ...session, state: "reconnecting" });
+      const reconnecting = { ...session, state: "reconnecting" };
+      sessions.set(sessionId, reconnecting);
+      void updateSessionPageState(sessionId, "reconnecting");
     } else if (session.state === "revoked") {
       sessions.delete(sessionId);
     }
@@ -1875,7 +1891,7 @@ async function statusDto() {
     },
     pendingSessions: sessionValues.filter((session) => session.state === "pending").map(sessionDto),
     activeSessions: sessionValues
-      .filter((session) => sessionIsActive(session.id))
+      .filter((session) => session.state === "reconnecting" || sessionIsActive(session.id))
       .map(sessionDto),
     pendingAccess: [...accessRequests.values()].map((request) => {
       const session = sessions.get(request.sessionId);

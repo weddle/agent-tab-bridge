@@ -23,6 +23,7 @@ export type NativeHostOptions = {
   onEndpointReady?: (identity: PinnedExtensionIdentity, broker: BrokerServer, recovery: NativeEndpointRecovery) => void | Promise<void>;
   onEndpointSuspended?: (recovery: NativeEndpointRecovery) => boolean | Promise<boolean>;
   onEndpointClosed?: (endpointId: string, broker: BrokerServer | null) => void | Promise<void>;
+  onProfileEnrolled?: (record: Readonly<{ endpointId: string; profileName: string; principalId: string; publicKeySpki: string; enrolledAt: number }>) => void | Promise<void>;
 };
 class NativeOutputFailure extends Error { constructor(cause: unknown) { super(`native messaging output failed: ${cause instanceof Error ? cause.message : String(cause)}`); this.name = "NativeOutputFailure"; } }
 
@@ -193,6 +194,10 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
         return record ? { principalId: record.principalId, displayName: record.name, publicKeySpki: record.publicKeySpki } : null;
       },
       authContext: () => binding?.trusted ? { machineId: companion.principalId, machinePublicKeySpki: companion.publicKeySpki, machinePrivateKeyPkcs8: companion.privateKeyPkcs8, endpointId: identity.fingerprint } : null,
+      routeFor: (context, principalId, authority) => {
+        if (context.address.machineId !== companion.principalId || context.address.endpointId !== identity.fingerprint || context.address.principalId !== principalId || authority.scope === null) throw new TaskSessionError("invalidSession", "routed session identity does not match its edge endpoint");
+        return { kind: "routed", endpointId: identity.fingerprint, controllerPrincipalId: principalId, routePolicy: "routed", accessCeiling: authority.scope, hubId: context.hubId, routeId: context.routeId, streamId: context.streamId };
+      },
       enrollProfile: (profileName, publicKeySpki) => binding?.enrollProfile?.(profileName, publicKeySpki) ?? unavailable("browser endpoint is reconnecting"),
       status: () => ({ companionPrincipalId: companion.principalId, controllerPrincipalId, recovery: sessions?.snapshot().some((session) => session.state === "reconnecting") === true }),
       listTabs: (sessionId, scope) => binding?.listTabs?.(sessionId, scope) ?? unavailable("browser endpoint is reconnecting"),
@@ -313,6 +318,7 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
           const manager = sessionManager();
           const session = manager.get(message.sessionId);
           if (!session || session.state !== "pending" || session.controllerPrincipalId !== message.controllerPrincipalId || session.displayControllerName !== message.displayControllerName || session.taskLabel !== message.taskLabel || session.expiresAt !== message.expiresAt || session.requestedCapabilities.join(",") !== message.requestedCapabilities.join(",") || !sameSessionAccess(session.access, message.access) || !sameRouteProvenance(session.route, message.route)) return;
+          if (session.route.kind === "routed") { await manager.revoke(session.id, "remoteApprovalUnavailable"); return; }
           const approved = await manager.approve(session.id);
           await send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionStarted", session: { ...approved.session, requestedCapabilities: [...approved.session.requestedCapabilities], access: { ...approved.session.access, tabIds: [...approved.session.access.tabIds], domains: [...approved.session.access.domains] }, route: { ...approved.session.route, accessCeiling: { ...approved.session.route.accessCeiling, tabIds: [...approved.session.route.accessCeiling.tabIds], domains: [...approved.session.route.accessCeiling.domains] } } }, relayUrl: approved.pairingUrl });
           return;
@@ -359,7 +365,9 @@ export async function runNativeEndpoint(options: NativeHostOptions = {}): Promis
           }
           clearTimeout(pending.timer);
           pendingEnrollments.delete(message.enrollmentId);
-          await stateStore.update((current) => ({ ...current, machine: { ...current.machine, enrollments: [...current.machine.enrollments.filter((profile) => profile.name !== pending.profileName), { name: pending.profileName, principalId: pending.fingerprint, publicKeySpki: pending.publicKeySpki, enrolledAt: Date.now() }] } }));
+          const enrolledAt = Date.now();
+          await stateStore.update((current) => ({ ...current, machine: { ...current.machine, enrollments: [...current.machine.enrollments.filter((profile) => profile.name !== pending.profileName), { name: pending.profileName, principalId: pending.fingerprint, publicKeySpki: pending.publicKeySpki, enrolledAt }] } }));
+          if (trusted) void Promise.resolve(options.onProfileEnrolled?.({ endpointId: trusted.fingerprint, profileName: pending.profileName, principalId: pending.fingerprint, publicKeySpki: pending.publicKeySpki, enrolledAt })).catch(() => {});
           broker?.publish({ event: "profileEnrolled", enrollmentId: message.enrollmentId, profileName: pending.profileName });
           await send({ version: NATIVE_PROTOCOL_VERSION, type: "enrollResult", requestId: message.requestId, enrollmentId: message.enrollmentId, ok: true, profileName: pending.profileName });
           return;

@@ -40,7 +40,8 @@ export function selfSignedCertificate(identity: StoredIdentity, commonName = "at
   const privateKey: KeyObject = createPrivateKey({ key: Buffer.from(identity.privateKeyPkcs8, "base64url"), format: "der", type: "pkcs8" });
   const publicKey = Buffer.from(identity.publicKeySpki, "base64url");
   const algorithm = sequence(oid([1, 2, 840, 10045, 4, 3, 2]), der(0x05, Buffer.alloc(0)));
-  const now = new Date(); const expires = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000);
+  const startTime = identity.createdAt > 0 ? identity.createdAt : Date.now();
+  const now = new Date(startTime); const expires = new Date(startTime + 365 * 24 * 60 * 60 * 1000);
   const validity = sequence(generalizedTime(now), generalizedTime(expires));
   const tbs = sequence(der(0xa0, integer(2)), integer(1), algorithm, name(commonName), validity, name(commonName), publicKey);
   const signature = sign("sha256", tbs, { key: privateKey, dsaEncoding: "der" });

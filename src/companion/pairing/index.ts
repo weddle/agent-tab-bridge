@@ -112,13 +112,18 @@ export class HubPairingCeremony {
   }
   complete(response: HubResponse, confirmation: MachineConfirmation): HubPairingResult {
     this.assertLive();
-    if (!this.hello || !this.secrets || response.ceremonyId !== this.invitation.ceremonyId || confirmation.ceremonyId !== this.invitation.ceremonyId) throw new PairingFailure("key-mismatch");
-    const unsigned = { ceremonyId: confirmation.ceremonyId, proverConfirmation: confirmation.proverConfirmation };
-    if (!verifyTranscript(this.hello.machine.publicKeySpki, confirmationTranscript(this.hello, response, unsigned), confirmation.machineSignature)) throw new PairingFailure("key-mismatch");
-    const pake = this.options.pake ?? defaultPakeEngine;
-    if (!pake.verify(this.secrets.proverConfirmation, fromB64(confirmation.proverConfirmation))) throw new PairingFailure("wrong-code");
-    this.completed = true;
-    return { pairing: pairing(this.hello.machine, this.invitation.roles), sharedKey: this.secrets.sharedKey };
+    try {
+      if (!this.hello || !this.secrets || response.ceremonyId !== this.invitation.ceremonyId || confirmation.ceremonyId !== this.invitation.ceremonyId) throw new PairingFailure("key-mismatch");
+      const unsigned = { ceremonyId: confirmation.ceremonyId, proverConfirmation: confirmation.proverConfirmation };
+      if (!verifyTranscript(this.hello.machine.publicKeySpki, confirmationTranscript(this.hello, response, unsigned), confirmation.machineSignature)) throw new PairingFailure("key-mismatch");
+      const pake = this.options.pake ?? defaultPakeEngine;
+      if (!pake.verify(this.secrets.proverConfirmation, fromB64(confirmation.proverConfirmation))) throw new PairingFailure("wrong-code");
+      this.completed = true;
+      return { pairing: pairing(this.hello.machine, this.invitation.roles), sharedKey: this.secrets.sharedKey };
+    } catch (error) {
+      this.completed = true;
+      throw error;
+    }
   }
   private assertLive(consumingAttempt = false): void {
     if (this.completed) throw new PairingFailure("replayed-confirmation");

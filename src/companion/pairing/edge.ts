@@ -8,6 +8,8 @@ import { MachinePairingCeremony, type HubResponse, type MachineConfirmation, typ
 import { clientTlsOptions } from "../../hub/service.js";
 import { selfSignedCertificate } from "../../hub/certificate.js";
 import { encodeHubFrame, HubFrameDecoder } from "../../hub/framing.js";
+import { HubRouteConnection, type HubRouteHandler } from "./routes.js";
+import type { EnrollmentStatement } from "../enrollment-statement.js";
 
 export const EDGE_HUB_STATE_VERSION = 1 as const;
 export interface EdgeHubState { version: typeof EDGE_HUB_STATE_VERSION; address: string; pairing: PinnedPeerKeyset; hubCertificatePem: string; enabledEndpointIds: string[]; }
@@ -69,23 +71,25 @@ export class EdgeHubPairingClient {
   readonly store: EdgeHubPairingStore;
   constructor(private readonly options: ApplicationSupportOptions & { stateStore?: CompanionStateStore; identityStore?: IdentityStore; maxFrameBytes?: number } = {}) { this.store = new EdgeHubPairingStore(options); }
   private presenceSocket?: TLSSocket;
-  async pair(addressValue: string): Promise<EdgePairingResult> {
+  private routes?: HubRouteConnection;
+  async pair(addressValue: string, code: string, confirmedHubFingerprint: string): Promise<EdgePairingResult> {
+    if (!code || !/^\d{6}$/.test(code)) throw new Error("pairing code must be a 6-digit operator-supplied code");
     const address = parseHubAddress(addressValue);
     const identity = await (this.options.identityStore ?? new IdentityStore("companion", this.options)).loadOrCreate();
     const certificate = selfSignedCertificate(identity, "atb machine");
     const socket = await connectSocket({ host: address.host, port: address.port, rejectUnauthorized: false, minVersion: "TLSv1.3", maxVersion: "TLSv1.3", key: certificate.keyPem, cert: certificate.certPem });
     const decoder = new HubFrameDecoder(this.options.maxFrameBytes); const invitationMessage = await control(socket, decoder, { type: "pairInvitationRequest" });
-    if (invitationMessage.type !== "pairInvitation" || typeof invitationMessage.code !== "string" || !invitationMessage.invitation) throw new Error("hub did not return a pairing invitation");
+    if (invitationMessage.type !== "pairInvitation" || !invitationMessage.invitation) throw new Error("hub did not return a pairing invitation");
     const invitation = invitationMessage.invitation as PairingInvitation; const peer = peerFingerprint(socket);
-    if (peer.fingerprint !== invitation.hub.fingerprint) throw new Error("hub certificate does not match invitation fingerprint");
-    const ceremony = new MachinePairingCeremony({ identity, invitation, code: invitationMessage.code, confirmedHubFingerprint: invitation.hub.fingerprint });
+    if (peer.fingerprint !== invitation.hub.fingerprint || confirmedHubFingerprint !== invitation.hub.fingerprint) throw new Error("hub fingerprint confirmation did not match");
+    const ceremony = new MachinePairingCeremony({ identity, invitation, code, confirmedHubFingerprint });
     const hello = ceremony.createHello(); const responseMessage = await control(socket, decoder, { type: "pairHello", hello });
     if (responseMessage.type !== "pairResponse" || !responseMessage.response) throw new Error("hub did not return a pairing response");
     const response = responseMessage.response as HubResponse; const result = ceremony.complete(response);
     const completeMessage = await control(socket, decoder, { type: "pairConfirmation", confirmation: result.confirmation });
     if (completeMessage.type !== "pairComplete") throw new Error("hub did not confirm pairing");
     await this.store.save({ version: EDGE_HUB_STATE_VERSION, address: addressValue, pairing: result.pairing, hubCertificatePem: peer.certificatePem, enabledEndpointIds: [] });
-    socket.destroy(); return { pairing: result.pairing, address: addressValue, code: invitationMessage.code };
+    socket.destroy(); return { pairing: result.pairing, address: addressValue, code };
   }
   async pushPresence(socket: TLSSocket): Promise<void> {
     const state = await this.store.load(); if (!state) return;
@@ -106,5 +110,19 @@ export class EdgeHubPairingClient {
     await this.pushPresence(socket);
     return socket;
   }
-  async unpair(): Promise<void> { this.presenceSocket?.destroy(); this.presenceSocket = undefined; await this.store.forget(); }
+  async pushEnrollment(statement: EnrollmentStatement): Promise<void> {
+    const socket = this.presenceSocket ?? await this.connectPresence();
+    if (!socket) return;
+    socket.write(encodeHubFrame(Buffer.from(JSON.stringify({ type: "enrollmentStatement", statement }), "utf8"), this.options.maxFrameBytes));
+  }
+  async connectRoutes(onRequest: HubRouteHandler): Promise<HubRouteConnection | undefined> {
+    const socket = await this.connectPresence();
+    if (!socket) return undefined;
+    this.routes?.close();
+    const routes = new HubRouteConnection(socket, onRequest, this.options.maxFrameBytes);
+    this.routes = routes;
+    socket.once("close", () => { if (this.routes === routes) this.routes = undefined; });
+    return routes;
+  }
+  async unpair(): Promise<void> { this.routes?.close(); this.routes = undefined; this.presenceSocket?.destroy(); this.presenceSocket = undefined; await this.store.forget(); }
 }

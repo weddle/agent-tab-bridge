@@ -1,10 +1,12 @@
 import net from "node:net";
-import { defaultBrokerSocketPath } from "./broker.js";
+import type { Duplex } from "node:stream";
+import { defaultBrokerSocketPath, type BrokerRouteContext } from "./broker.js";
 import { signTranscript, verifyTranscript } from "./identity.js";
 import { canonicalAuthV2Transcript, createAuthV2EphemeralPublicKey, createAuthV2Nonce, isAuthV2Transcript, type AuthV2RequestedAuthority } from "./auth-v2.js";
 import { loadProfile } from "./profiles.js";
 import { normalizeSessionAccess, type SessionAccess } from "./session-access.js";
 import { CompanionStateStore } from "./state.js";
+import type { HubRouteStream } from "./pairing/routes.js";
 import type { BrokerEvent } from "../atb.js";
 
 export async function createCompanionBrokerClient(options: { directory?: string; profile?: string; socketPath?: string } = {}) {
@@ -18,7 +20,7 @@ export async function createCompanionBrokerClient(options: { directory?: string;
   return createBrokerClient({ socketPath, token: state.machine.brokerSecret });
 }
 
-export type BrokerClientOptions = { socketPath: string; token?: string; profile?: { name: string; principalId: string; publicKeySpki: string; privateKeyPkcs8: string }; socketFactory?: () => net.Socket };
+export type BrokerClientOptions = { socketPath: string; token?: string; profile?: { name: string; principalId: string; publicKeySpki: string; privateKeyPkcs8: string }; route?: Pick<BrokerRouteContext, "hubId" | "routeId" | "streamId" | "address">; socketFactory?: () => net.Socket | Duplex };
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void };
 
 /** Newline-delimited broker client. Authentication precedes every command stream. */
@@ -69,6 +71,7 @@ export function createBrokerClient(options: BrokerClientOptions) {
           && transcript.controllerEphemeralPublicKey === profileAttempt.controllerEphemeralPublicKey
           && transcript.expiresAt >= Date.now()
           && JSON.stringify(transcript.authority) === JSON.stringify(profileAttempt.authority)
+          && (options.route === undefined || (transcript.edge.machineId === options.route.address.machineId && transcript.endpointId === options.route.address.endpointId && transcript.hubId === options.route.hubId && transcript.routeId === options.route.routeId && transcript.streamId === options.route.streamId))
           && verifyTranscript(transcript.edge.publicKeySpki, canonicalAuthV2Transcript(transcript), message.signature);
         if (!validChallenge) {
           rejectAuth?.(new Error("broker authentication failed"));
@@ -137,4 +140,9 @@ export function createBrokerClient(options: BrokerClientOptions) {
       if (transport && typeof transport === "object" && "destroy" in transport && typeof transport.destroy === "function") transport.destroy();
     },
   };
+}
+
+/** Profile-authenticated broker client carried inside one hub-routed opaque stream. */
+export function createRoutedBrokerClient(options: Readonly<{ stream: HubRouteStream; profile: NonNullable<BrokerClientOptions["profile"]>; route: NonNullable<BrokerClientOptions["route"]> }>) {
+  return createBrokerClient({ socketPath: "hub-routed", profile: options.profile, route: options.route, socketFactory: () => options.stream.transport });
 }
