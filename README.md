@@ -42,6 +42,7 @@ Working today:
 - Browser-local approval for selected tabs, approved domains, or full website access; full access still requires tabs to enter the session's visible group.
 - Named sessions, separately approved access upgrades, session-aware tab inventory, ownership conflict detection, and explicit revocation.
 - Live end-to-end acceptance in Brave, plus automated protocol, relay, authorization, and extension-UI coverage.
+- Bounded endpoint recovery for extension reloads and transient Native Messaging loss: the same pinned browser identity resumes the same loopback CDP URL without re-approval, while expiry or identity changes fail closed.
 
 Not yet provided:
 
@@ -49,7 +50,7 @@ Not yet provided:
 - A stable public CLI/protocol or migration support for stored identities.
 - An external security audit or a claim that the prototype is safe for unattended use.
 - Full acceptance on regular Google Chrome; current Chrome coverage uses Chrome-for-Testing.
-- Session recovery across companion/browser restarts, trusted-LAN operation, bookmarks/history access, managed actions, or Guardian Auto.
+- Session preservation across full browser or companion process restarts, trusted-LAN operation, bookmarks/history access, managed actions, or Guardian Auto. A full browser quit revokes sessions and removes their groups.
 
 See [`ROADMAP.md`](ROADMAP.md) for implemented boundaries, remaining hardening, and later capability work.
 
