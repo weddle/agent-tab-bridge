@@ -33,6 +33,15 @@
   --atb-group-orange: light-dark(#e37400, #fdd663);
   --atb-group-red: light-dark(#d93025, #f28b82);
 
+  /* Authority treatments: never reuse these for connection/error status. */
+  --atb-authority-selected-tabs: var(--atb-group-blue);
+  --atb-authority-sites: var(--atb-group-orange);
+  --atb-authority-full-access: var(--atb-group-red);
+  --atb-authority-pending: var(--atb-text-muted);
+  --atb-status-connected: var(--atb-success);
+  --atb-status-attention: var(--atb-warning);
+  --atb-status-off: var(--atb-text-muted);
+
   --atb-font: system-ui, -apple-system, "Segoe UI", sans-serif;
   --atb-radius-card: 8px;
   --atb-radius-control: 6px;

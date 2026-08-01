@@ -5,17 +5,42 @@ import { BrokerServer, startBrokerServer } from "./broker.js";
 import { deriveControllerPrincipalId, fingerprintSpki, HostIdentityHandshake, IdentityStore, createBrokerSecret } from "./identity.js";
 import { NativeMessageDecoder, writeNativeFrame } from "./native-framing.js";
 import { NATIVE_PROTOCOL_VERSION, type AccessUpgradeRecord, type ExtensionToHostMessage, type HostToExtensionMessage, type NativeMessage, type SharedTabRecord } from "./native-protocol.js";
-import { CompanionStateStore } from "./state.js";
+import { CompanionStateStore, type PinnedExtensionIdentity } from "./state.js";
 import { TaskSessionError, TaskSessionManager, type TaskSessionRelay } from "./task-sessions.js";
 import { sameSessionAccess, type SessionAccessDelta } from "./session-access.js";
 import { localRouteProvenance, sameRouteProvenance } from "./endpoint-contracts.js";
+import type { NativeEndpointBinding, NativeEndpointRecovery } from "./endpoint-recovery.js";
 
 export const NATIVE_HOST_NAME = "com.agenttabbridge.companion";
-export type NativeHostOptions = { input?: Readable; output?: Writable; stateStore?: CompanionStateStore; identityStore?: IdentityStore; startRelay?: () => Promise<TaskSessionRelay> };
+export type NativeHostOptions = {
+  input?: Readable;
+  output?: Writable;
+  stateStore?: CompanionStateStore;
+  identityStore?: IdentityStore;
+  startRelay?: () => Promise<TaskSessionRelay>;
+  brokerSocketPath?: (identity: PinnedExtensionIdentity) => string;
+  recoverEndpoint?: (identity: PinnedExtensionIdentity) => NativeEndpointRecovery | Promise<NativeEndpointRecovery | undefined> | undefined;
+  onEndpointReady?: (identity: PinnedExtensionIdentity, broker: BrokerServer, recovery: NativeEndpointRecovery) => void | Promise<void>;
+  onEndpointSuspended?: (recovery: NativeEndpointRecovery) => boolean | Promise<boolean>;
+  onEndpointClosed?: (endpointId: string, broker: BrokerServer | null) => void | Promise<void>;
+};
 class NativeOutputFailure extends Error { constructor(cause: unknown) { super(`native messaging output failed: ${cause instanceof Error ? cause.message : String(cause)}`); this.name = "NativeOutputFailure"; } }
 
-export async function runNativeMessagingHost(options: NativeHostOptions = {}): Promise<void> {
+/** Endpoint engine owned by the machine supervisor; it never touches Native Messaging stdio directly. */
+export async function runNativeEndpoint(options: NativeHostOptions = {}): Promise<void> {
   const input = options.input ?? process.stdin;
+  const bufferedInput: Buffer[] = [];
+  let receiveInput: ((chunk: Buffer) => void) | undefined;
+  let inputTerminated = false;
+  let finishInput = () => {};
+  input.on("data", (chunk: Buffer) => {
+    if (receiveInput) receiveInput(chunk);
+    else bufferedInput.push(Buffer.from(chunk));
+  });
+  input.once("end", () => { inputTerminated = true; finishInput(); });
+  input.once("close", () => { inputTerminated = true; finishInput(); });
+  input.once("error", () => { inputTerminated = true; finishInput(); });
+  input.resume();
   const output = options.output ?? process.stdout;
   const stateStore = options.stateStore ?? new CompanionStateStore();
   const identityStore = options.identityStore ?? new IdentityStore("companion");
@@ -23,6 +48,7 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
   const state = await stateStore.initializeMachine(companion.principalId, createBrokerSecret());
   const controllerPrincipalId = deriveControllerPrincipalId(state.machine.brokerSecret);
   let trusted: { extensionId: string; fingerprint: string; principalId: string; displayName: string } | null = null;
+  let endpointId: string | undefined;
   let broker: BrokerServer | null = null;
   let ending = false;
   let finishHost: () => void = () => {};
@@ -31,6 +57,13 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
   const pendingTabRequests = new Map<string, { resolve: (tabs: SharedTabRecord[]) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   const pendingClaimRequests = new Map<string, { resolve: (tab: SharedTabRecord) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   const pendingAccess = new Map<string, AccessUpgradeRecord>();
+  let recovery: NativeEndpointRecovery | undefined;
+  let sessions: TaskSessionManager | undefined;
+  let binding: NativeEndpointBinding | undefined;
+  const sessionManager = (): TaskSessionManager => {
+    if (!sessions) throw new TaskSessionError("invalidSession", "browser endpoint is not ready");
+    return sessions;
+  };
   const pendingAccessBySession = new Map<string, string>();
   const pendingEnrollments = new Map<string, { profileName: string; publicKeySpki: string; fingerprint: string; code: string; expiresAt: number; attempts: number; timer: NodeJS.Timeout }>();
   let outputTail = Promise.resolve();
@@ -78,7 +111,7 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
   };
   const requestAccess = async (principalId: string, stableSessionKey: string, delta: SessionAccessDelta): Promise<AccessUpgradeRecord> => {
     if (!trusted) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
-    const preview = sessions.previewAccessUpgrade(principalId, stableSessionKey, delta);
+    const preview = sessionManager().previewAccessUpgrade(principalId, stableSessionKey, delta);
     if (pendingAccessBySession.has(preview.session.id)) throw new TaskSessionError("sessionConflict", "an access upgrade is already awaiting approval");
     const request: AccessUpgradeRecord = {
       id: randomUUID(),
@@ -110,35 +143,78 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
     await send({ version: NATIVE_PROTOCOL_VERSION, type: "enrollPending", enrollmentId, profileName, profileFingerprint: fingerprint, expiresAt });
     return { enrollmentId, code, expiresAt };
   };
-  const sessions = new TaskSessionManager({ startRelay: options.startRelay ?? startAgentTabRelay, routeFor: (principalId, access) => {
-    if (!trusted) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
-    return localRouteProvenance(trusted.fingerprint, principalId, access);
-  }, onEvent: (event) => {
+  const attachBinding = (target: NativeEndpointBinding): void => {
+    binding = target;
+    binding.trusted = true;
+    binding.send = send;
+    binding.listTabs = listTabs;
+    binding.claimTab = claimTab;
+    binding.requestAccess = requestAccess;
+    binding.enrollProfile = enrollProfile;
+  };
+  const emitSessionEvent = (event: import("./task-sessions.js").SessionLifecycleEvent) => {
     const session = { ...event.session, requestedCapabilities: [...event.session.requestedCapabilities], access: { ...event.session.access, tabIds: [...event.session.access.tabIds], domains: [...event.session.access.domains] }, route: { ...event.session.route, accessCeiling: { ...event.session.route.accessCeiling, tabIds: [...event.session.route.accessCeiling.tabIds], domains: [...event.session.route.accessCeiling.domains] } } };
-    if (event.type === "pending") { broker?.publish({ event: "pending", sessionId: session.id, session }); void send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionPending", session }).catch(() => {}); }
-    else if (event.type === "active") broker?.publish({ event: "active", sessionId: session.id, session, cdpUrl: event.cdpUrl });
-    else {
+    if (event.type === "pending") {
+      broker?.publish({ event: "pending", sessionId: session.id, session });
+      void binding?.send?.({ version: NATIVE_PROTOCOL_VERSION, type: "sessionPending", session }).catch(() => {});
+    } else if (event.type === "active") {
+      broker?.publish({ event: "active", sessionId: session.id, session, cdpUrl: event.cdpUrl });
+    } else if (event.type === "reconnecting") {
+      broker?.publish({ event: "reconnecting", sessionId: session.id, session });
+    } else {
       const accessRequestId = pendingAccessBySession.get(session.id);
       if (accessRequestId) {
         pendingAccessBySession.delete(session.id);
         pendingAccess.delete(accessRequestId);
         broker?.publish({ event: "accessDeclined", sessionId: session.id, accessRequestId, reason: "session ended" });
-        void send({ version: NATIVE_PROTOCOL_VERSION, type: "accessDeclined", accessRequestId, sessionId: session.id }).catch(() => {});
+        void binding?.send?.({ version: NATIVE_PROTOCOL_VERSION, type: "accessDeclined", accessRequestId, sessionId: session.id }).catch(() => {});
       }
       broker?.publish({ event: "revoked", sessionId: session.id, session, reason: event.reason });
-      void send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionStopped", session, reason: event.reason }).catch(() => {});
+      void binding?.send?.({ version: NATIVE_PROTOCOL_VERSION, type: "sessionStopped", session, reason: event.reason }).catch(() => {});
     }
-  } });
-  broker = await startBrokerServer({ token: state.machine.brokerSecret, sessions, isTrusted: () => trusted !== null, controller: () => trusted ? { principalId: controllerPrincipalId, displayName: "Local controller" } : null, profile: async (name) => {
-    const current = await stateStore.load();
-    const record = current.machine.enrollments.find((profile) => profile.name === name);
-    return record ? { principalId: record.principalId, displayName: record.name, publicKeySpki: record.publicKeySpki } : null;
-  }, authContext: () => trusted ? { machineId: companion.principalId, machinePublicKeySpki: companion.publicKeySpki, machinePrivateKeyPkcs8: companion.privateKeyPkcs8, endpointId: trusted.fingerprint } : null, enrollProfile, status: () => ({ companionPrincipalId: companion.principalId, controllerPrincipalId }), listTabs, claimTab, requestAccess });
+  };
+  const createSessions = (identity: PinnedExtensionIdentity) => new TaskSessionManager({
+    startRelay: options.startRelay ?? startAgentTabRelay,
+    routeFor: (principalId, access) => localRouteProvenance(identity.fingerprint, principalId, access),
+    onEvent: emitSessionEvent,
+  });
+  const unavailable = <T>(message: string): Promise<T> => Promise.reject(new TaskSessionError("invalidSession", message));
+  const startBroker = async (identity: PinnedExtensionIdentity): Promise<BrokerServer> => {
+    if (broker) return broker;
+    broker = await startBrokerServer({
+      ...(options.brokerSocketPath ? { socketPath: options.brokerSocketPath(identity) } : {}),
+      token: state.machine.brokerSecret,
+      sessions: sessionManager(),
+      isTrusted: () => binding?.trusted === true,
+      controller: () => binding?.trusted ? { principalId: controllerPrincipalId, displayName: "Local controller" } : null,
+      profile: async (name) => {
+        const current = await stateStore.load();
+        const record = current.machine.enrollments.find((profile) => profile.name === name);
+        return record ? { principalId: record.principalId, displayName: record.name, publicKeySpki: record.publicKeySpki } : null;
+      },
+      authContext: () => binding?.trusted ? { machineId: companion.principalId, machinePublicKeySpki: companion.publicKeySpki, machinePrivateKeyPkcs8: companion.privateKeyPkcs8, endpointId: identity.fingerprint } : null,
+      enrollProfile: (profileName, publicKeySpki) => binding?.enrollProfile?.(profileName, publicKeySpki) ?? unavailable("browser endpoint is reconnecting"),
+      status: () => ({ companionPrincipalId: companion.principalId, controllerPrincipalId, recovery: sessions?.snapshot().some((session) => session.state === "reconnecting") === true }),
+      listTabs: (sessionId, scope) => binding?.listTabs?.(sessionId, scope) ?? unavailable("browser endpoint is reconnecting"),
+      claimTab: (sessionId, tabId) => binding?.claimTab?.(sessionId, tabId) ?? unavailable("browser endpoint is reconnecting"),
+      requestAccess: (principalId, stableSessionKey, delta) => binding?.requestAccess?.(principalId, stableSessionKey, delta) ?? unavailable("browser endpoint is reconnecting"),
+    });
+    return broker;
+  };
   const handshake = new HostIdentityHandshake(identityStore, stateStore);
   const decoder = new NativeMessageDecoder();
   const requestIds = new Set<string>();
+  let permanentClose = false;
   const stop = async () => {
     if (outputFailure) trusted = null;
+    if (binding) {
+      binding.trusted = false;
+      binding.send = undefined;
+      binding.listTabs = undefined;
+      binding.claimTab = undefined;
+      binding.requestAccess = undefined;
+      binding.enrollProfile = undefined;
+    }
     for (const pending of pendingTabRequests.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("native host is closing"));
@@ -149,29 +225,68 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
       pending.reject(new Error("native host is closing"));
     }
     pendingClaimRequests.clear();
-    try { await sessions.revokeAll("hostClosing"); } finally { try { await broker?.close(); } catch {} }
+    if (recovery && !outputFailure && !permanentClose && await options.onEndpointSuspended?.(recovery)) return;
+    try {
+      await sessions?.revokeAll("hostClosing");
+    } finally {
+      try { await broker?.close(); } catch {}
+      if (endpointId) await options.onEndpointClosed?.(endpointId, broker);
+    }
   };
   const snapshot = async () => {
-    const all = sessions.snapshot().map((session) => ({ ...session, requestedCapabilities: [...session.requestedCapabilities], access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] }, route: { ...session.route, accessCeiling: { ...session.route.accessCeiling, tabIds: [...session.route.accessCeiling.tabIds], domains: [...session.route.accessCeiling.domains] } } }));
+    const manager = sessionManager();
+    const all = manager.snapshot().map((session) => ({ ...session, requestedCapabilities: [...session.requestedCapabilities], access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] }, route: { ...session.route, accessCeiling: { ...session.route.accessCeiling, tabIds: [...session.route.accessCeiling.tabIds], domains: [...session.route.accessCeiling.domains] } } }));
     const current = await stateStore.load();
     const enrolledProfiles = current.machine.enrollments.map(({ name, principalId, enrolledAt }) => ({ name, principalId, enrolledAt }));
     await send({ version: NATIVE_PROTOCOL_VERSION, type: "snapshot", pending: all.filter(({ state }) => state === "pending"), active: all.filter(({ state }) => state === "active"), sharedTabs: [], pendingAccess: [...pendingAccess.values()], enrolledProfiles });
+    for (const session of all.filter(({ state }) => state === "reconnecting")) {
+      const relayUrl = manager.pairingUrl(session.id);
+      if (relayUrl) await send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionResuming", session, relayUrl });
+    }
   };
   await new Promise<void>((resolve) => {
     finishHost = () => { if (ending) return; ending = true; void outputTail.then(stop, stop).then(() => resolve(), () => resolve()); };
     const enqueue = (message: NativeMessage) => { queue = queue.then(async () => await handle(message as ExtensionToHostMessage)).catch((error) => { if (error instanceof NativeOutputFailure || error instanceof Error) finishHost(); }); };
     let queue = Promise.resolve();
-    input.on("data", (chunk: Buffer) => {
+    finishInput = () => {
+      try { decoder.finish(); } catch {}
+      finishHost();
+    };
+    receiveInput = (chunk) => {
       if (ending) return;
       try { for (const message of decoder.feed(chunk)) enqueue(message); } catch { finishHost(); }
-    });
-    input.once("end", () => { try { decoder.finish(); } catch {} finishHost(); });
-    input.once("error", finishHost);
+    };
+    for (const chunk of bufferedInput) receiveInput(chunk);
+    bufferedInput.length = 0;
+    if (inputTerminated) finishInput();
     async function handle(message: ExtensionToHostMessage): Promise<void> {
       if (message.requestId && (requestIds.has(message.requestId) || !requestIds.add(message.requestId))) return;
       try {
         if (message.type === "hello") { const challenge = await handshake.createChallenge(message); await send(message.requestId ? { ...challenge, requestId: message.requestId } : challenge); return; }
-        if (message.type === "helloProof") { const pinned = await handshake.verifyProof(message); trusted = { extensionId: pinned.extensionId, fingerprint: pinned.fingerprint, principalId: pinned.fingerprint, displayName: pinned.extensionId }; await send({ version: NATIVE_PROTOCOL_VERSION, type: "trusted", companionPrincipalId: companion.principalId, extensionFingerprint: pinned.fingerprint, ...(message.requestId ? { requestId: message.requestId } : {}) }); await snapshot(); return; }
+        if (message.type === "helloProof") {
+          const pinned = await handshake.verifyProof(message);
+          trusted = { extensionId: pinned.extensionId, fingerprint: pinned.fingerprint, principalId: pinned.fingerprint, displayName: pinned.extensionId };
+          endpointId = pinned.fingerprint;
+          recovery = await options.recoverEndpoint?.(pinned);
+          if (recovery) {
+            sessions = recovery.sessions;
+            broker = recovery.broker;
+            sessions.setEventListener(emitSessionEvent);
+            attachBinding(recovery.binding);
+            if (binding) binding.trusted = false;
+          } else {
+            sessions = createSessions(pinned);
+            const freshBinding: NativeEndpointBinding = { trusted: false, send: undefined, listTabs: undefined, claimTab: undefined, requestAccess: undefined, enrollProfile: undefined };
+            attachBinding(freshBinding);
+            const endpointBroker = await startBroker(pinned);
+            recovery = { identity: pinned, sessions, broker: endpointBroker, binding: freshBinding };
+          }
+          const endpointBroker = broker!;
+          await options.onEndpointReady?.(pinned, endpointBroker, recovery);
+          await send({ version: NATIVE_PROTOCOL_VERSION, type: "trusted", companionPrincipalId: companion.principalId, extensionFingerprint: pinned.fingerprint, ...(message.requestId ? { requestId: message.requestId } : {}) });
+          await snapshot();
+          return;
+        }
         if (!trusted) return;
         if (message.type === "tabsListed") {
           const pending = pendingTabRequests.get(message.requestId);
@@ -193,12 +308,19 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
           pending.resolve(message.tab);
           return;
         }
-        if (message.type === "revokeDevice") { const current = trusted; await sessions.revokeAll("deviceRevoked"); await stateStore.unpinExtension(current.extensionId, current.fingerprint); trusted = null; await outputTail; finishHost(); return; }
-        if (message.type === "approveSession") { const session = sessions.get(message.sessionId); if (!session || session.state !== "pending" || session.controllerPrincipalId !== message.controllerPrincipalId || session.displayControllerName !== message.displayControllerName || session.taskLabel !== message.taskLabel || session.expiresAt !== message.expiresAt || session.requestedCapabilities.join(",") !== message.requestedCapabilities.join(",") || !sameSessionAccess(session.access, message.access) || !sameRouteProvenance(session.route, message.route)) return; const approved = await sessions.approve(session.id); await send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionStarted", session: { ...approved.session, requestedCapabilities: [...approved.session.requestedCapabilities], access: { ...approved.session.access, tabIds: [...approved.session.access.tabIds], domains: [...approved.session.access.domains] }, route: { ...approved.session.route, accessCeiling: { ...approved.session.route.accessCeiling, tabIds: [...approved.session.route.accessCeiling.tabIds], domains: [...approved.session.route.accessCeiling.domains] } } }, relayUrl: approved.pairingUrl }); return; }
+        if (message.type === "revokeDevice") { const current = trusted; permanentClose = true; await sessionManager().revokeAll("deviceRevoked"); await stateStore.unpinExtension(current.extensionId, current.fingerprint); trusted = null; await outputTail; finishHost(); return; }
+        if (message.type === "approveSession") {
+          const manager = sessionManager();
+          const session = manager.get(message.sessionId);
+          if (!session || session.state !== "pending" || session.controllerPrincipalId !== message.controllerPrincipalId || session.displayControllerName !== message.displayControllerName || session.taskLabel !== message.taskLabel || session.expiresAt !== message.expiresAt || session.requestedCapabilities.join(",") !== message.requestedCapabilities.join(",") || !sameSessionAccess(session.access, message.access) || !sameRouteProvenance(session.route, message.route)) return;
+          const approved = await manager.approve(session.id);
+          await send({ version: NATIVE_PROTOCOL_VERSION, type: "sessionStarted", session: { ...approved.session, requestedCapabilities: [...approved.session.requestedCapabilities], access: { ...approved.session.access, tabIds: [...approved.session.access.tabIds], domains: [...approved.session.access.domains] }, route: { ...approved.session.route, accessCeiling: { ...approved.session.route.accessCeiling, tabIds: [...approved.session.route.accessCeiling.tabIds], domains: [...approved.session.route.accessCeiling.domains] } } }, relayUrl: approved.pairingUrl });
+          return;
+        }
         if (message.type === "approveAccess") {
           const request = pendingAccess.get(message.accessRequestId);
           if (!request || request.sessionId !== message.sessionId || !sameSessionAccess(request.requestedAccess, message.requestedAccess)) return;
-          const session = sessions.applyAccessUpgrade(request.sessionId, request.delta, request.requestedAccess);
+          const session = sessionManager().applyAccessUpgrade(request.sessionId, request.delta, request.requestedAccess);
           pendingAccess.delete(request.id);
           pendingAccessBySession.delete(request.sessionId);
           const serialized = { ...session, requestedCapabilities: [...session.requestedCapabilities], access: { ...session.access, tabIds: [...session.access.tabIds], domains: [...session.access.domains] } };
@@ -247,14 +369,14 @@ export async function runNativeMessagingHost(options: NativeHostOptions = {}): P
           const record = current.machine.enrollments.find((profile) => profile.name === message.profileName);
           if (record) {
             await stateStore.update((state) => ({ ...state, machine: { ...state.machine, enrollments: state.machine.enrollments.filter((profile) => profile.name !== message.profileName) } }));
-            await Promise.allSettled(sessions.snapshot().filter((session) => session.controllerPrincipalId === record.principalId && session.state !== "revoked").map(async (session) => await sessions.revoke(session.id, "profileRevoked")));
+            await Promise.allSettled(sessionManager().snapshot().filter((session) => session.controllerPrincipalId === record.principalId && session.state !== "revoked").map(async (session) => await sessionManager().revoke(session.id, "profileRevoked")));
           }
           await snapshot();
           return;
         }
-        if (message.type === "revokeSession" && sessions.get(message.sessionId)) { await sessions.revoke(message.sessionId, message.reason ?? "browserRevoked"); return; }
-        if (message.type === "relayReady") { sessions.relayReady(message.sessionId); await snapshot(); return; }
-        if (message.type === "relayFailed" && sessions.get(message.sessionId)) await sessions.relayFailed(message.sessionId, "relayFailed");
+        if (message.type === "revokeSession" && sessionManager().get(message.sessionId)) { await sessionManager().revoke(message.sessionId, message.reason ?? "browserRevoked"); return; }
+        if (message.type === "relayReady") { sessionManager().relayReady(message.sessionId); if (binding) binding.trusted = true; await snapshot(); return; }
+        if (message.type === "relayFailed" && sessionManager().get(message.sessionId)) await sessionManager().relayFailed(message.sessionId, "relayFailed");
       } catch (error) { if (error instanceof NativeOutputFailure) throw error; if (message.type === "helloProof" || message.type === "approveSession" || message.type === "approveAccess" || message.type === "declineAccess" || message.type === "confirmEnrollment" || message.type === "revokeProfile" || message.type === "revokeSession" || message.type === "relayReady" || message.type === "relayFailed") return; throw error; }
     }
   });

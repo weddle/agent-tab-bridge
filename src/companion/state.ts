@@ -89,7 +89,9 @@ function migrateLegacyState(legacy: LegacyState): CompanionState {
 }
 
 export class CompanionStateStore {
-  readonly filePath: string; private state: CompanionState | undefined;
+  readonly filePath: string;
+  private state: CompanionState | undefined;
+  private writeTail = Promise.resolve();
   constructor(options: ApplicationSupportOptions & { fileName?: string } = {}) { this.filePath = applicationSupportPath(options.fileName ?? "state.json", options); }
   async load(): Promise<CompanionState> {
     if (this.state) return structuredClone(this.state);
@@ -100,8 +102,27 @@ export class CompanionStateStore {
     else throw new Error("invalid companion state");
     return structuredClone(this.state);
   }
-  async save(state: CompanionState): Promise<void> { if (!validState(state)) throw new TypeError("invalid companion state"); await atomicWritePrivateJson(this.filePath, state); this.state = structuredClone(state); }
-  async update(mutator: (state: CompanionState) => CompanionState | Promise<CompanionState>): Promise<CompanionState> { const next = await mutator(await this.load()); await this.save(next); return structuredClone(next); }
+  private async write<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.writeTail.then(operation);
+    this.writeTail = next.then(() => undefined, () => undefined);
+    return await next;
+  }
+  async save(state: CompanionState): Promise<void> {
+    await this.write(async () => {
+      if (!validState(state)) throw new TypeError("invalid companion state");
+      await atomicWritePrivateJson(this.filePath, state);
+      this.state = structuredClone(state);
+    });
+  }
+  async update(mutator: (state: CompanionState) => CompanionState | Promise<CompanionState>): Promise<CompanionState> {
+    return await this.write(async () => {
+      const next = await mutator(await this.load());
+      if (!validState(next)) throw new TypeError("invalid companion state");
+      await atomicWritePrivateJson(this.filePath, next);
+      this.state = structuredClone(next);
+      return structuredClone(next);
+    });
+  }
   async initializeMachine(machineId: string, brokerSecret: string): Promise<CompanionState> {
     if (!validFingerprint(machineId) || !brokerSecret) throw new TypeError("invalid machine identity");
     return await this.update((current) => ({ ...current, machine: { ...current.machine, identity: { machineId }, brokerSecret: current.machine.brokerSecret || brokerSecret } }));
@@ -109,15 +130,27 @@ export class CompanionStateStore {
   async pinExtension(identity: PinnedExtensionIdentity): Promise<EndpointIdentity> {
     const fingerprint = extensionFingerprint(identity.publicKeySpki);
     if (!fingerprint || fingerprint !== identity.fingerprint || !identity.extensionId || !Number.isInteger(identity.pinnedAt)) throw new TypeError("invalid pinned extension identity");
-    const current = await this.load();
-    const existing = current.endpoints.find((endpoint) => endpoint.identity.extensionId === identity.extensionId && endpoint.identity.endpointId === fingerprint);
-    if (existing) return structuredClone(existing.identity);
-    const endpoint: EndpointIdentity = { endpointId: fingerprint, extensionId: identity.extensionId, extensionFingerprint: fingerprint, publicKeySpki: identity.publicKeySpki, label: identity.label?.trim() || identity.extensionId, pinnedAt: identity.pinnedAt };
-    current.endpoints.push({ identity: endpoint, sessions: [], groups: [] });
-    await this.save(current);
-    return structuredClone(endpoint);
+    let endpoint: EndpointIdentity | undefined;
+    await this.update((current) => {
+      const existing = current.endpoints.find((item) => item.identity.extensionId === identity.extensionId && item.identity.endpointId === fingerprint);
+      if (existing) {
+        endpoint = existing.identity;
+        return current;
+      }
+      endpoint = { endpointId: fingerprint, extensionId: identity.extensionId, extensionFingerprint: fingerprint, publicKeySpki: identity.publicKeySpki, label: identity.label?.trim() || identity.extensionId, pinnedAt: identity.pinnedAt };
+      return { ...current, endpoints: [...current.endpoints, { identity: endpoint, sessions: [], groups: [] }] };
+    });
+    return structuredClone(endpoint!);
   }
-  async unpinExtension(extensionId: string, fingerprint?: string): Promise<boolean> { const current = await this.load(); const before = current.endpoints.length; current.endpoints = current.endpoints.filter((endpoint) => endpoint.identity.extensionId !== extensionId || (fingerprint !== undefined && endpoint.identity.endpointId !== fingerprint)); if (current.endpoints.length === before) return false; await this.save(current); return true; }
+  async unpinExtension(extensionId: string, fingerprint?: string): Promise<boolean> {
+    let changed = false;
+    await this.update((current) => {
+      const endpoints = current.endpoints.filter((endpoint) => endpoint.identity.extensionId !== extensionId || (fingerprint !== undefined && endpoint.identity.endpointId !== fingerprint));
+      changed = endpoints.length !== current.endpoints.length;
+      return changed ? { ...current, endpoints } : current;
+    });
+    return changed;
+  }
   async status(): Promise<CompanionStateStatus> {
     const state = await this.load();
     return { version: STATE_VERSION, machineId: state.machine.identity.machineId, endpoints: state.endpoints.map((endpoint) => ({ endpointId: endpoint.identity.endpointId, extensionId: endpoint.identity.extensionId, extensionFingerprint: endpoint.identity.extensionFingerprint, label: endpoint.identity.label, pinnedAt: endpoint.identity.pinnedAt, publicKeySpkiFingerprint: extensionFingerprint(endpoint.identity.publicKeySpki)!, sessions: structuredClone(endpoint.sessions), groups: structuredClone(endpoint.groups) })), hasBrokerSecret: state.machine.brokerSecret.length > 0 };

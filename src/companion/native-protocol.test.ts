@@ -30,6 +30,10 @@ describe("native protocol validation", () => {
     expect(validateNativeMessage(approval)).toBe(true);
     expect(validateNativeMessage({ ...approval, access: { level: "domains", tabIds: [], domains: ["https://example.com/path"] } })).toBe(false);
     expect(validateNativeMessage({ ...approval, unexpected: true })).toBe(false);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "revokeSession", sessionId: "task-1", reason: "user revoked" })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "revokeSession", sessionId: "task-1", unexpected: true })).toBe(false);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "sessionResuming", session: session({ state: "reconnecting" }), relayUrl: "ws://127.0.0.1/extension#token" })).toBe(true);
+    expect(validateNativeMessage({ version: NATIVE_PROTOCOL_VERSION, type: "sessionResuming", session: session({ state: "active" }), relayUrl: "ws://127.0.0.1/extension#token" })).toBe(false);
     const accessPending = {
       version: NATIVE_PROTOCOL_VERSION,
       type: "accessPending",

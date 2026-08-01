@@ -7,8 +7,8 @@ import { normalizeSessionAccess, type SessionAccess } from "./session-access.js"
 import { CompanionStateStore } from "./state.js";
 import type { BrokerEvent } from "../atb.js";
 
-export async function createCompanionBrokerClient(options: { directory?: string; profile?: string } = {}) {
-  const socketPath = defaultBrokerSocketPath({ directory: options.directory });
+export async function createCompanionBrokerClient(options: { directory?: string; profile?: string; socketPath?: string } = {}) {
+  const socketPath = options.socketPath ?? defaultBrokerSocketPath({ directory: options.directory });
   if (options.profile !== undefined) {
     const record = await loadProfile(options.profile, { directory: options.directory });
     return createBrokerClient({ socketPath, profile: { name: record.name, principalId: record.principalId, publicKeySpki: record.publicKeySpki, privateKeyPkcs8: record.privateKeyPkcs8 } });
@@ -132,7 +132,9 @@ export function createBrokerClient(options: BrokerClientOptions) {
     onEvent(listener: (event: BrokerEvent) => void): () => void { listeners.add(listener); return () => listeners.delete(listener); },
     async close(): Promise<void> {
       if (closed) return;
-      await new Promise<void>((resolve) => socket.end(() => resolve()));
+      socket.end();
+      const transport: unknown = socket;
+      if (transport && typeof transport === "object" && "destroy" in transport && typeof transport.destroy === "function") transport.destroy();
     },
   };
 }

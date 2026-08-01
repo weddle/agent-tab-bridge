@@ -48,12 +48,12 @@
         border-radius: 50%;
         background: var(--atb-text-muted);
       }
-      .dot.connected { background: var(--atb-success); }
-      .dot.connecting { background: var(--atb-warning); }
-      .dot.disconnected { background: var(--atb-text-muted); }
-      /* Error is a hollow ring so it never reads as "just another color". */
+      .dot.connected { background: var(--atb-status-connected); }
+      .dot.connecting { background: var(--atb-status-attention); }
+      .dot.disconnected { background: var(--atb-status-off); }
+      /* Error is a hollow grey ring: red is reserved for full access. */
       .dot.error {
-        border: 2px solid var(--atb-danger);
+        border: 2px solid var(--atb-status-off);
         background: transparent;
       }
       .identity {
@@ -103,16 +103,32 @@
         gap: var(--atb-space-1);
         padding: var(--atb-space-3);
       }
-      .card.access-selectedTabs { border-left: 3px solid var(--atb-accent-fill); }
-      .card.access-domains { border-left: 3px solid var(--atb-warning); }
-      .card.access-full { border-left: 3px solid var(--atb-danger); }
+      .card.access-selectedTabs { border-left: 3px solid var(--atb-authority-selected-tabs); }
+      .card.access-domains { border-left: 3px solid var(--atb-authority-sites); }
+      .card.access-full { border-left: 3px solid var(--atb-authority-full-access); }
+      .card.access-pending { border-left: 3px solid var(--atb-authority-pending); }
       /* Approval state is expressed separately from the access-level accent. */
-      .card.pending { box-shadow: inset 0 2px 0 var(--atb-warning); }
-      .access-summary {
-        font-size: 12px;
-        font-weight: 600;
+      .card.pending { box-shadow: inset 0 2px 0 var(--atb-status-attention); }
+      .access-summary { font-size: 12px; font-weight: 600; }
+      .card.access-full .access-summary,
+      .full-access-consequence { color: var(--atb-authority-full-access); }
+      .full-access-consequence { font-size: 12px; }
+      .scope-block { display: flex; flex-direction: column; gap: var(--atb-space-1); }
+      .scope-chips { display: flex; flex-wrap: wrap; gap: var(--atb-space-1); }
+      .scope-chip, .grant-chip {
+        display: inline-block;
+        padding: 2px 6px;
+        border-radius: var(--atb-radius-control);
+        background: var(--atb-authority-pending);
+        color: var(--atb-bg);
+        font-size: 11px;
       }
-      .card.access-full .access-summary { color: var(--atb-danger); }
+      .access-selectedTabs .scope-chip { background: var(--atb-authority-selected-tabs); }
+      .access-domains .scope-chip { background: var(--atb-authority-sites); }
+      .access-full .scope-chip { background: var(--atb-authority-full-access); }
+      .remembered-grant { display: flex; align-items: center; gap: var(--atb-space-1); font-size: 12px; }
+      .remembered-grant .atb-btn { min-height: 24px; padding: 2px 7px; font-size: 12px; }
+      .verified-identity { overflow-wrap: anywhere; }
       .card-header {
         display: flex;
         justify-content: space-between;

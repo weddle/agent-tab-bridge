@@ -11,6 +11,17 @@
  * re-enable a control the user just used.
  */
 
+import {
+  FULL_ACCESS_CONSEQUENCE,
+  isRememberableAccess,
+  renderAccessScope,
+  renderClaimedString,
+  renderRememberedGrantChip,
+  renderScopeChips,
+  renderStandingGrantScope,
+  verifiedIdentityDetails,
+} from "./modules/ui-vocabulary.js";
+
 const statusDot = document.getElementById("statusDot");
 const connectionStatus = document.getElementById("connectionStatus");
 const companionIdentity = document.getElementById("companionIdentity");
@@ -26,6 +37,8 @@ const accessList = document.getElementById("accessRequests");
 const enrollSection = document.getElementById("enrollSection");
 const enrollHeading = document.getElementById("enrollHeading");
 const enrollList = document.getElementById("enrollRequests");
+const profilesHeading = document.getElementById("profilesHeading");
+const grantsHeading = document.getElementById("grantsHeading");
 const activeSection = document.getElementById("activeSection");
 const activeHeading = document.getElementById("activeHeading");
 const activeList = document.getElementById("activeSessions");
@@ -179,14 +192,91 @@ function formatAccess(session) {
     ? `Selected tabs: ${tabIds.map((tabId) => `Tab ${tabId}`).join(", ")}`
     : "Selected tabs only — share tabs manually";
 }
-
-
-function sessionKey(session) {
-  return typeof session?.id === "string" ? session.id : "";
-}
-
 function taskLabel(session) {
   return session?.taskLabel || "Unnamed task";
+}
+
+function profileFor(session) {
+  return state.enrolledProfiles.find((profile) => profile?.principalId === session?.controllerId) ?? null;
+}
+
+function verifiedSessionIdentity(session) {
+  const profile = profileFor(session);
+  return verifiedIdentityDetails(profile?.name || "Local controller", session?.controllerId);
+}
+
+function appendVerifiedIdentity(card, session) {
+  const identity = verifiedSessionIdentity(session);
+  const line = makeElement("p", "meta verified-identity", identity.text);
+  line.title = identity.fullValue;
+  line.setAttribute("aria-label", identity.ariaLabel);
+  card.append(line);
+}
+
+function appendClaimedContext(card, task, controller) {
+  card.append(makeElement("p", "meta", `SAID ${renderClaimedString(task)} — requested by ${renderClaimedString(controller)}`));
+}
+
+function appendScope(card, access) {
+  const what = makeElement("div", "scope-block");
+  what.append(makeElement("span", "list-label", "WHAT"));
+  const chips = makeElement("div", "scope-chips");
+  for (const chip of renderScopeChips(access)) chips.append(makeElement("span", "scope-chip", chip));
+  if (chips.childElementCount === 0) chips.append(makeElement("span", "scope-chip", renderAccessScope(access)));
+  what.append(chips);
+  card.append(what);
+}
+
+function selectedTabDetails(card, access) {
+  if (access?.level !== "selectedTabs" || !Array.isArray(access.tabIds) || access.tabIds.length === 0) return;
+  const details = document.createElement("details");
+  details.append(makeElement("summary", undefined, "Show exact selected tabs"));
+  const list = makeElement("ul", "tabs");
+  for (const tabId of access.tabIds) list.append(makeElement("li", undefined, `Tab ${tabId}`));
+  details.append(list);
+  card.append(details);
+}
+
+function standingGrantForSession(session) {
+  return state.standingGrants.find((grant) => {
+    const route = grant?.route;
+    return route?.kind === "local" &&
+      route.routePolicy === "localOnly" &&
+      route.endpointId === session?.route?.endpointId &&
+      grant.controllerId === session?.controllerId;
+  }) ?? null;
+}
+
+function accessWithinGrant(session, grant) {
+  if (!grant || !isRememberableAccess(session?.access)) return false;
+  const ceiling = grant.route?.accessCeiling;
+  if (!ceiling) return false;
+  if (session.access.level === "selectedTabs") return true;
+  return ceiling.level === "domains" &&
+    Array.isArray(session.access.domains) &&
+    session.access.domains.every((domain) => (ceiling.domains ?? []).includes(domain));
+}
+
+function rememberedGrantForSession(session) {
+  const grant = standingGrantForSession(session);
+  return session?.rememberedGrant === true || accessWithinGrant(session, grant) ? grant : null;
+}
+
+function appendRememberedGrant(card, session) {
+  const grant = rememberedGrantForSession(session);
+  if (!grant) return null;
+  const row = makeElement("p", "remembered-grant");
+  row.append(makeElement("span", "grant-chip", renderRememberedGrantChip(grant)));
+  const forget = makeButton("Forget", "secondary");
+  forget.addEventListener("click", () => void runMutation(
+    `grant:${grant.controllerId}`,
+    forget,
+    { type: "revokeGrant", controllerId: grant.controllerId },
+    "The standing grant could not be removed.",
+  ));
+  row.append(document.createTextNode(" "), forget);
+  card.append(row);
+  return grant;
 }
 
 function controllerLabel(session) {
@@ -276,6 +366,7 @@ function activeSignature(session) {
   const tabs = tabsForSession(id)
     .map((tab) => `${String(tab?.tabId ?? "?")}:${tab?.title ?? ""}`)
     .join(UNIT);
+  const remembered = rememberedGrantForSession(session);
   return [
     id,
     taskLabel(session),
@@ -289,34 +380,38 @@ function activeSignature(session) {
     share.variant,
     share.disabled ? "1" : "0",
     share.reason,
+    remembered?.controllerId ?? "",
+    session?.rememberedGrant === true ? "remembered" : "",
   ].join(UNIT);
 }
 
 function buildPendingCard(session) {
   const id = sessionKey(session);
+  const level = accessLevel(session);
   const card = makeElement("article", "atb-card card pending");
-  card.classList.add(`access-${accessLevel(session)}`);
+  card.classList.add(`access-${level}`);
 
-  const task = makeElement("div", "task", taskLabel(session));
+  const task = makeElement("div", "task", renderClaimedString(taskLabel(session)));
   task.title = "Unverified task label";
   card.append(task);
-  card.append(makeElement("p", "meta", `Requested by ${controllerLabel(session)} (unverified)`));
-  if (typeof session?.controllerId === "string" && session.controllerId) {
-    card.append(makeElement("p", "meta", `Principal ${abbreviate(session.controllerId)}`));
-  }
-  card.append(makeElement("p", "meta", `Capabilities: ${formatCapabilities(session?.capabilities)}`));
+  appendVerifiedIdentity(card, session);
+  appendClaimedContext(card, taskLabel(session), controllerLabel(session));
+  appendScope(card, session?.access);
   card.append(makeElement("p", "access-summary", formatAccess(session)));
+  selectedTabDetails(card, session?.access);
+  if (level === "full") card.append(makeElement("p", "full-access-consequence", FULL_ACCESS_CONSEQUENCE));
+  card.append(makeElement("p", "meta", `Capabilities: ${formatCapabilities(session?.capabilities)}`));
   const remainingEl = makeElement("p", "meta remaining", formatRemaining(session));
   card.append(remainingEl);
 
   let remember = null;
-  const isEnrolledProfile = state.enrolledProfiles.some((profile) => profile?.principalId === session?.controllerId);
-  if (isEnrolledProfile && accessLevel(session) !== "full") {
+  const isEnrolledProfile = profileFor(session) !== null;
+  if (isEnrolledProfile && isRememberableAccess(session?.access)) {
     const label = makeElement("label", "meta remember");
     remember = document.createElement("input");
     remember.type = "checkbox";
     remember.className = "atb-remember";
-    label.append(remember, document.createTextNode(" Remember for this agent: auto-approve future sessions up to this level (never full access)"));
+    label.append(remember, document.createTextNode(" Remember for this agent: auto-approve future sessions up to this level"));
     card.append(label);
   }
 
@@ -333,17 +428,22 @@ function buildPendingCard(session) {
 
 function buildActiveCard(session) {
   const id = sessionKey(session);
-  const card = makeElement("article", "atb-card card");
-  card.classList.add(`access-${accessLevel(session)}`);
+  const level = accessLevel(session);
+  const card = makeElement("article", "atb-card");
+  card.classList.add("card", `access-${level}`);
 
   const header = makeElement("div", "card-header");
-  const task = makeElement("div", "task", taskLabel(session));
+  const task = makeElement("div", "task", renderClaimedString(taskLabel(session)));
   task.title = "Unverified task label";
   const remainingEl = makeElement("span", "remaining", formatRemaining(session));
   header.append(task, remainingEl);
   card.append(header);
-  card.append(makeElement("p", "meta", `Requested by ${controllerLabel(session)} (unverified)`));
+  appendVerifiedIdentity(card, session);
+  appendClaimedContext(card, taskLabel(session), controllerLabel(session));
+  appendScope(card, session?.access);
   card.append(makeElement("p", "access-summary", formatAccess(session)));
+  if (level === "full") card.append(makeElement("p", "full-access-consequence", FULL_ACCESS_CONSEQUENCE));
+  appendRememberedGrant(card, session);
 
   card.append(makeElement("p", "list-label", "Tabs shared with this session"));
   const tabs = tabsForSession(id);
@@ -372,9 +472,7 @@ function buildActiveCard(session) {
   });
   details.append(
     makeElement("summary", undefined, "Details"),
-    makeElement("p", "meta", `Principal ${abbreviate(session?.controllerId)}`),
     makeElement("p", "meta", `Capabilities: ${formatCapabilities(session?.capabilities)}`),
-    makeElement("p", "meta", `Access: ${formatAccess(session)}`),
     makeElement("p", "meta", `Session health: ${healthText(session)}`),
     makeElement("p", "meta", `Session id ${abbreviate(session?.id)}`),
   );
@@ -416,13 +514,25 @@ function buildAccessCard(request) {
   const id = sessionKey(request);
   const level = request?.requestedAccess?.level ?? "selectedTabs";
   const card = makeElement("article", `atb-card card pending access-${level}`);
-  card.append(makeElement("div", "task", request?.taskLabel || "Unnamed task"));
-  card.append(makeElement("p", "meta", `Requested by ${request?.controllerName || "Unnamed controller"} (unverified)`));
-  card.append(makeElement("p", "access-summary", formatUpgrade(request)));
+  card.append(makeElement("div", "task", renderClaimedString(request?.taskLabel || "Unnamed task")));
+  const profile = state.enrolledProfiles.find((candidate) => candidate?.principalId === request?.controllerId);
+  const identity = verifiedIdentityDetails(
+    profile?.name || "Local controller",
+    request?.controllerId || request?.controllerFingerprint || "unavailable",
+  );
+  const identityLine = makeElement("p", "meta verified-identity", identity.text);
+  identityLine.title = identity.fullValue;
+  identityLine.setAttribute("aria-label", identity.ariaLabel);
+  card.append(identityLine);
+  card.append(makeElement("p", "meta", `SAID ${renderClaimedString(request?.taskLabel || "Unnamed task")} — requested by ${renderClaimedString(request?.controllerName || "Unnamed controller")}`));
   const current = { access: request?.currentAccess };
   const requested = { access: request?.requestedAccess };
-  card.append(makeElement("p", "meta", `Current access — ${formatAccess(current)}`));
-  card.append(makeElement("p", "meta", `Approved access — ${formatAccess(requested)}`));
+  appendScope(card, request?.requestedAccess);
+  card.append(makeElement("p", "access-summary", formatUpgrade(request)));
+  card.append(makeElement("p", "meta", `Current ceiling — ${formatAccess(current)}`));
+  card.append(makeElement("p", "meta", `Resulting ceiling — ${formatAccess(requested)}`));
+  selectedTabDetails(card, request?.requestedAccess);
+  if (level === "full") card.append(makeElement("p", "full-access-consequence", FULL_ACCESS_CONSEQUENCE));
   const decline = makeButton("Decline", "secondary");
   decline.addEventListener("click", () => void mutateAccess("declineAccess", id, decline));
   const approve = makeButton("Approve upgrade", "primary");
@@ -444,8 +554,12 @@ function enrollSignature(request) {
 function buildEnrollCard(request) {
   const id = sessionKey(request);
   const card = makeElement("article", "atb-card card pending access-selectedTabs");
-  card.append(makeElement("div", "task", `Enroll agent profile "${request?.profileName ?? "unnamed"}"`));
-  card.append(makeElement("p", "meta", `Key ${abbreviate(request?.profileFingerprint)}`));
+  card.append(makeElement("div", "task", `Enroll agent profile ${renderClaimedString(request?.profileName ?? "unnamed")}`));
+  const identity = verifiedIdentityDetails("Agent profile", request?.profileFingerprint);
+  const identityLine = makeElement("p", "meta verified-identity", identity.text);
+  identityLine.title = identity.fullValue;
+  identityLine.setAttribute("aria-label", identity.ariaLabel);
+  card.append(makeElement("p", "meta", "Confirming enrollment enrolls this profile for this machine (all its browsers)."));
   card.append(makeElement("p", "meta", "Enter the 6-digit code shown by the agent that requested enrollment. If you did not start that agent, ignore this request; it expires on its own."));
   const input = document.createElement("input");
   input.type = "text";
@@ -614,8 +728,7 @@ function render() {
   setText(enrollHeading, `Agent enrollments (${enrollments.length})`);
   reconcile(enrollList, enrollCards, enrollments, enrollSignature, buildEnrollCard);
 
-
-  setHidden(activeSection, nativeStatus !== "connected" && active.length === 0);
+  setHidden(activeSection, false);
   setText(activeHeading, `Active sessions (${active.length})`);
   reconcile(activeList, activeCards, active, activeSignature, buildActiveCard);
   setHidden(activeEmpty, active.length > 0);
@@ -629,23 +742,25 @@ function renderProfilesAndGrants() {
   const grants = state.standingGrants;
   setHidden(profilesBlock, profiles.length === 0);
   setHidden(grantsBlock, grants.length === 0);
+  setText(profilesHeading, `Enrolled agent profiles (${profiles.length})`);
+  setText(grantsHeading, `Standing grants (${grants.length})`);
   if (holdsUserContext(profilesList) || holdsUserContext(grantsList)) return;
   profilesList.replaceChildren(...profiles.map((profile) => {
     const item = makeElement("li");
     item.append(
-      makeElement("span", "tab-title", `${profile.name} · ${abbreviate(profile.principalId)}`),
+      makeElement("span", "tab-title", `${renderClaimedString(profile.name)} · ${abbreviate(profile.principalId)}`),
+      makeElement("span", "meta", "Enrolled for this machine (all its browsers). Revocation ends this profile's sessions and grants across all browsers on this machine."),
     );
     const revoke = makeButton("Revoke", "secondary");
     if (inFlight.has(profile.principalId)) revoke.disabled = true;
+    revoke.title = "Ends this profile's sessions and grants across all browsers on this machine.";
     revoke.addEventListener("click", () => void runMutation(profile.principalId, revoke, { type: "revokeProfile", profileName: profile.name }, "The companion rejected this profile revocation."));
     item.append(revoke);
     return item;
   }));
   grantsList.replaceChildren(...grants.map((grant) => {
     const item = makeElement("li");
-    const scope = grant.level === "domains" ? `sites: ${grant.domains.join(", ") || "none"}` : "selected tabs only";
-    const route = grant.route?.routePolicy === "localOnly" ? " · local only" : "";
-    item.append(makeElement("span", "tab-title", `${grant.controllerName} · auto-approve up to ${scope}${route}`));
+    item.append(makeElement("span", "tab-title", `${renderClaimedString(grant.controllerName || "Unnamed profile")} · auto-approve up to ${renderStandingGrantScope(grant)}`));
     const forget = makeButton("Forget", "secondary");
     if (inFlight.has(`grant:${grant.controllerId}`)) forget.disabled = true;
     forget.addEventListener("click", () => void runMutation(`grant:${grant.controllerId}`, forget, { type: "revokeGrant", controllerId: grant.controllerId }, "The standing grant could not be removed."));

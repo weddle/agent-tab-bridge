@@ -14,7 +14,7 @@ export const MAX_CAPABILITIES = 1;
 export const SUPPORTED_CAPABILITIES = ["cdp"] as const;
 export type Capability = (typeof SUPPORTED_CAPABILITIES)[number];
 
-export type SessionState = "pending" | "active" | "revoked";
+export type SessionState = "pending" | "active" | "reconnecting" | "revoked";
 export interface SessionRecord extends RouteAwareSessionRecord {}
 export interface SessionApproval {
   sessionId: string;
@@ -72,6 +72,7 @@ export interface SnapshotMessage { version: typeof NATIVE_PROTOCOL_VERSION; type
 export interface SessionPendingMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionPending"; requestId?: string; session: SessionRecord; }
 export interface SessionStartedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionStarted"; requestId?: string; session: SessionRecord; relayUrl?: string; }
 export interface SessionStoppedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionStopped"; requestId?: string; session: SessionRecord; reason?: string; }
+export interface SessionResumingMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "sessionResuming"; requestId?: string; session: SessionRecord; relayUrl: string; }
 export interface AccessPendingMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "accessPending"; requestId?: string; request: AccessUpgradeRecord; }
 export interface AccessUpdatedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "accessUpdated"; requestId?: string; accessRequestId: string; session: SessionRecord; }
 export interface AccessDeclinedMessage { version: typeof NATIVE_PROTOCOL_VERSION; type: "accessDeclined"; requestId?: string; accessRequestId: string; sessionId: string; }
@@ -82,7 +83,7 @@ export interface RevokeProfileMessage { version: typeof NATIVE_PROTOCOL_VERSION;
 
 export type ExtensionToHostMessage = HelloMessage | HelloProofMessage | ApproveSessionMessage | RevokeSessionMessage | RevokeDeviceMessage | RelayReadyMessage | RelayFailedMessage | TabsListedMessage | TabClaimedMessage | ApproveAccessMessage | DeclineAccessMessage | ConfirmEnrollmentMessage | RevokeProfileMessage;
 
-export type HostToExtensionMessage = HelloChallengeMessage | TrustedMessage | SnapshotMessage | SessionPendingMessage | SessionStartedMessage | SessionStoppedMessage | ListTabsMessage | ClaimTabMessage | AccessPendingMessage | AccessUpdatedMessage | AccessDeclinedMessage | EnrollPendingMessage | EnrollResultMessage;
+export type HostToExtensionMessage = HelloChallengeMessage | TrustedMessage | SnapshotMessage | SessionPendingMessage | SessionStartedMessage | SessionResumingMessage | SessionStoppedMessage | ListTabsMessage | ClaimTabMessage | AccessPendingMessage | AccessUpdatedMessage | AccessDeclinedMessage | EnrollPendingMessage | EnrollResultMessage;
 export type NativeMessage = ExtensionToHostMessage | HostToExtensionMessage;
 
 export interface HandshakeTranscript {
@@ -111,7 +112,7 @@ const validCapabilities = (value: unknown): value is Capability[] => Array.isArr
 
 export function validateSessionRecord(value: unknown): value is SessionRecord {
   if (!isRecord(value) || !keysExactly(value, ["id", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "access", "createdAt", "expiresAt", "state", "route"])) return false;
-  return validId(value.id) && validPrincipalId(value.controllerPrincipalId) && validDisplay(value.displayControllerName) && validLabel(value.taskLabel) && validCapabilities(value.requestedCapabilities) && isSessionAccess(value.access) && isInteger(value.createdAt) && (value.expiresAt === null || (isInteger(value.expiresAt) && value.expiresAt > value.createdAt && value.expiresAt - value.createdAt <= MAX_TTL_MS)) && (value.state === "pending" || value.state === "active" || value.state === "revoked") && isRouteProvenance(value.route) && value.route.controllerPrincipalId === value.controllerPrincipalId;
+  return validId(value.id) && validPrincipalId(value.controllerPrincipalId) && validDisplay(value.displayControllerName) && validLabel(value.taskLabel) && validCapabilities(value.requestedCapabilities) && isSessionAccess(value.access) && isInteger(value.createdAt) && (value.expiresAt === null || (isInteger(value.expiresAt) && value.expiresAt > value.createdAt && value.expiresAt - value.createdAt <= MAX_TTL_MS)) && (value.state === "pending" || value.state === "active" || value.state === "reconnecting" || value.state === "revoked") && isRouteProvenance(value.route) && value.route.controllerPrincipalId === value.controllerPrincipalId;
 }
 export function assertSessionRecord(value: unknown): SessionRecord { if (!validateSessionRecord(value)) throw new NativeProtocolError("invalid session record"); return value; }
 export function canonicalSessionRecord(record: SessionRecord): Uint8Array { assertSessionRecord(record); return canonicalRouteAwareRecord(record); }
@@ -142,6 +143,7 @@ export function validateNativeMessage(value: unknown): value is NativeMessage {
     case "helloChallenge": return hasVersionAndType(value, "helloChallenge", ["role", "companionId", "companionPublicKey", "extensionId", "extensionPublicKey", "extensionNonce", "companionNonce", "signature"]) && validHandshakeFields(value, "companion");
     case "helloProof": return hasVersionAndType(value, "helloProof", ["role", "extensionId", "extensionPublicKey", "companionId", "companionPublicKey", "extensionNonce", "companionNonce", "signature"]) && validHandshakeFields(value, "extension");
     case "approveSession": return hasVersionAndType(value, "approveSession", ["sessionId", "controllerPrincipalId", "displayControllerName", "taskLabel", "requestedCapabilities", "access", "expiresAt", "route"]) && validateSessionApproval({ sessionId: value.sessionId, controllerPrincipalId: value.controllerPrincipalId, displayControllerName: value.displayControllerName, taskLabel: value.taskLabel, requestedCapabilities: value.requestedCapabilities, access: value.access, expiresAt: value.expiresAt, route: value.route });
+    case "revokeSession": return hasVersionAndType(value, "revokeSession", ["sessionId"], ["reason"]) && validId(value.sessionId) && (value.reason === undefined || isString(value.reason, 256));
     case "revokeDevice": return hasVersionAndType(value, "revokeDevice", []) && typeof value.requestId === "string" && value.requestId.length > 0;
     case "listTabs": return hasVersionAndType(value, "listTabs", ["scope"], ["sessionId"]) && (value.scope === "all" || value.scope === "session") && (value.sessionId === undefined || validId(value.sessionId)) && (value.scope !== "session" || validId(value.sessionId));
     case "tabsListed": return hasVersionAndType(value, "tabsListed", ["tabs"]) && typeof value.requestId === "string" && Array.isArray(value.tabs) && value.tabs.length <= 10_000 && value.tabs.every(validateSharedTab);
@@ -158,6 +160,7 @@ export function validateNativeMessage(value: unknown): value is NativeMessage {
     case "trusted": return hasVersionAndType(value, "trusted", ["companionPrincipalId", "extensionFingerprint"]) && validPrincipalId(value.companionPrincipalId) && validPrincipalId(value.extensionFingerprint);
     case "sessionPending": return hasVersionAndType(value, "sessionPending", ["session"]) && validateSessionRecord(value.session);
     case "sessionStarted": return hasVersionAndType(value, "sessionStarted", ["session"], ["relayUrl"]) && validateSessionRecord(value.session) && (value.relayUrl === undefined || isString(value.relayUrl, 8192));
+    case "sessionResuming": return hasVersionAndType(value, "sessionResuming", ["session", "relayUrl"]) && validateSessionRecord(value.session) && value.session.state === "reconnecting" && isString(value.relayUrl, 8192) && /^ws:\/\/127\.0\.0\.1(?::\d+)?\//.test(value.relayUrl);
     case "sessionStopped": return hasVersionAndType(value, "sessionStopped", ["session"], ["reason"]) && validateSessionRecord(value.session) && (value.reason === undefined || isString(value.reason, 256));
     case "enrollPending": return hasVersionAndType(value, "enrollPending", ["enrollmentId", "profileName", "profileFingerprint", "expiresAt"]) && validId(value.enrollmentId) && validId(value.profileName, 64) && validPrincipalId(value.profileFingerprint) && isInteger(value.expiresAt) && value.expiresAt > 0;
     case "confirmEnrollment": return hasVersionAndType(value, "confirmEnrollment", ["enrollmentId", "code"]) && typeof value.requestId === "string" && validId(value.enrollmentId) && isString(value.code, 16) && /^\d{6}$/.test(value.code);

@@ -17,7 +17,7 @@ export type BrokerCommand = "status" | "listTabs" | "claimTab" | "openSession" |
 export type BrokerCommandRequest = Readonly<{ id: string; command: BrokerCommand; taskLabel?: string; requestedCapabilities?: string[]; access?: SessionAccess; accessDelta?: SessionAccessDelta; ttlMs?: number; stableSessionKey?: string; sessionId?: string; scope?: "all" | "session"; tabId?: number; reason?: string; profileName?: string; publicKeySpki?: string }>;
 export type BrokerAuthOk = Readonly<{ type: "authOk" }>;
 export type BrokerResponse = Readonly<{ id: string; ok: true; result: unknown }> | Readonly<{ id: string; ok: false; error: { code: string; message: string } }>;
-export type BrokerEvent = Readonly<{ event: "pending" | "active" | "revoked" | "accessPending" | "accessUpdated" | "accessDeclined" | "hostClosing" | "profileEnrolled" | "enrollDeclined"; sessionId?: string; session?: TaskSession; accessRequest?: AccessUpgradeRecord; accessRequestId?: string; cdpUrl?: string; reason?: string; enrollmentId?: string; profileName?: string }>;
+export type BrokerEvent = Readonly<{ event: "pending" | "active" | "reconnecting" | "revoked" | "accessPending" | "accessUpdated" | "accessDeclined" | "hostClosing" | "profileEnrolled" | "enrollDeclined"; sessionId?: string; session?: TaskSession; accessRequest?: AccessUpgradeRecord; accessRequestId?: string; cdpUrl?: string; reason?: string; enrollmentId?: string; profileName?: string }>;
 export type BrokerProfileResolver = (name: string) => Promise<Readonly<{ principalId: string; displayName: string; publicKeySpki: string }> | null> | Readonly<{ principalId: string; displayName: string; publicKeySpki: string }> | null;
 export type BrokerAuthContext = () => Readonly<{ machineId: string; machinePublicKeySpki: string; machinePrivateKeyPkcs8: string; endpointId: string }> | null;
 export type BrokerServerOptions = Readonly<{ socketPath?: string; token: string; sessions: TaskSessionManager; isTrusted: () => boolean; controller: () => Readonly<{ principalId: string; displayName: string }> | null; profile?: BrokerProfileResolver; authContext?: BrokerAuthContext; enrollProfile?: (profileName: string, publicKeySpki: string) => Promise<Readonly<{ enrollmentId: string; code: string; expiresAt: number }>>; status?: () => Record<string, unknown>; listTabs?: (sessionId: string | undefined, scope: "all" | "session") => Promise<unknown>; claimTab?: (sessionId: string, tabId: number) => Promise<unknown>; requestAccess?: (controllerPrincipalId: string, stableSessionKey: string, delta: SessionAccessDelta) => Promise<AccessUpgradeRecord> | AccessUpgradeRecord }>;
@@ -97,6 +97,8 @@ export class BrokerServer {
   private readonly connections = new Set<Socket>();
   private closed = false;
   private constructor(private readonly server: Server, private readonly options: BrokerServerOptions, socketPath: string) { this.socketPath = socketPath; }
+  get connectionCount(): number { return this.connections.size; }
+  get clientCount(): number { return this.clients.size; }
   static async start(options: BrokerServerOptions): Promise<BrokerServer> {
     if (options.token.length < 32) throw new Error("broker token is missing or too short");
     const socketPath = options.socketPath ?? defaultBrokerSocketPath();

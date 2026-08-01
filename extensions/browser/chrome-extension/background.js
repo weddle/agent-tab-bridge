@@ -25,6 +25,7 @@ import {
   verifyNativeChallenge,
   toBase64Url,
 } from "./modules/native-identity.js";
+import { renderClaimedString } from "./modules/ui-vocabulary.js";
 const NATIVE_HOST_NAME = "com.agenttabbridge.companion";
 const TASK_GROUP_COLOR = "blue";
 const MAX_TASK_LABEL_LENGTH = 128;
@@ -356,7 +357,7 @@ function normalizeSession(raw, expectedState) {
       (!Number.isInteger(value.expiresAt) ||
         value.expiresAt <= value.createdAt ||
         value.expiresAt - value.createdAt > 24 * 60 * 60 * 1_000)) ||
-    !["pending", "active", "revoked"].includes(value.state) ||
+    !["pending", "active", "reconnecting", "revoked"].includes(value.state) ||
     (expectedState && value.state !== expectedState)
   ) {
     return null;
@@ -389,6 +390,7 @@ function sessionDto(session) {
     createdAt: session.createdAt,
     expiresAt: session.expiresAt,
     state: session.state,
+    ...(session.rememberedGrant === true ? { rememberedGrant: true } : {}),
     route: { ...session.route, accessCeiling: { ...session.route.accessCeiling, tabIds: [...session.route.accessCeiling.tabIds], domains: [...session.route.accessCeiling.domains] } },
   };
 }
@@ -428,16 +430,16 @@ function sessionCanAdoptTab(session, tab) {
   );
 }
 
-
 function taskGroupTitle(session) {
   const label = session.taskLabel || "Task";
-  return `Agent Tab Bridge · ${label}`;
+  return `Agent Tab Bridge · ${renderClaimedString(label)}`;
 }
 
 function sessionPageUrl(session) {
   const url = new URL(SESSION_PAGE_URL);
   url.searchParams.set("sessionId", session.id);
   url.searchParams.set("controller", session.controllerName);
+  url.searchParams.set("controllerFingerprint", session.controllerId);
   url.searchParams.set("label", session.taskLabel);
   url.searchParams.set("capabilities", session.capabilities.join(", "));
   url.searchParams.set("access", session.access.level);
@@ -634,10 +636,10 @@ async function handleTrusted(message, port, generation) {
 
 
 /** Popup-equivalent approval used by both the popup route and standing grants. */
-function approveSessionNow(session) {
+function approveSessionNow(session, rememberedGrant = false) {
   const approval = {
     requestId: newRequestId(),
-    session: { ...session, capabilities: [...session.capabilities] },
+    session: { ...session, capabilities: [...session.capabilities], rememberedGrant },
   };
   approvedSessions.set(session.id, approval);
   try {
@@ -666,7 +668,13 @@ async function maybeAutoApprove(session) {
   if (!session || session.state !== "pending" || approvedSessions.has(session.id) || session.route?.kind !== "local" || session.route.routePolicy !== "localOnly") return;
   if (!enrolledPrincipal(session.controllerId)) return;
   if (!accessWithinStandingGrant(session.access, localStandingGrantFor(standingGrants, session.controllerId, session.route))) return;
-  try { approveSessionNow(session); } catch { /* the popup path remains available */ }
+  try {
+    session.rememberedGrant = true;
+    approveSessionNow(session, true);
+  } catch {
+    delete session.rememberedGrant;
+    /* The popup path remains available. */
+  }
 }
 async function handleNativeSnapshot(message) {
   enrolledProfiles = (Array.isArray(message.enrolledProfiles) ? message.enrolledProfiles : [])
@@ -681,8 +689,8 @@ async function handleNativeSnapshot(message) {
     const session = normalizeSession(raw);
     if (session) incoming.set(session.id, session);
   }
-  for (const sessionId of [...sessions.keys()]) {
-    if (!incoming.has(sessionId)) await stopSession(sessionId, { removeSession: true });
+  for (const [sessionId, existing] of sessions) {
+    if (!incoming.has(sessionId) && existing.state !== "reconnecting") await stopSession(sessionId, { removeSession: true });
   }
   for (const session of incoming.values()) {
     const existing = sessions.get(session.id);
@@ -695,10 +703,11 @@ async function handleNativeSnapshot(message) {
       await stopSession(session.id, { removeSession: true });
       continue;
     }
-    sessions.set(session.id, { ...existing, ...session });
+    const merged = { ...existing, ...session, rememberedGrant: session.rememberedGrant === true || existing?.rememberedGrant === true };
+    sessions.set(session.id, merged);
     if (session.state === "revoked" || session.state === "pending") {
       await stopSession(session.id, { removeSession: session.state === "revoked" });
-      if (session.state === "pending") { sessions.set(session.id, session); await maybeAutoApprove(session); }
+      if (session.state === "pending") { sessions.set(session.id, merged); await maybeAutoApprove(merged); }
     } else if (!relaySockets.has(session.id)) {
       // A relay credential is intentionally memory-only. A resurrected worker
       // cannot reconnect an old active task, so remove its authority instead.
@@ -843,6 +852,14 @@ async function handleSessionStarted(message) {
   sessions.set(sessionId, sessionUpdate);
   await openSessionRelay(sessionId, message.relayUrl);
 }
+async function handleSessionResuming(message) {
+  const sessionUpdate = normalizeSession(message, "reconnecting");
+  if (!sessionUpdate || typeof message?.relayUrl !== "string") return;
+  const known = sessions.get(sessionUpdate.id);
+  if (!known || known.state !== "reconnecting" || !matchesSessionAuthority(known, sessionUpdate) || relaySockets.has(sessionUpdate.id)) return;
+  sessions.set(sessionUpdate.id, { ...known, ...sessionUpdate, rememberedGrant: known.rememberedGrant === true });
+  await openSessionRelay(sessionUpdate.id, message.relayUrl);
+}
 
 async function handleSessionStopped(message) {
   const session = normalizeSession(message);
@@ -926,6 +943,10 @@ async function handleNativeMessage(message, port, generation) {
       await handleNativeSnapshot(message);
       refreshBadge();
       return;
+    case "sessionResuming":
+      await handleSessionResuming(message);
+      refreshBadge();
+      return;
     case "sessionPending":
       await handleSessionPending(message);
       refreshBadge();
@@ -975,6 +996,17 @@ async function handleNativeMessage(message, port, generation) {
       return;
   }
 }
+function suspendSessionsForNativeRecovery() {
+  for (const [sessionId, session] of sessions) {
+    if (session.state === "active") {
+      closeRelaySocket(sessionId);
+      sessions.set(sessionId, { ...session, state: "reconnecting" });
+    } else if (session.state === "revoked") {
+      sessions.delete(sessionId);
+    }
+  }
+}
+
 
 async function handleNativeDisconnect(port, generation) {
   if (nativePort !== port || generation !== nativeGeneration) {
@@ -985,9 +1017,10 @@ async function handleNativeDisconnect(port, generation) {
   trustedCompanion = null;
   nativeState = "disconnected";
   try {
-    await stopAllSessions();
+    if (nativeReconnectAllowed) suspendSessionsForNativeRecovery();
+    else await stopAllSessions();
   } finally {
-    sessions.clear();
+    if (!nativeReconnectAllowed) sessions.clear();
     approvedSessions.clear();
     accessRequests.clear();
     approvedAccessRequests.clear();

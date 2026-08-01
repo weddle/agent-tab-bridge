@@ -46,7 +46,7 @@ export interface RouteAwareSessionRecord {
   access: SessionAccess;
   createdAt: number;
   expiresAt: number | null;
-  state: "pending" | "active" | "revoked";
+  state: "pending" | "active" | "reconnecting" | "revoked";
   route: RouteProvenance;
 }
 
@@ -77,7 +77,9 @@ export function isRouteProvenance(value: unknown): value is RouteProvenance {
 }
 
 export function sameRouteProvenance(left: RouteProvenance, right: RouteProvenance): boolean {
-  return canonicalRouteAwareRecord(left) === canonicalRouteAwareRecord(right);
+  const leftBytes = canonicalRouteAwareRecord(left);
+  const rightBytes = canonicalRouteAwareRecord(right);
+  return leftBytes.byteLength === rightBytes.byteLength && leftBytes.every((byte, index) => byte === rightBytes[index]);
 }
 
 /**

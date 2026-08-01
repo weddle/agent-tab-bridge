@@ -56,6 +56,22 @@ describe("TaskSessionManager integration contract", () => {
     expect(events[1]).toMatchObject({ type: "active", session: { id: "session-1" }, cdpUrl: relays[0]?.cdpUrl });
     expect(manager.cdpUrl("session-1")).toBe(relays[0]?.cdpUrl);
   });
+  it("suspends active sessions for a same-endpoint relay recovery", async () => {
+    const events: string[] = [];
+    const { relays, startRelay } = makeRelayFactory();
+    const manager = new TaskSessionManager({ startRelay, idFactory: () => "session-recovery", onEvent: (event) => events.push(event.type) });
+    const pending = manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "recover", capabilities: ["cdp"], stableSessionKey: "recover-key" });
+    await manager.approve(pending.id);
+    manager.relayReady(pending.id);
+    expect(manager.suspend()).toMatchObject([{ id: pending.id, state: "reconnecting" }]);
+    expect(manager.snapshot()).toMatchObject([{ id: pending.id, state: "reconnecting" }]);
+    expect(manager.cdpUrl(pending.id)).toBeUndefined();
+    expect(manager.open({ controllerPrincipalId: "controller-1", controllerName: "CLI", taskLabel: "recover", capabilities: ["cdp"], stableSessionKey: "recover-key" })).toMatchObject({ id: pending.id, state: "reconnecting" });
+    manager.relayReady(pending.id);
+    expect(manager.get(pending.id)).toMatchObject({ state: "active" });
+    expect(manager.cdpUrl(pending.id)).toBe(relays[0]?.cdpUrl);
+    expect(events).toEqual(["pending", "active", "reconnecting", "active"]);
+  });
 
   it("creates an indefinite session without an expiry timer", async () => {
     let now = 10_000;

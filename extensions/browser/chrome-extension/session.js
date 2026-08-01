@@ -6,11 +6,25 @@
  * page has always described.
  */
 
+import {
+  FULL_ACCESS_CONSEQUENCE,
+  renderAccessScope,
+  renderClaimedString,
+  verifiedIdentityDetails,
+} from "./modules/ui-vocabulary.js";
+
 const params = new URLSearchParams(location.search);
 const text = (name, fallback) => params.get(name) || fallback;
 
-document.getElementById("description").textContent = text("label", "Approved local controller session");
-document.getElementById("controller").textContent = `Requester: ${text("controller", "Unnamed controller")}`;
+const description = document.getElementById("description");
+description.textContent = renderClaimedString(text("label", "Approved local controller session"));
+description.title = "Unverified session label";
+
+const identity = verifiedIdentityDetails("Local controller", text("controllerFingerprint", "unavailable"));
+const controller = document.getElementById("controller");
+controller.textContent = identity.text;
+controller.title = identity.fullValue;
+controller.setAttribute("aria-label", identity.ariaLabel);
 document.getElementById("session").textContent = `Session: ${text("sessionId", "Unavailable")}`;
 document.getElementById("capabilities").textContent = `Approved capabilities: ${text("capabilities", "None")}`;
 
@@ -23,12 +37,12 @@ const revocation = document.getElementById("revocation");
 if (access === "full") {
   groupSwatch.classList.add("full");
   groupLabel.textContent = "This full-access session's tab group is red.";
-  authority.textContent = "This session may open and adopt any ordinary website tab.";
+  authority.textContent = FULL_ACCESS_CONSEQUENCE;
   revocation.textContent = "Moving an adopted tab out of this group revokes access to that tab immediately.";
 } else if (access === "domains") {
   groupSwatch.classList.add("domains");
   groupLabel.textContent = "This domain-scoped session's tab group is orange.";
-  authority.textContent = `This session may open and adopt ${text("domains", "the approved domains")} and their subdomains.`;
+  authority.textContent = `This session may open and adopt ${renderAccessScope({ level: "domains", domains: text("domains", "the approved domains").split(", "), tabIds: [] })}.`;
   revocation.textContent = "Leaving the approved domains or moving a tab out of this group revokes access immediately.";
 } else {
   const tabIds = params.get("tabIds");

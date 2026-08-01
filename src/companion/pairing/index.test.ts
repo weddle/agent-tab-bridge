@@ -1,7 +1,9 @@
+import { createPublicKey } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { generateIdentity, fingerprintSpki, type StoredIdentity } from "../identity.js";
 import { MachinePairingCeremony, PairingFailure, PairingState, PAIRING_MAX_ATTEMPTS, startHubPairing, type PairingRoles } from "./index.js";
 import { pinnedTlsOptions } from "./tls.js";
+import { selfSignedCertificate } from "../../hub/certificate.js";
 import { p256 } from "./vendor/pake-js-0.1.1.js";
 
 const hex = (value: string): Uint8Array => Buffer.from(value.replace(/\s/g, ""), "hex");
@@ -133,6 +135,18 @@ describe("machine-to-hub pairing", () => {
     expect(options.rejectUnauthorized).toBe(true);
     expect(options.checkServerIdentity("hub", certificate)).toBeUndefined();
     expect(options.checkServerIdentity("hub", { ...certificate, pubkey: Buffer.from(identity().publicKeySpki, "base64url") })).toBeInstanceOf(Error);
+  });
+
+  it("pins the SPKI from a real generated certificate and rejects a wrong certificate", () => {
+    const { hub, client, response } = ceremony();
+    const pairing = client.complete(response).pairing;
+    const good = selfSignedCertificate(hub);
+    const wrong = selfSignedCertificate(identity());
+    const options = pinnedTlsOptions(pairing);
+    expect(options.checkServerIdentity("hub", { raw: good.certDer, pubkey: good.certDer } as never)).toBeUndefined();
+    const spki = createPublicKey({ key: Buffer.from(hub.publicKeySpki, "base64url"), type: "spki", format: "der" }).export({ type: "spki", format: "der" });
+    expect(options.checkServerIdentity("hub", { pubkey: spki.subarray(-65) } as never)).toBeUndefined();
+    expect(options.checkServerIdentity("hub", { raw: wrong.certDer, pubkey: wrong.certDer } as never)).toBeInstanceOf(Error);
   });
 
   it("forgets all machine-wide pinned state", () => {
