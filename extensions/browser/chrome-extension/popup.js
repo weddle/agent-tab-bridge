@@ -217,6 +217,10 @@ function taskLabel(session) {
   return session?.taskLabel || "Unnamed task";
 }
 
+function sessionKey(record) {
+  return typeof record?.id === "string" ? record.id : "";
+}
+
 function profileFor(session) {
   return state.enrolledProfiles.find((profile) => profile?.principalId === session?.controllerId) ?? null;
 }
