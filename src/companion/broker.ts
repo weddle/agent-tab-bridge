@@ -278,6 +278,11 @@ export class BrokerServer {
         if (request.stableSessionKey !== undefined && (!controller || !isStableSessionKey(request.stableSessionKey))) throw new TaskSessionError("invalidSession", "stableSessionKey is invalid");
         if (request.scope === "session" && request.stableSessionKey === undefined) throw new TaskSessionError("invalidSession", "session scope requires stableSessionKey");
         const session = controller && request.stableSessionKey ? this.options.sessions.getNamed(controller.principalId, request.stableSessionKey) : undefined;
+        if (routed) {
+          const routedPrincipal = controller?.principalId;
+          const activeRouted = this.options.sessions.snapshot().filter((item) => item.controllerPrincipalId === routedPrincipal && item.route.kind === "routed" && item.state === "active");
+          if (request.scope === "all" ? activeRouted.length === 0 : !session || session.state !== "active") throw new TaskSessionError("invalidSession", "routed tab access requires an active approved session");
+        }
         result = await this.options.listTabs(session?.id, request.scope);
       } else if (request.command === "claimTab") {
         if (!this.options.isTrusted()) throw new TaskSessionError("invalidSession", "browser extension is not trusted");
