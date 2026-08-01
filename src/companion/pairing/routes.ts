@@ -31,7 +31,7 @@ export class HubRouteStream {
     for (const listener of this.closeListeners) listener();
     this.closeListeners.clear();
   }
-  receive(payload: Buffer): void { if (!this.closed) for (const listener of this.listeners) listener(payload); }
+  receive(payload: Buffer): void { if (!this.closed) for (const listener of [...this.listeners]) listener(payload); }
 }
 
 export class HubRouteConnection {
